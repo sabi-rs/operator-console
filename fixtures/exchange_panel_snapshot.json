@@ -1,0 +1,56 @@
+{
+  "snapshot": {
+    "worker": {
+      "name": "exchange-browser-worker",
+      "status": "ready",
+      "detail": "Stub transport response loaded from fixture"
+    },
+    "venues": [
+      {
+        "id": "smarkets",
+        "label": "Smarkets",
+        "status": "connected",
+        "detail": "Browser profile ready",
+        "event_count": 3,
+        "market_count": 18
+      },
+      {
+        "id": "betfair",
+        "label": "Betfair",
+        "status": "planned",
+        "detail": "Adapter not implemented yet",
+        "event_count": 0,
+        "market_count": 0
+      }
+    ],
+    "selected_venue": "smarkets",
+    "events": [
+      {
+        "id": "arsenal-v-everton",
+        "label": "Arsenal v Everton",
+        "competition": "Premier League",
+        "start_time": "2026-03-14T17:30:00Z",
+        "url": "https://smarkets.com/football/england-premier-league/2026/03/14/17-30/arsenal-vs-everton/44919794/"
+      }
+    ],
+    "markets": [
+      {
+        "name": "Full-time result",
+        "contract_count": 3
+      },
+      {
+        "name": "Double chance",
+        "contract_count": 3
+      }
+    ],
+    "preflight": {
+      "venue": "smarkets",
+      "event": "Arsenal v Everton",
+      "market": "Full-time result",
+      "contract": "Arsenal",
+      "side": "buy",
+      "stake": 10.0
+    },
+    "status_line": "Stub dashboard ready"
+  }
+}

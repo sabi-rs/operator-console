@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::domain::WatchSnapshot;
+use crate::domain::{ExchangePanelSnapshot, VenueId, WatchSnapshot};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WatchRequest {
@@ -12,4 +12,15 @@ pub struct WatchRequest {
 
 pub trait WatchProvider {
     fn load_watch_snapshot(&mut self, request: &WatchRequest) -> color_eyre::Result<WatchSnapshot>;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProviderRequest {
+    LoadDashboard,
+    SelectVenue(VenueId),
+    Refresh,
+}
+
+pub trait ExchangeProvider {
+    fn handle(&mut self, request: ProviderRequest) -> color_eyre::Result<ExchangePanelSnapshot>;
 }
