@@ -55,9 +55,17 @@ fn oddsmatcher_selection_moves_with_arrow_keys() {
     app.set_trading_section(TradingSection::OddsMatcher);
     app.replace_oddsmatcher_rows(sample_rows(), String::from("Loaded test rows."));
 
-    let first = app.selected_oddsmatcher_row().expect("first row").id.clone();
+    let first = app
+        .selected_oddsmatcher_row()
+        .expect("first row")
+        .id
+        .clone();
     app.handle_key(KeyCode::Down);
-    let second = app.selected_oddsmatcher_row().expect("selected row").id.clone();
+    let second = app
+        .selected_oddsmatcher_row()
+        .expect("selected row")
+        .id
+        .clone();
 
     assert_ne!(first, second);
 }
@@ -114,10 +122,14 @@ fn oddsmatcher_panel_renders_filter_sidebar() {
     }
     let rendered = lines.join("\n");
 
-    assert!(rendered.contains("Filters"));
-    assert!(rendered.contains("Live Matches"));
+    assert!(rendered.contains("OddsMatcher"));
+    assert!(rendered.contains("Market Type"));
+    assert!(rendered.contains("Timeframe"));
+    assert!(rendered.contains("Offers"));
     assert!(rendered.contains("Selection"));
-    assert!(rendered.contains("Bookmaker"));
+    assert!(rendered.contains("Availability"));
+    assert!(rendered.contains("Date"));
+    assert!(rendered.contains("Time"));
 }
 
 #[test]
@@ -135,7 +147,8 @@ fn oddsmatcher_result_can_seed_calculator() {
     assert_eq!(app.calculator_back_odds(), row.back.odds);
     assert_eq!(app.calculator_lay_odds(), row.lay.odds);
     assert_eq!(
-        app.calculator_source().map(|source| source.selection_name.clone()),
+        app.calculator_source()
+            .map(|source| source.selection_name.clone()),
         Some(row.selection_name)
     );
 }
@@ -196,8 +209,24 @@ fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {
 
 fn sample_rows() -> Vec<OddsMatcherRow> {
     vec![
-        sample_row("match-1", "Arsenal", "Arsenal v Everton", 2.84, 2.9, 97.4, 120.0),
-        sample_row("match-2", "Liverpool", "Liverpool v Chelsea", 3.10, 3.2, 96.9, 210.0),
+        sample_row(
+            "match-1",
+            "Arsenal",
+            "Arsenal v Everton",
+            2.84,
+            2.9,
+            97.4,
+            120.0,
+        ),
+        sample_row(
+            "match-2",
+            "Liverpool",
+            "Liverpool v Chelsea",
+            3.10,
+            3.2,
+            96.9,
+            210.0,
+        ),
     ]
 }
 
