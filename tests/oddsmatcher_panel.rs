@@ -99,3 +99,26 @@ fn oddsmatcher_panel_renders_filter_sidebar() {
     assert!(rendered.contains("Selection"));
     assert!(rendered.contains("Bookmaker"));
 }
+
+#[test]
+fn oddsmatcher_result_can_seed_calculator() {
+    let mut app = App::default();
+    app.set_active_panel(Panel::Trading);
+    app.set_trading_section(TradingSection::OddsMatcher);
+    app.handle_key(KeyCode::Char('r'));
+
+    let row = app
+        .selected_oddsmatcher_row()
+        .expect("selected row")
+        .clone();
+
+    app.handle_key(KeyCode::Enter);
+
+    assert_eq!(app.active_trading_section(), TradingSection::Calculator);
+    assert_eq!(app.calculator_back_odds(), row.back.odds);
+    assert_eq!(app.calculator_lay_odds(), row.lay.odds);
+    assert_eq!(
+        app.calculator_source().map(|source| source.selection_name.clone()),
+        Some(row.selection_name)
+    );
+}

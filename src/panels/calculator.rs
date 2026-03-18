@@ -8,7 +8,7 @@ use crate::app::App;
 use crate::calculator::Output;
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let layout = Layout::vertical([Constraint::Length(6), Constraint::Min(10)]).split(area);
+    let layout = Layout::vertical([Constraint::Length(8), Constraint::Min(10)]).split(area);
     let lower = Layout::horizontal([Constraint::Percentage(44), Constraint::Percentage(56)])
         .split(layout[1]);
     let right = Layout::vertical([Constraint::Length(10), Constraint::Min(10)]).split(lower[1]);
@@ -50,6 +50,27 @@ fn render_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 output
                     .as_ref()
                     .map(|output| format!("{:.2}%", output.rating_pct))
+                    .unwrap_or_else(|| String::from("-")),
+            ),
+        ]),
+        Line::from(vec![
+            metric("Event", accent_blue()),
+            Span::raw(
+                app.calculator_source()
+                    .map(|source| source.event_name.clone())
+                    .unwrap_or_else(|| String::from("-")),
+            ),
+        ]),
+        Line::from(vec![
+            metric("Selection", accent_cyan()),
+            Span::raw(
+                app.calculator_source()
+                    .map(|source| {
+                        format!(
+                            "{} | {} | {:.2}",
+                            source.selection_name, source.competition_name, source.rating
+                        )
+                    })
                     .unwrap_or_else(|| String::from("-")),
             ),
         ]),
@@ -127,6 +148,12 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Line::raw("m toggle simple/advanced"),
         Line::raw(String::new()),
     ];
+    if let Some(source) = app.calculator_source() {
+        lines.push(Line::raw(format!(
+            "Seeded from {} -> {} / {}",
+            source.event_name, source.bookmaker_name, source.exchange_name
+        )));
+    }
     match output {
         Ok(output) => {
             lines.push(Line::raw(format!(

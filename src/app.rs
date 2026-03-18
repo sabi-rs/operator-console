@@ -248,6 +248,7 @@ impl CalculatorEditorState {
 pub struct CalculatorState {
     input: CalculatorInput,
     editor: CalculatorEditorState,
+    source: Option<CalculatorSourceContext>,
 }
 
 impl Default for CalculatorState {
@@ -255,8 +256,19 @@ impl Default for CalculatorState {
         Self {
             input: CalculatorInput::default(),
             editor: CalculatorEditorState::default(),
+            source: None,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct CalculatorSourceContext {
+    pub event_name: String,
+    pub selection_name: String,
+    pub competition_name: String,
+    pub rating: f64,
+    pub bookmaker_name: String,
+    pub exchange_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -564,6 +576,10 @@ impl App {
         &self.calculator
     }
 
+    pub fn calculator_source(&self) -> Option<&CalculatorSourceContext> {
+        self.calculator.source.as_ref()
+    }
+
     pub fn calculator_selected_field(&self) -> CalculatorField {
         self.calculator.editor.selected_field()
     }
@@ -589,6 +605,14 @@ impl App {
 
     pub fn calculator_mode(&self) -> CalculatorMode {
         self.calculator.input.mode
+    }
+
+    pub fn calculator_back_odds(&self) -> f64 {
+        self.calculator.input.back_odds
+    }
+
+    pub fn calculator_lay_odds(&self) -> f64 {
+        self.calculator.input.lay_odds
     }
 
     pub fn calculator_field_rows(&self) -> Vec<(CalculatorField, String, bool)> {
@@ -884,6 +908,8 @@ impl App {
             KeyCode::Enter => {
                 if self.is_oddsmatcher_filters_context() {
                     self.begin_oddsmatcher_edit();
+                } else if self.is_oddsmatcher_results_context() {
+                    self.load_calculator_from_selected_oddsmatcher();
                 } else if self.is_recorder_context() {
                     self.begin_recorder_edit();
                 } else if self.is_calculator_context() {
@@ -1039,6 +1065,10 @@ impl App {
 
     fn is_oddsmatcher_filters_context(&self) -> bool {
         self.is_oddsmatcher_context() && self.oddsmatcher_focus == OddsMatcherFocus::Filters
+    }
+
+    fn is_oddsmatcher_results_context(&self) -> bool {
+        self.is_oddsmatcher_context() && self.oddsmatcher_focus == OddsMatcherFocus::Results
     }
 
     fn is_oddsmatcher_editing_context(&self) -> bool {
@@ -1574,6 +1604,29 @@ impl App {
         self.oddsmatcher_query_note =
             oddsmatcher::save_query(&self.oddsmatcher_query_path, &self.oddsmatcher_query)?;
         Ok(())
+    }
+
+    fn load_calculator_from_selected_oddsmatcher(&mut self) {
+        let Some(row) = self.selected_oddsmatcher_row().cloned() else {
+            self.status_message = String::from("No OddsMatcher row is selected.");
+            return;
+        };
+
+        self.calculator.input.back_odds = row.back.odds;
+        self.calculator.input.lay_odds = row.lay.odds;
+        self.calculator.source = Some(CalculatorSourceContext {
+            event_name: row.event_name.clone(),
+            selection_name: row.selection_name.clone(),
+            competition_name: row.event_group.display_name.clone(),
+            rating: row.rating,
+            bookmaker_name: row.back.bookmaker.display_name.clone(),
+            exchange_name: row.lay.bookmaker.display_name.clone(),
+        });
+        self.trading_section = TradingSection::Calculator;
+        self.status_message = format!(
+            "Loaded calculator from OddsMatcher row: {} @ {:.2} / {:.2}.",
+            row.selection_name, row.back.odds, row.lay.odds
+        );
     }
 
     fn refresh_oddsmatcher(&mut self) -> Result<()> {
