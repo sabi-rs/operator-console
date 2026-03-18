@@ -1,14 +1,22 @@
+use std::path::Path;
+use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::backend::Backend;
-use ratatui::widgets::ListState;
+use ratatui::widgets::{ListState, TableState};
 use ratatui::{Frame, Terminal};
 
+use crate::calculator::{self, BetType, Input as CalculatorInput, Mode as CalculatorMode};
 use crate::domain::{ExchangePanelSnapshot, VenueId};
 use crate::provider::{ExchangeProvider, ProviderRequest};
-use crate::recorder::{ProcessRecorderSupervisor, RecorderConfig, RecorderStatus, RecorderSupervisor};
+use crate::recorder::{
+    default_config_path, load_recorder_config_or_default, save_recorder_config,
+    ProcessRecorderSupervisor, RecorderConfig, RecorderEditorState, RecorderField, RecorderStatus,
+    RecorderSupervisor,
+};
 use crate::stub_provider::StubExchangeProvider;
 use crate::transport::WorkerConfig;
 use crate::ui;
@@ -17,12 +25,232 @@ use crate::worker_client::{BetRecorderWorkerClient, WorkerClientExchangeProvider
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
     Dashboard,
-    Exchanges,
+    Trading,
+    Banking,
+    Observability,
+}
+
+impl Panel {
+    pub const ALL: [Self; 4] = [
+        Self::Dashboard,
+        Self::Trading,
+        Self::Banking,
+        Self::Observability,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dashboard => "Dashboard",
+            Self::Trading => "Trading",
+            Self::Banking => "Banking",
+            Self::Observability => "Observability",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradingSection {
+    Accounts,
+    Positions,
+    Markets,
+    Stats,
+    Calculator,
     Recorder,
+}
+
+impl TradingSection {
+    pub const ALL: [Self; 6] = [
+        Self::Accounts,
+        Self::Positions,
+        Self::Markets,
+        Self::Stats,
+        Self::Calculator,
+        Self::Recorder,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Accounts => "Accounts",
+            Self::Positions => "Positions",
+            Self::Markets => "Markets",
+            Self::Stats => "Stats",
+            Self::Calculator => "Calculator",
+            Self::Recorder => "Recorder",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BankingSection {
+    Accounts,
+    Transfers,
+    Transactions,
+    Reconciliation,
+    Stats,
+}
+
+impl BankingSection {
+    pub const ALL: [Self; 5] = [
+        Self::Accounts,
+        Self::Transfers,
+        Self::Transactions,
+        Self::Reconciliation,
+        Self::Stats,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Accounts => "Accounts",
+            Self::Transfers => "Transfers",
+            Self::Transactions => "Transactions",
+            Self::Reconciliation => "Reconciliation",
+            Self::Stats => "Stats",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservabilitySection {
+    Workers,
+    Watchers,
+    Configs,
+    Logs,
+    Health,
+}
+
+impl ObservabilitySection {
+    pub const ALL: [Self; 5] = [
+        Self::Workers,
+        Self::Watchers,
+        Self::Configs,
+        Self::Logs,
+        Self::Health,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Workers => "Workers",
+            Self::Watchers => "Watchers",
+            Self::Configs => "Configs",
+            Self::Logs => "Logs",
+            Self::Health => "Health",
+        }
+    }
 }
 
 type ProviderFactory = dyn Fn(&RecorderConfig) -> Box<dyn ExchangeProvider>;
 type StubFactory = dyn Fn() -> Box<dyn ExchangeProvider>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalculatorField {
+    BackStake,
+    BackOdds,
+    LayOdds,
+    BackCommission,
+    LayCommission,
+    RiskFreeAward,
+    RiskFreeRetention,
+    PartLayStakeOne,
+    PartLayOddsOne,
+    PartLayStakeTwo,
+    PartLayOddsTwo,
+}
+
+impl CalculatorField {
+    pub const ALL: [Self; 11] = [
+        Self::BackStake,
+        Self::BackOdds,
+        Self::LayOdds,
+        Self::BackCommission,
+        Self::LayCommission,
+        Self::RiskFreeAward,
+        Self::RiskFreeRetention,
+        Self::PartLayStakeOne,
+        Self::PartLayOddsOne,
+        Self::PartLayStakeTwo,
+        Self::PartLayOddsTwo,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BackStake => "Back Stake",
+            Self::BackOdds => "Back Odds",
+            Self::LayOdds => "Lay Odds",
+            Self::BackCommission => "Bookie Comm %",
+            Self::LayCommission => "Lay Comm %",
+            Self::RiskFreeAward => "Risk-Free Award",
+            Self::RiskFreeRetention => "Retention %",
+            Self::PartLayStakeOne => "Part Lay 1 Stake",
+            Self::PartLayOddsOne => "Part Lay 1 Odds",
+            Self::PartLayStakeTwo => "Part Lay 2 Stake",
+            Self::PartLayOddsTwo => "Part Lay 2 Odds",
+        }
+    }
+
+    fn display_value(self, state: &CalculatorState) -> String {
+        match self {
+            Self::BackStake => format!("{:.2}", state.input.back_stake),
+            Self::BackOdds => format!("{:.2}", state.input.back_odds),
+            Self::LayOdds => format!("{:.2}", state.input.lay_odds),
+            Self::BackCommission => format!("{:.2}", state.input.back_commission_pct),
+            Self::LayCommission => format!("{:.2}", state.input.lay_commission_pct),
+            Self::RiskFreeAward => format!("{:.2}", state.input.risk_free_award),
+            Self::RiskFreeRetention => format!("{:.2}", state.input.risk_free_retention_pct),
+            Self::PartLayStakeOne => format!("{:.2}", state.input.part_lays[0].stake),
+            Self::PartLayOddsOne => format!("{:.2}", state.input.part_lays[0].odds),
+            Self::PartLayStakeTwo => format!("{:.2}", state.input.part_lays[1].stake),
+            Self::PartLayOddsTwo => format!("{:.2}", state.input.part_lays[1].odds),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CalculatorEditorState {
+    selected_field: CalculatorField,
+    editing: bool,
+    buffer: String,
+    replace_on_input: bool,
+}
+
+impl Default for CalculatorEditorState {
+    fn default() -> Self {
+        Self {
+            selected_field: CalculatorField::BackStake,
+            editing: false,
+            buffer: String::new(),
+            replace_on_input: false,
+        }
+    }
+}
+
+impl CalculatorEditorState {
+    fn selected_field(&self) -> CalculatorField {
+        self.selected_field
+    }
+
+    fn select_next_field(&mut self) {
+        self.selected_field = next_from(self.selected_field, &CalculatorField::ALL);
+    }
+
+    fn select_previous_field(&mut self) {
+        self.selected_field = previous_from(self.selected_field, &CalculatorField::ALL);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CalculatorState {
+    input: CalculatorInput,
+    editor: CalculatorEditorState,
+}
+
+impl Default for CalculatorState {
+    fn default() -> Self {
+        Self {
+            input: CalculatorInput::default(),
+            editor: CalculatorEditorState::default(),
+        }
+    }
+}
 
 pub struct App {
     provider: Box<dyn ExchangeProvider>,
@@ -30,26 +258,45 @@ pub struct App {
     make_recorder_provider: Box<ProviderFactory>,
     recorder_supervisor: Box<dyn RecorderSupervisor>,
     recorder_config: RecorderConfig,
+    recorder_config_path: std::path::PathBuf,
+    recorder_config_note: String,
+    recorder_editor: RecorderEditorState,
     recorder_status: RecorderStatus,
+    calculator: CalculatorState,
     snapshot: ExchangePanelSnapshot,
     active_panel: Panel,
+    trading_section: TradingSection,
+    banking_section: BankingSection,
+    observability_section: ObservabilitySection,
     exchange_list_state: ListState,
+    open_position_table_state: TableState,
+    last_recorder_refresh_at: Option<Instant>,
     running: bool,
     status_message: String,
 }
 
 impl Default for App {
     fn default() -> Self {
-        let stub_factory = || Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>;
+        let stub_factory =
+            || Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>;
         let provider = stub_factory();
-        let recorder_config = RecorderConfig::default();
+        let recorder_config_path = default_config_path();
+        let (recorder_config, recorder_config_note) =
+            load_recorder_config_or_default(&recorder_config_path).unwrap_or_else(|error| {
+                (
+                    RecorderConfig::default(),
+                    format!("Recorder config load failed; using defaults: {error}"),
+                )
+            });
         let make_recorder_provider = default_recorder_provider_factory();
-        Self::with_dependencies(
+        Self::with_dependencies_and_storage(
             provider,
             Box::new(stub_factory),
             make_recorder_provider,
             Box::new(ProcessRecorderSupervisor::default()),
             recorder_config,
+            recorder_config_path,
+            recorder_config_note,
         )
         .expect("default stub provider should load dashboard")
     }
@@ -57,36 +304,80 @@ impl Default for App {
 
 impl App {
     pub fn from_provider<P: ExchangeProvider + 'static>(provider: P) -> Result<Self> {
-        let recorder_config = RecorderConfig::default();
-        Self::with_dependencies(
+        let recorder_config_path = default_config_path();
+        let (recorder_config, recorder_config_note) =
+            load_recorder_config_or_default(&recorder_config_path).unwrap_or_else(|error| {
+                (
+                    RecorderConfig::default(),
+                    format!("Recorder config load failed; using defaults: {error}"),
+                )
+            });
+        Self::with_dependencies_and_storage(
             Box::new(provider),
             Box::new(|| Box::new(StubExchangeProvider::default())),
             default_recorder_provider_factory(),
             Box::new(ProcessRecorderSupervisor::default()),
             recorder_config,
+            recorder_config_path,
+            recorder_config_note,
         )
     }
 
     pub fn with_dependencies(
-        mut provider: Box<dyn ExchangeProvider>,
+        provider: Box<dyn ExchangeProvider>,
         make_stub_provider: Box<StubFactory>,
         make_recorder_provider: Box<ProviderFactory>,
         recorder_supervisor: Box<dyn RecorderSupervisor>,
         recorder_config: RecorderConfig,
     ) -> Result<Self> {
+        Self::with_dependencies_and_storage(
+            provider,
+            make_stub_provider,
+            make_recorder_provider,
+            recorder_supervisor,
+            recorder_config,
+            default_config_path(),
+            String::from("Using in-memory recorder config."),
+        )
+    }
+
+    pub fn with_dependencies_and_storage(
+        mut provider: Box<dyn ExchangeProvider>,
+        make_stub_provider: Box<StubFactory>,
+        make_recorder_provider: Box<ProviderFactory>,
+        recorder_supervisor: Box<dyn RecorderSupervisor>,
+        recorder_config: RecorderConfig,
+        recorder_config_path: std::path::PathBuf,
+        recorder_config_note: String,
+    ) -> Result<Self> {
         let snapshot = provider.handle(ProviderRequest::LoadDashboard)?;
+        let status_message = snapshot.status_line.clone();
+        let mut open_position_table_state = TableState::default();
+        if !snapshot.open_positions.is_empty() {
+            open_position_table_state.select(Some(0));
+        }
+
         Ok(Self {
             provider,
             make_stub_provider,
             make_recorder_provider,
             recorder_supervisor,
             recorder_config,
+            recorder_config_path,
+            recorder_config_note,
+            recorder_editor: RecorderEditorState::default(),
             recorder_status: RecorderStatus::Disabled,
-            status_message: snapshot.status_line.clone(),
+            calculator: CalculatorState::default(),
             snapshot,
             active_panel: Panel::Dashboard,
+            trading_section: TradingSection::Accounts,
+            banking_section: BankingSection::Accounts,
+            observability_section: ObservabilitySection::Workers,
             exchange_list_state: ListState::default(),
+            open_position_table_state,
+            last_recorder_refresh_at: None,
             running: true,
+            status_message,
         })
     }
 
@@ -106,8 +397,24 @@ impl App {
         self.active_panel = panel;
     }
 
+    pub fn active_trading_section(&self) -> TradingSection {
+        self.trading_section
+    }
+
+    pub fn set_trading_section(&mut self, section: TradingSection) {
+        self.trading_section = section;
+    }
+
+    pub fn active_banking_section(&self) -> BankingSection {
+        self.banking_section
+    }
+
+    pub fn active_observability_section(&self) -> ObservabilitySection {
+        self.observability_section
+    }
+
     pub fn help_text(&self) -> &'static str {
-        "q quit | tab switch panel | j/k move | r refresh | s start recorder | x stop recorder"
+        "q quit | j/k modules | h/l sections | tab next | arrows nav | r refresh\nenter edit | esc cancel | [/] cycle suggestions | u reload | D defaults\ns start recorder | x stop recorder | c cash out | b cycle type | m toggle mode"
     }
 
     pub fn selected_exchange_row(&self) -> Option<usize> {
@@ -122,6 +429,14 @@ impl App {
         &self.status_message
     }
 
+    pub fn selected_open_position_row(&self) -> Option<usize> {
+        self.open_position_table_state.selected()
+    }
+
+    pub fn open_position_table_state(&mut self) -> &mut TableState {
+        &mut self.open_position_table_state
+    }
+
     pub fn recorder_config(&self) -> &RecorderConfig {
         &self.recorder_config
     }
@@ -130,12 +445,83 @@ impl App {
         &self.recorder_status
     }
 
+    pub fn recorder_config_path(&self) -> &Path {
+        &self.recorder_config_path
+    }
+
+    pub fn recorder_config_note(&self) -> &str {
+        &self.recorder_config_note
+    }
+
+    pub fn recorder_selected_field(&self) -> RecorderField {
+        self.recorder_editor.selected_field()
+    }
+
+    pub fn recorder_is_editing(&self) -> bool {
+        self.recorder_editor.editing
+    }
+
+    pub fn recorder_edit_buffer(&self) -> Option<&str> {
+        self.recorder_editor
+            .editing
+            .then_some(self.recorder_editor.buffer.as_str())
+    }
+
+    pub fn calculator_state(&self) -> &CalculatorState {
+        &self.calculator
+    }
+
+    pub fn calculator_selected_field(&self) -> CalculatorField {
+        self.calculator.editor.selected_field()
+    }
+
+    pub fn calculator_is_editing(&self) -> bool {
+        self.calculator.editor.editing
+    }
+
+    pub fn calculator_edit_buffer(&self) -> Option<&str> {
+        self.calculator
+            .editor
+            .editing
+            .then_some(self.calculator.editor.buffer.as_str())
+    }
+
+    pub fn calculator_output(&self) -> Result<calculator::Output, String> {
+        calculator::calculate(&self.calculator.input)
+    }
+
+    pub fn calculator_bet_type(&self) -> BetType {
+        self.calculator.input.bet_type
+    }
+
+    pub fn calculator_mode(&self) -> CalculatorMode {
+        self.calculator.input.mode
+    }
+
+    pub fn calculator_field_rows(&self) -> Vec<(CalculatorField, String, bool)> {
+        CalculatorField::ALL
+            .into_iter()
+            .map(|field| {
+                let value = if self.calculator.editor.editing
+                    && self.calculator.editor.selected_field() == field
+                {
+                    self.calculator.editor.buffer.clone()
+                } else {
+                    field.display_value(&self.calculator)
+                };
+                (
+                    field,
+                    value,
+                    self.calculator.editor.selected_field() == field,
+                )
+            })
+            .collect()
+    }
+
     pub fn refresh(&mut self) -> Result<()> {
         match self.provider.handle(ProviderRequest::Refresh) {
             Ok(snapshot) => {
-                self.snapshot = snapshot;
-                self.status_message = self.snapshot.status_line.clone();
-                self.clamp_selected_exchange_row();
+                self.replace_snapshot(snapshot);
                 Ok(())
             }
             Err(error) => {
@@ -149,39 +535,115 @@ impl App {
         }
     }
 
+    pub fn cash_out_next_actionable_bet(&mut self) -> Result<()> {
+        let actionable_bet_id = self
+            .snapshot
+            .exit_recommendations
+            .iter()
+            .find(|recommendation| recommendation.action == "cash_out")
+            .map(|recommendation| recommendation.bet_id.clone())
+            .ok_or_else(|| {
+                color_eyre::eyre::eyre!("No tracked bet is currently marked for cash out.")
+            })?;
+        let snapshot = self.provider.handle(ProviderRequest::CashOutTrackedBet {
+            bet_id: actionable_bet_id,
+        })?;
+        self.replace_snapshot(snapshot);
+        Ok(())
+    }
+
     pub fn start_recorder(&mut self) -> Result<()> {
+        self.persist_recorder_config()?;
         self.recorder_supervisor.start(&self.recorder_config)?;
         self.recorder_status = self.recorder_supervisor.poll_status();
         self.provider = (self.make_recorder_provider)(&self.recorder_config);
-        self.snapshot = self.provider.handle(ProviderRequest::LoadDashboard)?;
-        self.status_message = String::from("Recorder enabled from TUI.");
-        self.active_panel = Panel::Exchanges;
+        let snapshot = self.load_recorder_dashboard_with_retry()?;
+        self.replace_snapshot(snapshot);
+        self.last_recorder_refresh_at = Some(Instant::now());
+        self.active_panel = Panel::Trading;
+        self.trading_section = TradingSection::Positions;
+        Ok(())
+    }
+
+    pub fn autostart_recorder_if_enabled(&mut self) -> Result<()> {
+        if self.recorder_config.autostart && self.recorder_status != RecorderStatus::Running {
+            self.start_recorder()?;
+        }
         Ok(())
     }
 
     pub fn stop_recorder(&mut self) -> Result<()> {
         self.recorder_supervisor.stop()?;
         self.recorder_status = RecorderStatus::Disabled;
+        self.last_recorder_refresh_at = None;
         self.provider = (self.make_stub_provider)();
-        self.snapshot = self.provider.handle(ProviderRequest::LoadDashboard)?;
-        self.status_message = String::from("Recorder disabled from TUI.");
+        let snapshot = self.provider.handle(ProviderRequest::LoadDashboard)?;
+        self.replace_snapshot(snapshot);
         Ok(())
+    }
+
+    pub fn reload_recorder_config(&mut self) -> Result<()> {
+        let (config, note) = load_recorder_config_or_default(&self.recorder_config_path)?;
+        self.recorder_config = config;
+        self.recorder_config_note = note;
+        self.recorder_editor = RecorderEditorState::default();
+        self.apply_recorder_change("Reloaded recorder config from disk.")
+    }
+
+    pub fn reset_recorder_config(&mut self) -> Result<()> {
+        self.recorder_config = RecorderConfig::default();
+        self.recorder_editor = RecorderEditorState::default();
+        self.apply_recorder_change("Reset recorder config to defaults.")
     }
 
     pub fn next_panel(&mut self) {
         self.active_panel = match self.active_panel {
-            Panel::Dashboard => Panel::Exchanges,
-            Panel::Exchanges => Panel::Recorder,
-            Panel::Recorder => Panel::Dashboard,
+            Panel::Dashboard => Panel::Trading,
+            Panel::Trading => Panel::Banking,
+            Panel::Banking => Panel::Observability,
+            Panel::Observability => Panel::Dashboard,
         };
     }
 
     pub fn previous_panel(&mut self) {
         self.active_panel = match self.active_panel {
-            Panel::Dashboard => Panel::Recorder,
-            Panel::Exchanges => Panel::Dashboard,
-            Panel::Recorder => Panel::Exchanges,
+            Panel::Dashboard => Panel::Observability,
+            Panel::Trading => Panel::Dashboard,
+            Panel::Banking => Panel::Trading,
+            Panel::Observability => Panel::Banking,
         };
+    }
+
+    pub fn next_section(&mut self) {
+        match self.active_panel {
+            Panel::Dashboard => {}
+            Panel::Trading => {
+                self.trading_section = next_from(self.trading_section, &TradingSection::ALL)
+            }
+            Panel::Banking => {
+                self.banking_section = next_from(self.banking_section, &BankingSection::ALL)
+            }
+            Panel::Observability => {
+                self.observability_section =
+                    next_from(self.observability_section, &ObservabilitySection::ALL)
+            }
+        }
+    }
+
+    pub fn previous_section(&mut self) {
+        match self.active_panel {
+            Panel::Dashboard => {}
+            Panel::Trading => {
+                self.trading_section = previous_from(self.trading_section, &TradingSection::ALL)
+            }
+            Panel::Banking => {
+                self.banking_section = previous_from(self.banking_section, &BankingSection::ALL)
+            }
+            Panel::Observability => {
+                self.observability_section =
+                    previous_from(self.observability_section, &ObservabilitySection::ALL)
+            }
+        }
     }
 
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
@@ -205,44 +667,194 @@ impl App {
         ui::render(frame, self);
     }
 
-    fn handle_key_code(&mut self, key_code: KeyCode) {
+    pub fn handle_key(&mut self, key_code: KeyCode) {
+        if self.is_calculator_editing_context() {
+            match key_code {
+                KeyCode::Esc => {
+                    self.cancel_calculator_edit();
+                    return;
+                }
+                KeyCode::Enter => {
+                    if let Err(error) = self.apply_calculator_edit() {
+                        self.status_message = format!("Calculator input error: {error}");
+                    }
+                    return;
+                }
+                KeyCode::Backspace => {
+                    self.calculator_backspace();
+                    return;
+                }
+                KeyCode::Char(character) => {
+                    if matches!(character, '0'..='9' | '.' | '-') {
+                        self.calculator_push_char(character);
+                    }
+                    return;
+                }
+                _ => return,
+            }
+        }
+
+        if self.is_recorder_editing_context() {
+            match key_code {
+                KeyCode::Esc => {
+                    self.cancel_recorder_edit();
+                    return;
+                }
+                KeyCode::Enter => {
+                    if let Err(error) = self.apply_recorder_edit() {
+                        self.status_message = format!("Recorder config error: {error}");
+                    }
+                    return;
+                }
+                KeyCode::Backspace => {
+                    self.recorder_backspace();
+                    return;
+                }
+                KeyCode::Char(character) => {
+                    self.recorder_push_char(character);
+                    return;
+                }
+                _ => return,
+            }
+        }
+
         match key_code {
-            KeyCode::Char('q') | KeyCode::Esc => self.running = false,
-            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => self.next_panel(),
-            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => self.previous_panel(),
+            KeyCode::Char('q') => self.running = false,
+            KeyCode::Esc => self.running = false,
+            KeyCode::Tab => self.next_panel(),
+            KeyCode::BackTab => self.previous_panel(),
+            KeyCode::Right | KeyCode::Char('l') => self.next_section(),
+            KeyCode::Left | KeyCode::Char('h') => self.previous_section(),
+            KeyCode::Enter => {
+                if self.is_recorder_context() {
+                    self.begin_recorder_edit();
+                } else if self.is_calculator_context() {
+                    self.begin_calculator_edit();
+                }
+            }
+            KeyCode::Char('b') => {
+                if self.is_calculator_context() {
+                    self.cycle_calculator_bet_type();
+                }
+            }
+            KeyCode::Char('m') => {
+                if self.is_calculator_context() {
+                    self.toggle_calculator_mode();
+                }
+            }
             KeyCode::Char('r') => {
                 if let Err(error) = self.refresh() {
                     self.status_message = format!("Refresh failed: {error}");
                 }
             }
-            KeyCode::Char('s') => {
-                if self.active_panel == Panel::Recorder {
-                    if let Err(error) = self.start_recorder() {
-                        self.status_message = format!("Recorder start failed: {error}");
-                        self.recorder_status = RecorderStatus::Error;
+            KeyCode::Char('c') => {
+                if self.active_panel == Panel::Trading
+                    && self.trading_section == TradingSection::Positions
+                {
+                    if let Err(error) = self.cash_out_next_actionable_bet() {
+                        self.status_message = format!("Cash out failed: {error}");
                     }
+                } else {
+                    self.status_message =
+                        String::from("Open Trading > Positions to request a tracked-bet cash out.");
+                }
+            }
+            KeyCode::Char('[') => {
+                if self.is_recorder_context() {
+                    if let Err(error) = self.cycle_recorder_suggestion(false) {
+                        self.status_message = format!("Recorder suggestion failed: {error}");
+                    }
+                }
+            }
+            KeyCode::Char(']') => {
+                if self.is_recorder_context() {
+                    if let Err(error) = self.cycle_recorder_suggestion(true) {
+                        self.status_message = format!("Recorder suggestion failed: {error}");
+                    }
+                }
+            }
+            KeyCode::Char('u') => {
+                if self.is_recorder_context() {
+                    if let Err(error) = self.reload_recorder_config() {
+                        self.status_message = format!("Recorder reload failed: {error}");
+                    }
+                } else {
+                    self.status_message =
+                        String::from("Open Trading > Recorder to reload recorder config.");
+                }
+            }
+            KeyCode::Char('D') => {
+                if self.is_recorder_context() {
+                    if let Err(error) = self.reset_recorder_config() {
+                        self.status_message = format!("Recorder reset failed: {error}");
+                    }
+                } else {
+                    self.status_message =
+                        String::from("Open Trading > Recorder to reset recorder config.");
+                }
+            }
+            KeyCode::Char('s') => {
+                if let Err(error) = self.start_recorder() {
+                    self.status_message = format!("Recorder start failed: {error}");
+                    self.recorder_status = RecorderStatus::Error;
                 }
             }
             KeyCode::Char('x') => {
-                if self.active_panel == Panel::Recorder {
-                    if let Err(error) = self.stop_recorder() {
-                        self.status_message = format!("Recorder stop failed: {error}");
-                        self.recorder_status = RecorderStatus::Error;
-                    }
+                if let Err(error) = self.stop_recorder() {
+                    self.status_message = format!("Recorder stop failed: {error}");
+                    self.recorder_status = RecorderStatus::Error;
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if self.active_panel == Panel::Exchanges {
-                    self.select_next_exchange_row();
+            KeyCode::Char('j') => self.next_panel(),
+            KeyCode::Char('k') => self.previous_panel(),
+            KeyCode::Down => match (self.active_panel, self.trading_section) {
+                (Panel::Trading, TradingSection::Accounts) => self.select_next_exchange_row(),
+                (Panel::Trading, TradingSection::Positions | TradingSection::Markets) => {
+                    self.select_next_open_position_row()
                 }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if self.active_panel == Panel::Exchanges {
-                    self.select_previous_exchange_row();
+                (Panel::Trading, TradingSection::Calculator) => {
+                    self.calculator.editor.select_next_field()
                 }
-            }
+                (Panel::Trading, TradingSection::Recorder) => {
+                    self.recorder_editor.select_next_field()
+                }
+                _ => {}
+            },
+            KeyCode::Up => match (self.active_panel, self.trading_section) {
+                (Panel::Trading, TradingSection::Accounts) => self.select_previous_exchange_row(),
+                (Panel::Trading, TradingSection::Positions | TradingSection::Markets) => {
+                    self.select_previous_open_position_row()
+                }
+                (Panel::Trading, TradingSection::Calculator) => {
+                    self.calculator.editor.select_previous_field()
+                }
+                (Panel::Trading, TradingSection::Recorder) => {
+                    self.recorder_editor.select_previous_field()
+                }
+                _ => {}
+            },
             _ => {}
         }
+    }
+
+    fn handle_key_code(&mut self, key_code: KeyCode) {
+        self.handle_key(key_code);
+    }
+
+    fn is_recorder_context(&self) -> bool {
+        self.active_panel == Panel::Trading && self.trading_section == TradingSection::Recorder
+    }
+
+    fn is_recorder_editing_context(&self) -> bool {
+        self.is_recorder_context() && self.recorder_editor.editing
+    }
+
+    fn is_calculator_context(&self) -> bool {
+        self.active_panel == Panel::Trading && self.trading_section == TradingSection::Calculator
+    }
+
+    fn is_calculator_editing_context(&self) -> bool {
+        self.is_calculator_context() && self.calculator.editor.editing
     }
 
     fn clamp_selected_exchange_row(&mut self) {
@@ -251,6 +863,18 @@ impl App {
                 self.exchange_list_state.select(None);
             }
             _ => {}
+        }
+    }
+
+    fn clamp_selected_open_position_row(&mut self) {
+        if self.snapshot.open_positions.is_empty() {
+            self.open_position_table_state.select(None);
+            return;
+        }
+
+        match self.open_position_table_state.selected() {
+            Some(index) if index < self.snapshot.open_positions.len() => {}
+            _ => self.open_position_table_state.select(Some(0)),
         }
     }
 
@@ -284,6 +908,36 @@ impl App {
 
         self.exchange_list_state.select(Some(previous_index));
         self.sync_selected_venue();
+    }
+
+    pub fn select_next_open_position_row(&mut self) {
+        if self.snapshot.open_positions.is_empty() {
+            self.open_position_table_state.select(None);
+            return;
+        }
+
+        let next_index = match self.open_position_table_state.selected() {
+            Some(index) if index + 1 < self.snapshot.open_positions.len() => index + 1,
+            Some(index) => index,
+            None => 0,
+        };
+
+        self.open_position_table_state.select(Some(next_index));
+    }
+
+    pub fn select_previous_open_position_row(&mut self) {
+        if self.snapshot.open_positions.is_empty() {
+            self.open_position_table_state.select(None);
+            return;
+        }
+
+        let previous_index = match self.open_position_table_state.selected() {
+            Some(index) if index > 0 => index - 1,
+            Some(index) => index,
+            None => 0,
+        };
+
+        self.open_position_table_state.select(Some(previous_index));
     }
 
     fn sync_selected_venue(&mut self) {
@@ -320,7 +974,13 @@ impl App {
             self.recorder_status = next_status.clone();
             if matches!(next_status, RecorderStatus::Stopped | RecorderStatus::Error) {
                 self.status_message = format!("Recorder status changed to {next_status:?}.");
+                self.last_recorder_refresh_at = None;
             }
+        }
+
+        if self.recorder_status == RecorderStatus::Running && self.recorder_refresh_due() {
+            self.last_recorder_refresh_at = Some(Instant::now());
+            let _ = self.refresh();
         }
     }
 
@@ -348,6 +1008,256 @@ impl App {
             }
         }
     }
+
+    fn replace_snapshot(&mut self, snapshot: ExchangePanelSnapshot) {
+        self.snapshot = snapshot;
+        self.status_message = self.snapshot.status_line.clone();
+        self.clamp_selected_exchange_row();
+        self.clamp_selected_open_position_row();
+    }
+
+    fn load_recorder_dashboard_with_retry(&mut self) -> Result<ExchangePanelSnapshot> {
+        let start = Instant::now();
+        let timeout = self.recorder_startup_timeout();
+        let retry_delay = Duration::from_millis(100);
+        let log_path = self.recorder_log_path();
+        loop {
+            let last_error = match self.provider.handle(ProviderRequest::LoadDashboard) {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(error) => error.to_string(),
+            };
+
+            self.recorder_status = self.recorder_supervisor.poll_status();
+            if matches!(
+                self.recorder_status,
+                RecorderStatus::Stopped | RecorderStatus::Error
+            ) {
+                return Err(color_eyre::eyre::eyre!(
+                    "recorder watcher stopped before first snapshot: {last_error}. See {}",
+                    log_path.display()
+                ));
+            }
+
+            if start.elapsed() >= timeout {
+                return Err(color_eyre::eyre::eyre!(
+                    "timed out waiting for recorder snapshot: {last_error}. See {}",
+                    log_path.display()
+                ));
+            }
+
+            thread::sleep(retry_delay);
+        }
+    }
+
+    fn recorder_startup_timeout(&self) -> Duration {
+        Duration::from_secs(self.recorder_config.interval_seconds.max(1) + 5)
+    }
+
+    fn recorder_log_path(&self) -> std::path::PathBuf {
+        self.recorder_config.run_dir.join("watcher.log")
+    }
+
+    fn recorder_refresh_due(&self) -> bool {
+        let refresh_interval = Duration::from_secs(1);
+        self.last_recorder_refresh_at
+            .is_none_or(|last| last.elapsed() >= refresh_interval)
+    }
+
+    fn begin_recorder_edit(&mut self) {
+        let field = self.recorder_editor.selected_field();
+        self.recorder_editor.buffer = field.display_value(&self.recorder_config);
+        self.recorder_editor.editing = true;
+        self.recorder_editor.replace_on_input = true;
+        self.status_message = format!("Editing recorder {}.", field.label());
+    }
+
+    fn apply_recorder_edit(&mut self) -> Result<()> {
+        let field = self.recorder_editor.selected_field();
+        let value = self.recorder_editor.buffer.clone();
+        field.apply_value(&mut self.recorder_config, &value)?;
+        self.recorder_editor.editing = false;
+        self.recorder_editor.buffer.clear();
+        self.recorder_editor.replace_on_input = false;
+        self.apply_recorder_change(&format!("Updated recorder {}.", field.label()))
+    }
+
+    fn cancel_recorder_edit(&mut self) {
+        self.recorder_editor.editing = false;
+        self.recorder_editor.buffer.clear();
+        self.recorder_editor.replace_on_input = false;
+        self.status_message = String::from("Cancelled recorder edit.");
+    }
+
+    fn recorder_push_char(&mut self, character: char) {
+        if self.recorder_editor.replace_on_input {
+            self.recorder_editor.buffer.clear();
+            self.recorder_editor.replace_on_input = false;
+        }
+        self.recorder_editor.buffer.push(character);
+    }
+
+    fn recorder_backspace(&mut self) {
+        if self.recorder_editor.replace_on_input {
+            self.recorder_editor.buffer.clear();
+            self.recorder_editor.replace_on_input = false;
+            return;
+        }
+        self.recorder_editor.buffer.pop();
+    }
+
+    fn cycle_recorder_suggestion(&mut self, forward: bool) -> Result<()> {
+        let field = self.recorder_editor.selected_field();
+        let suggestions = field.suggestions();
+        if suggestions.is_empty() {
+            return Ok(());
+        }
+
+        let current_value = field.display_value(&self.recorder_config);
+        let current_index = suggestions.iter().position(|value| value == &current_value);
+        let next_index = match (current_index, forward) {
+            (Some(index), true) => (index + 1) % suggestions.len(),
+            (Some(index), false) => {
+                if index == 0 {
+                    suggestions.len() - 1
+                } else {
+                    index - 1
+                }
+            }
+            (None, _) => 0,
+        };
+
+        field.apply_value(&mut self.recorder_config, &suggestions[next_index])?;
+        self.apply_recorder_change(&format!(
+            "Applied recorder suggestion for {}.",
+            field.label()
+        ))
+    }
+
+    fn persist_recorder_config(&mut self) -> Result<()> {
+        self.recorder_config_note =
+            save_recorder_config(&self.recorder_config_path, &self.recorder_config)?;
+        Ok(())
+    }
+
+    fn apply_recorder_change(&mut self, message: &str) -> Result<()> {
+        self.persist_recorder_config()?;
+
+        if self.recorder_status == RecorderStatus::Running {
+            self.recorder_supervisor.stop()?;
+            self.recorder_supervisor.start(&self.recorder_config)?;
+            self.recorder_status = self.recorder_supervisor.poll_status();
+            self.provider = (self.make_recorder_provider)(&self.recorder_config);
+            let snapshot = self.load_recorder_dashboard_with_retry()?;
+            self.replace_snapshot(snapshot);
+            self.last_recorder_refresh_at = Some(Instant::now());
+            self.status_message = format!("{message} Restarted recorder to apply the change.");
+            return Ok(());
+        }
+
+        self.status_message = String::from(message);
+        Ok(())
+    }
+
+    fn begin_calculator_edit(&mut self) {
+        let field = self.calculator.editor.selected_field();
+        self.calculator.editor.buffer = field.display_value(&self.calculator);
+        self.calculator.editor.editing = true;
+        self.calculator.editor.replace_on_input = true;
+        self.status_message = format!("Editing calculator {}.", field.label());
+    }
+
+    fn apply_calculator_edit(&mut self) -> Result<()> {
+        let field = self.calculator.editor.selected_field();
+        let value = self.calculator.editor.buffer.clone();
+        let parsed = value
+            .parse::<f64>()
+            .map_err(|_| color_eyre::eyre::eyre!("{} must be numeric.", field.label()))?;
+        match field {
+            CalculatorField::BackStake => self.calculator.input.back_stake = parsed,
+            CalculatorField::BackOdds => self.calculator.input.back_odds = parsed,
+            CalculatorField::LayOdds => self.calculator.input.lay_odds = parsed,
+            CalculatorField::BackCommission => self.calculator.input.back_commission_pct = parsed,
+            CalculatorField::LayCommission => self.calculator.input.lay_commission_pct = parsed,
+            CalculatorField::RiskFreeAward => self.calculator.input.risk_free_award = parsed,
+            CalculatorField::RiskFreeRetention => {
+                self.calculator.input.risk_free_retention_pct = parsed
+            }
+            CalculatorField::PartLayStakeOne => self.calculator.input.part_lays[0].stake = parsed,
+            CalculatorField::PartLayOddsOne => self.calculator.input.part_lays[0].odds = parsed,
+            CalculatorField::PartLayStakeTwo => self.calculator.input.part_lays[1].stake = parsed,
+            CalculatorField::PartLayOddsTwo => self.calculator.input.part_lays[1].odds = parsed,
+        }
+        self.calculator.editor.editing = false;
+        self.calculator.editor.buffer.clear();
+        self.calculator.editor.replace_on_input = false;
+        self.status_message = format!("Updated calculator {}.", field.label());
+        Ok(())
+    }
+
+    fn cancel_calculator_edit(&mut self) {
+        self.calculator.editor.editing = false;
+        self.calculator.editor.buffer.clear();
+        self.calculator.editor.replace_on_input = false;
+        self.status_message = String::from("Cancelled calculator edit.");
+    }
+
+    fn calculator_push_char(&mut self, character: char) {
+        if self.calculator.editor.replace_on_input {
+            self.calculator.editor.buffer.clear();
+            self.calculator.editor.replace_on_input = false;
+        }
+        self.calculator.editor.buffer.push(character);
+    }
+
+    fn calculator_backspace(&mut self) {
+        if self.calculator.editor.replace_on_input {
+            self.calculator.editor.buffer.clear();
+            self.calculator.editor.replace_on_input = false;
+            return;
+        }
+        self.calculator.editor.buffer.pop();
+    }
+
+    fn cycle_calculator_bet_type(&mut self) {
+        let current = self.calculator.input.bet_type;
+        let index = BetType::ALL
+            .iter()
+            .position(|candidate| candidate == &current)
+            .unwrap_or(0);
+        self.calculator.input.bet_type = BetType::ALL[(index + 1) % BetType::ALL.len()];
+        self.status_message = format!(
+            "Calculator bet type set to {}.",
+            self.calculator.input.bet_type.label()
+        );
+    }
+
+    fn toggle_calculator_mode(&mut self) {
+        self.calculator.input.mode.toggle();
+        self.status_message = format!(
+            "Calculator mode set to {}.",
+            self.calculator.input.mode.label()
+        );
+    }
+}
+
+fn next_from<T: Copy + PartialEq>(value: T, all: &[T]) -> T {
+    let index = all
+        .iter()
+        .position(|candidate| candidate == &value)
+        .unwrap_or(0);
+    all[(index + 1) % all.len()]
+}
+
+fn previous_from<T: Copy + PartialEq>(value: T, all: &[T]) -> T {
+    let index = all
+        .iter()
+        .position(|candidate| candidate == &value)
+        .unwrap_or(0);
+    if index == 0 {
+        all[all.len() - 1]
+    } else {
+        all[index - 1]
+    }
 }
 
 fn default_recorder_provider_factory() -> Box<ProviderFactory> {
@@ -359,11 +1269,249 @@ fn default_recorder_provider_factory() -> Box<ProviderFactory> {
                 run_dir: Some(config.run_dir.clone()),
                 account_payload_path: None,
                 open_bets_payload_path: None,
+                companion_legs_path: config.companion_legs_path.clone(),
                 agent_browser_session: None,
                 commission_rate: config.commission_rate.parse::<f64>().unwrap_or(0.0),
                 target_profit: config.target_profit.parse::<f64>().unwrap_or(1.0),
                 stop_loss: config.stop_loss.parse::<f64>().unwrap_or(1.0),
+                hard_margin_call_profit_floor: parse_optional_f64(
+                    &config.hard_margin_call_profit_floor,
+                ),
+                warn_only_default: config.warn_only_default,
             },
         )) as Box<dyn ExchangeProvider>
     })
+}
+
+fn parse_optional_f64(value: &str) -> Option<f64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        trimmed.parse::<f64>().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    use crate::domain::{
+        ExchangePanelSnapshot, VenueId, VenueStatus, VenueSummary, WorkerStatus, WorkerSummary,
+    };
+    use crate::provider::{ExchangeProvider, ProviderRequest};
+    use crate::recorder::{RecorderConfig, RecorderStatus, RecorderSupervisor};
+
+    use super::App;
+
+    struct RefreshingProvider {
+        refresh_count: Rc<RefCell<usize>>,
+        load_snapshot: ExchangePanelSnapshot,
+        refresh_snapshot: ExchangePanelSnapshot,
+    }
+
+    impl ExchangeProvider for RefreshingProvider {
+        fn handle(
+            &mut self,
+            request: ProviderRequest,
+        ) -> color_eyre::Result<ExchangePanelSnapshot> {
+            match request {
+                ProviderRequest::LoadDashboard => Ok(self.load_snapshot.clone()),
+                ProviderRequest::Refresh => {
+                    *self.refresh_count.borrow_mut() += 1;
+                    Ok(self.refresh_snapshot.clone())
+                }
+                ProviderRequest::SelectVenue(_) | ProviderRequest::CashOutTrackedBet { .. } => {
+                    Ok(self.refresh_snapshot.clone())
+                }
+            }
+        }
+    }
+
+    struct RunningSupervisor;
+
+    struct DisabledSupervisor;
+
+    impl RecorderSupervisor for RunningSupervisor {
+        fn start(&mut self, _config: &RecorderConfig) -> color_eyre::Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> color_eyre::Result<()> {
+            Ok(())
+        }
+
+        fn poll_status(&mut self) -> RecorderStatus {
+            RecorderStatus::Running
+        }
+    }
+
+    impl RecorderSupervisor for DisabledSupervisor {
+        fn start(&mut self, _config: &RecorderConfig) -> color_eyre::Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> color_eyre::Result<()> {
+            Ok(())
+        }
+
+        fn poll_status(&mut self) -> RecorderStatus {
+            RecorderStatus::Disabled
+        }
+    }
+
+    #[test]
+    fn poll_recorder_refreshes_running_recorder_automatically() {
+        let refresh_count = Rc::new(RefCell::new(0));
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(RefreshingProvider {
+                refresh_count: refresh_count.clone(),
+                load_snapshot: sample_snapshot("Initial dashboard"),
+                refresh_snapshot: sample_snapshot("Auto refreshed dashboard"),
+            }),
+            Box::new(|| {
+                Box::new(RefreshingProvider {
+                    refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: sample_snapshot("Stub dashboard"),
+                    refresh_snapshot: sample_snapshot("Stub dashboard"),
+                }) as Box<dyn ExchangeProvider>
+            }),
+            Box::new(|_| {
+                Box::new(RefreshingProvider {
+                    refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: sample_snapshot("Recorder dashboard"),
+                    refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                }) as Box<dyn ExchangeProvider>
+            }),
+            Box::new(RunningSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        app.recorder_status = RecorderStatus::Running;
+        app.last_recorder_refresh_at = Some(Instant::now() - Duration::from_secs(2));
+
+        app.poll_recorder();
+
+        assert_eq!(app.snapshot().status_line, "Auto refreshed dashboard");
+        assert_eq!(*refresh_count.borrow(), 1);
+    }
+
+    #[test]
+    fn poll_recorder_skips_auto_refresh_when_not_running() {
+        let refresh_count = Rc::new(RefCell::new(0));
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(RefreshingProvider {
+                refresh_count: refresh_count.clone(),
+                load_snapshot: sample_snapshot("Initial dashboard"),
+                refresh_snapshot: sample_snapshot("Auto refreshed dashboard"),
+            }),
+            Box::new(|| {
+                Box::new(RefreshingProvider {
+                    refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: sample_snapshot("Stub dashboard"),
+                    refresh_snapshot: sample_snapshot("Stub dashboard"),
+                }) as Box<dyn ExchangeProvider>
+            }),
+            Box::new(|_| {
+                Box::new(RefreshingProvider {
+                    refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: sample_snapshot("Recorder dashboard"),
+                    refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                }) as Box<dyn ExchangeProvider>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        app.recorder_status = RecorderStatus::Disabled;
+        app.last_recorder_refresh_at = Some(Instant::now() - Duration::from_secs(2));
+
+        app.poll_recorder();
+
+        assert_eq!(app.snapshot().status_line, "Initial dashboard");
+        assert_eq!(*refresh_count.borrow(), 0);
+    }
+
+    #[test]
+    fn poll_recorder_skips_auto_refresh_before_interval_elapses() {
+        let refresh_count = Rc::new(RefCell::new(0));
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(RefreshingProvider {
+                refresh_count: refresh_count.clone(),
+                load_snapshot: sample_snapshot("Initial dashboard"),
+                refresh_snapshot: sample_snapshot("Auto refreshed dashboard"),
+            }),
+            Box::new(|| {
+                Box::new(RefreshingProvider {
+                    refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: sample_snapshot("Stub dashboard"),
+                    refresh_snapshot: sample_snapshot("Stub dashboard"),
+                }) as Box<dyn ExchangeProvider>
+            }),
+            Box::new(|_| {
+                Box::new(RefreshingProvider {
+                    refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: sample_snapshot("Recorder dashboard"),
+                    refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                }) as Box<dyn ExchangeProvider>
+            }),
+            Box::new(RunningSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        app.recorder_status = RecorderStatus::Running;
+        app.last_recorder_refresh_at = Some(Instant::now());
+
+        app.poll_recorder();
+
+        assert_eq!(app.snapshot().status_line, "Initial dashboard");
+        assert_eq!(*refresh_count.borrow(), 0);
+    }
+
+    fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {
+        ExchangePanelSnapshot {
+            worker: WorkerSummary {
+                name: String::from("bet-recorder"),
+                status: WorkerStatus::Ready,
+                detail: String::from("ready"),
+            },
+            venues: vec![VenueSummary {
+                id: VenueId::Smarkets,
+                label: String::from("Smarkets"),
+                status: VenueStatus::Connected,
+                detail: String::from("ready"),
+                event_count: 1,
+                market_count: 1,
+            }],
+            selected_venue: Some(VenueId::Smarkets),
+            events: Vec::new(),
+            markets: Vec::new(),
+            preflight: None,
+            status_line: String::from(status_line),
+            runtime: None,
+            account_stats: None,
+            open_positions: Vec::new(),
+            historical_positions: Vec::new(),
+            other_open_bets: Vec::new(),
+            decisions: Vec::new(),
+            watch: None,
+            tracked_bets: Vec::new(),
+            exit_policy: Default::default(),
+            exit_recommendations: Vec::new(),
+        }
+    }
 }
