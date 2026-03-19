@@ -8,6 +8,10 @@ pub enum VenueId {
     Bet365,
     Betfair,
     Betfred,
+    Coral,
+    Ladbrokes,
+    Kwik,
+    Bet600,
     Matchbook,
     Betdaq,
     Betway,
@@ -21,6 +25,10 @@ impl VenueId {
             Self::Bet365 => "bet365",
             Self::Betfair => "betfair",
             Self::Betfred => "betfred",
+            Self::Coral => "coral",
+            Self::Ladbrokes => "ladbrokes",
+            Self::Kwik => "kwik",
+            Self::Bet600 => "bet600",
             Self::Matchbook => "matchbook",
             Self::Betdaq => "betdaq",
             Self::Betway => "betway",
@@ -351,6 +359,74 @@ pub struct ExchangePanelSnapshot {
     pub tracked_bets: Vec<TrackedBetRow>,
     pub exit_policy: ExitPolicySummary,
     pub exit_recommendations: Vec<ExitRecommendation>,
+    pub horse_matcher: Option<HorseMatcherSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HorseMatcherSnapshot {
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub captured_at: String,
+    pub source_count: usize,
+    pub ready_source_count: usize,
+    pub sources: Vec<HorseMatcherSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HorseMatcherSource {
+    pub venue: VenueId,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub venue_label: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub kind: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub status: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub detail: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub page_url: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub page_title: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub event_name: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub market_name: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub start_hint: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub captured_at: String,
+    pub quotes: Vec<HorseMatcherQuote>,
+}
+
+impl Default for HorseMatcherSource {
+    fn default() -> Self {
+        Self {
+            venue: VenueId::Smarkets,
+            venue_label: String::new(),
+            kind: String::new(),
+            status: String::new(),
+            detail: String::new(),
+            page_url: String::new(),
+            page_title: String::new(),
+            event_name: String::new(),
+            market_name: String::new(),
+            start_hint: String::new(),
+            captured_at: String::new(),
+            quotes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HorseMatcherQuote {
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub selection_name: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub side: String,
+    pub odds: f64,
+    pub liquidity: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

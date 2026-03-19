@@ -10,8 +10,12 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::app::PositionsFocus;
+use crate::domain::VenueId;
 use crate::domain::{
     ExchangePanelSnapshot, OpenPositionRow, OtherOpenBetRow, TrackedBetRow, TrackedLeg,
+};
+use crate::trading_actions::{
+    TradingActionSeed, TradingActionSide, TradingActionSource, TradingActionSourceContext,
 };
 
 pub fn render(
@@ -24,6 +28,7 @@ pub fn render(
     show_live_view_overlay: bool,
     status_message: &str,
     help_text: &str,
+    status_scroll: u16,
 ) {
     let active_views = active_position_views(snapshot);
     let exit_recommendations = derived_exit_recommendations(snapshot);
@@ -181,7 +186,14 @@ pub fn render(
         empty_row("No other open bets are loaded.", 5),
         None,
     );
-    render_operator_log(frame, right[4], status_message, help_text, positions_focus);
+    render_operator_log(
+        frame,
+        right[4],
+        status_message,
+        help_text,
+        positions_focus,
+        status_scroll,
+    );
 
     if show_live_view_overlay {
         render_live_view_overlay(frame, area, selected_active);
@@ -211,6 +223,96 @@ struct DerivedExitRecommendation {
 
 pub(crate) fn active_position_row_count(snapshot: &ExchangePanelSnapshot) -> usize {
     active_position_views(snapshot).len()
+}
+
+pub(crate) fn selected_active_position_seed(
+    snapshot: &ExchangePanelSnapshot,
+    active_table_state: &TableState,
+) -> Option<TradingActionSeed> {
+    let active_views = active_position_views(snapshot);
+    let view = selected_active_position(&active_views, active_table_state)?;
+
+    let event_name = active_event_label(view);
+    let market_name = active_market_name(view);
+    let selection_name = active_selection_label(view);
+    let event_url = view
+        .open_position
+        .map(|open_position| open_position.event_url.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let tracked_bet_id = view
+        .tracked_bet
+        .map(|tracked_bet| tracked_bet.bet_id.clone())
+        .unwrap_or_else(|| String::from("position-row"));
+    let default_stake = view
+        .open_position
+        .map(|open_position| open_position.stake)
+        .or_else(|| {
+            view.tracked_bet
+                .and_then(|tracked_bet| tracked_bet.stake_gbp)
+        })
+        .or_else(|| {
+            view.sportsbook_bet
+                .map(|sportsbook_bet| sportsbook_bet.stake)
+        });
+    let buy_price = view
+        .open_position
+        .and_then(|open_position| open_position.current_buy_odds);
+    let sell_price = view
+        .open_position
+        .and_then(|open_position| open_position.current_sell_odds);
+    let default_side = if buy_price.is_some() {
+        TradingActionSide::Buy
+    } else {
+        TradingActionSide::Sell
+    };
+
+    Some(TradingActionSeed {
+        source: TradingActionSource::Positions,
+        venue: VenueId::Smarkets,
+        source_ref: tracked_bet_id,
+        event_name,
+        market_name,
+        selection_name,
+        event_url,
+        deep_link_url: None,
+        betslip_market_id: None,
+        betslip_selection_id: None,
+        buy_price,
+        sell_price,
+        default_side,
+        default_stake,
+        source_context: TradingActionSourceContext {
+            is_in_play: view
+                .open_position
+                .map(|open_position| open_position.is_in_play)
+                .unwrap_or(false),
+            event_status: view
+                .open_position
+                .map(|open_position| open_position.event_status.clone())
+                .unwrap_or_default(),
+            market_status: view
+                .open_position
+                .map(|open_position| open_position.market_status.clone())
+                .unwrap_or_default(),
+            live_clock: view
+                .open_position
+                .map(|open_position| open_position.live_clock.clone())
+                .unwrap_or_default(),
+            can_trade_out: view
+                .open_position
+                .map(|open_position| open_position.can_trade_out)
+                .unwrap_or(false),
+            current_pnl_amount: view
+                .open_position
+                .map(|open_position| open_position.pnl_amount),
+            baseline_stake: view.open_position.map(|open_position| open_position.stake),
+            baseline_liability: view
+                .open_position
+                .map(|open_position| open_position.liability),
+            baseline_price: view.open_position.map(|open_position| open_position.price),
+        },
+        notes: vec![String::from("positions")],
+    })
 }
 
 pub(crate) fn next_actionable_cash_out_bet_id(snapshot: &ExchangePanelSnapshot) -> Option<String> {
@@ -1960,6 +2062,7 @@ fn render_operator_log(
     status_message: &str,
     help_text: &str,
     positions_focus: PositionsFocus,
+    status_scroll: u16,
 ) {
     let lines = vec![
         Line::from(vec![
@@ -1967,7 +2070,7 @@ fn render_operator_log(
             Span::raw(status_message.to_string()),
         ]),
         Line::raw(format!(
-            "󰕮 pane {} • history is scrollable once selected",
+            "󰕮 pane {} • history scrolls when selected • PgUp/PgDn scroll status",
             positions_focus.label()
         )),
     ]
@@ -1981,6 +2084,7 @@ fn render_operator_log(
     .collect::<Vec<_>>();
     let paragraph = Paragraph::new(lines)
         .block(section_block("󰌌 Operator Feed", accent_blue()))
+        .scroll((status_scroll, 0))
         .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
 }
@@ -2785,6 +2889,7 @@ mod tests {
             tracked_bets: Vec::new(),
             exit_policy: Default::default(),
             exit_recommendations: Vec::new(),
+            horse_matcher: None,
         };
 
         let rendered = summary_lines(&snapshot)
@@ -3411,6 +3516,7 @@ mod tests {
                 worst_case_pnl: 1.27,
                 cash_out_venue: Some(String::from("smarkets")),
             }],
+            horse_matcher: None,
         }
     }
 

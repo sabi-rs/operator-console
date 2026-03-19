@@ -29,6 +29,10 @@ fn venue_id_display_labels_are_stable() {
     assert_eq!(VenueId::Bet365.as_str(), "bet365");
     assert_eq!(VenueId::Betfair.as_str(), "betfair");
     assert_eq!(VenueId::Betfred.as_str(), "betfred");
+    assert_eq!(VenueId::Coral.as_str(), "coral");
+    assert_eq!(VenueId::Ladbrokes.as_str(), "ladbrokes");
+    assert_eq!(VenueId::Kwik.as_str(), "kwik");
+    assert_eq!(VenueId::Bet600.as_str(), "bet600");
     assert_eq!(VenueId::Betdaq.as_str(), "betdaq");
     assert_eq!(VenueId::Betway.as_str(), "betway");
     assert_eq!(VenueId::Betuk.as_str(), "betuk");

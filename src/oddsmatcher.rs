@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{eyre, Context, Result};
 use reqwest::blocking::Client;
+use reqwest::StatusCode;
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -323,7 +324,16 @@ impl OddsMatcherField {
 
     pub fn suggestions(self) -> Vec<String> {
         match self {
-            Self::Bookmaker => vec![String::from("betvictor")],
+            Self::Bookmaker => vec![
+                String::from("betvictor"),
+                String::from("betuk"),
+                String::from("betfred"),
+                String::from("coral"),
+                String::from("ladbrokes"),
+                String::from("kwik"),
+                String::from("bet600"),
+                String::from("bet365"),
+            ],
             Self::Exchange => vec![String::from("smarketsexchange")],
             Self::Sport => vec![String::from("soccer")],
             Self::MarketGroup => vec![String::from("match-odds")],
@@ -416,6 +426,12 @@ pub struct GraphQlError {
 pub struct GetBestMatchesData {
     #[serde(rename = "getBestMatches")]
     pub get_best_matches: Vec<OddsMatcherRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct GetBestMatchesRawData {
+    #[serde(rename = "getBestMatches")]
+    get_best_matches: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -552,9 +568,20 @@ pub fn fetch_best_matches(
         .wrap_err("failed to send OddsMatcher GraphQL request")?;
 
     let status = response.status();
-    let graphql: GraphQlResponse<GetBestMatchesData> = response
-        .json()
-        .wrap_err("failed to decode OddsMatcher GraphQL response")?;
+    let body = response
+        .text()
+        .wrap_err("failed to read OddsMatcher GraphQL response body")?;
+    decode_best_matches_response(status, &body)
+}
+
+fn decode_best_matches_response(status: StatusCode, body: &str) -> Result<Vec<OddsMatcherRow>> {
+    let graphql: GraphQlResponse<GetBestMatchesRawData> =
+        serde_json::from_str(body).map_err(|error| {
+            let snippet = truncate_for_error(body, 320);
+            eyre!(
+            "failed to decode OddsMatcher GraphQL response: {error}. response snippet: {snippet}"
+        )
+        })?;
 
     if !status.is_success() {
         let detail = graphql
@@ -578,15 +605,50 @@ pub fn fetch_best_matches(
     let data = graphql
         .data
         .ok_or_else(|| eyre!("OddsMatcher GraphQL response did not include data"))?;
-    Ok(data.get_best_matches)
+    let mut rows = Vec::new();
+    let mut decode_errors = Vec::new();
+
+    for row in data.get_best_matches {
+        match serde_json::from_value::<OddsMatcherRow>(row.clone()) {
+            Ok(parsed) => rows.push(parsed),
+            Err(error) => {
+                let row_hint = row
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| row.get("eventName").and_then(|value| value.as_str()))
+                    .unwrap_or("<unknown>");
+                decode_errors.push(format!("{row_hint}: {error}"));
+            }
+        }
+    }
+
+    if rows.is_empty() && !decode_errors.is_empty() {
+        return Err(eyre!(
+            "failed to decode all OddsMatcher rows: {}",
+            decode_errors.join("; ")
+        ));
+    }
+
+    Ok(rows)
+}
+
+fn truncate_for_error(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        value.to_string()
+    } else {
+        let truncated = value.chars().take(limit).collect::<String>();
+        format!("{truncated}...")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        fetch_best_matches, load_query_or_default, save_query, GetBestMatchesData,
-        GetBestMatchesVariables, GraphQlRequest, GraphQlResponse, OddsMatcherField, OddsMatcherRow,
+        decode_best_matches_response, fetch_best_matches, load_query_or_default, save_query,
+        GetBestMatchesData, GetBestMatchesVariables, GraphQlRequest, GraphQlResponse,
+        OddsMatcherField, OddsMatcherRow,
     };
+    use reqwest::StatusCode;
 
     #[test]
     fn request_payload_uses_captured_defaults() {
@@ -773,6 +835,144 @@ mod tests {
             row.back.bookmaker.active,
             super::BookmakerActive::Labels(vec![String::from("desktop"), String::from("mobile"),])
         );
+    }
+
+    #[test]
+    fn decode_best_matches_response_skips_malformed_rows_when_good_rows_exist() {
+        let rows = decode_best_matches_response(
+            StatusCode::OK,
+            r#"{
+              "data": {
+                "getBestMatches": [
+                  {
+                    "eventName": "Arsenal v Everton",
+                    "id": "match-1",
+                    "startAt": "2026-03-14T17:30:00Z",
+                    "selectionId": "sel-1",
+                    "marketId": "mkt-1",
+                    "eventId": "evt-1",
+                    "back": {
+                      "updatedAt": "2026-03-18T12:00:00Z",
+                      "odds": 2.55,
+                      "fetchedAt": "2026-03-18T12:00:00Z",
+                      "deepLink": "https://bookie.example/bet",
+                      "bookmaker": {
+                        "active": true,
+                        "code": "betvictor",
+                        "displayName": "BetVictor",
+                        "id": "101",
+                        "logo": "/logos/80x30/betvictor.png"
+                      }
+                    },
+                    "lay": {
+                      "bookmaker": {
+                        "active": true,
+                        "code": "smarketsexchange",
+                        "displayName": "Smarkets Exchange",
+                        "id": "201",
+                        "logo": "/logos/80x30/smarkets.png"
+                      },
+                      "deepLink": "https://smarkets.example/betslip",
+                      "fetchedAt": "2026-03-18T12:00:00Z",
+                      "updatedAt": "2026-03-18T12:00:00Z",
+                      "odds": 2.66,
+                      "liquidity": 30.0,
+                      "betSlip": {
+                        "marketId": "mkt-1",
+                        "selectionId": "sel-1"
+                      }
+                    },
+                    "eventGroup": {
+                      "displayName": "Premier League",
+                      "id": "grp-1",
+                      "sourceName": "premier-league",
+                      "sport": "soccer"
+                    },
+                    "marketGroup": {
+                      "displayName": "Match Odds",
+                      "id": "mg-1",
+                      "sourceName": null,
+                      "sport": "soccer"
+                    },
+                    "marketName": "Match Odds",
+                    "rating": "95.81",
+                    "selectionName": "Arsenal",
+                    "snr": "0",
+                    "sport": {
+                      "displayName": "Soccer",
+                      "id": "soccer"
+                    },
+                    "betRequestId": "req-1"
+                  },
+                  {
+                    "eventName": "Broken Match",
+                    "id": "broken-1",
+                    "startAt": "2026-03-14T17:30:00Z",
+                    "selectionId": "sel-2",
+                    "marketId": "mkt-2",
+                    "eventId": "evt-2",
+                    "back": {
+                      "updatedAt": "2026-03-18T12:00:00Z",
+                      "odds": "not-a-number",
+                      "fetchedAt": "2026-03-18T12:00:00Z",
+                      "deepLink": "",
+                      "bookmaker": {
+                        "active": true,
+                        "code": "betvictor",
+                        "displayName": "BetVictor",
+                        "id": "101",
+                        "logo": null
+                      }
+                    },
+                    "lay": {
+                      "bookmaker": {
+                        "active": true,
+                        "code": "smarketsexchange",
+                        "displayName": "Smarkets Exchange",
+                        "id": "201",
+                        "logo": null
+                      },
+                      "deepLink": "",
+                      "fetchedAt": "2026-03-18T12:00:00Z",
+                      "updatedAt": "2026-03-18T12:00:00Z",
+                      "odds": "2.66",
+                      "liquidity": "30.0",
+                      "betSlip": {
+                        "marketId": "mkt-2",
+                        "selectionId": "sel-2"
+                      }
+                    },
+                    "eventGroup": {
+                      "displayName": "Premier League",
+                      "id": "grp-2",
+                      "sourceName": "premier-league",
+                      "sport": "soccer"
+                    },
+                    "marketGroup": {
+                      "displayName": "Match Odds",
+                      "id": "mg-2",
+                      "sourceName": null,
+                      "sport": "soccer"
+                    },
+                    "marketName": "Match Odds",
+                    "rating": "95.81",
+                    "selectionName": "Broken",
+                    "snr": "0",
+                    "sport": {
+                      "displayName": "Soccer",
+                      "id": "soccer"
+                    },
+                    "betRequestId": null
+                  }
+                ]
+              },
+              "errors": []
+            }"#,
+        )
+        .expect("response should keep valid rows");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_name, "Arsenal v Everton");
     }
 
     #[test]

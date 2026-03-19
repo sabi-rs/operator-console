@@ -2,6 +2,12 @@ use std::path::PathBuf;
 use std::{env, fs};
 
 use operator_console::domain::VenueId;
+use operator_console::horse_matcher::{HorseMatcherMode, HorseMatcherQuery};
+use operator_console::trading_actions::{
+    TradingActionIntent, TradingActionKind, TradingActionMode, TradingActionSide,
+    TradingActionSource, TradingActionSourceContext, TradingExecutionPolicy, TradingRiskReport,
+    TradingTimeInForce,
+};
 use operator_console::transport::WorkerConfig;
 use operator_console::worker_client::{WorkerRequest, WorkerResponse};
 use serde_json::Value;
@@ -106,6 +112,147 @@ fn worker_request_serializes_cash_out_tracked_bet() {
     .expect("serialize");
 
     assert_json_eq(&request, r#"{"CashOutTrackedBet":{"bet_id":"bet-001"}}"#);
+}
+
+#[test]
+fn worker_request_serializes_execute_trading_action() {
+    let request = serde_json::to_string(&WorkerRequest::ExecuteTradingAction {
+        intent: TradingActionIntent {
+            action_kind: TradingActionKind::PlaceBet,
+            source: TradingActionSource::Positions,
+            venue: VenueId::Smarkets,
+            mode: TradingActionMode::Review,
+            side: TradingActionSide::Buy,
+            request_id: String::from("positions-123"),
+            source_ref: String::from("bet-001"),
+            event_name: String::from("Arsenal v Everton"),
+            market_name: String::from("Match Odds"),
+            selection_name: String::from("Arsenal"),
+            stake: 10.0,
+            expected_price: 2.34,
+            event_url: Some(String::from("https://smarkets.com/event/1")),
+            deep_link_url: None,
+            betslip_market_id: None,
+            betslip_selection_id: None,
+            execution_policy: TradingExecutionPolicy::new(TradingTimeInForce::FillOrKill),
+            risk_report: TradingRiskReport {
+                summary: String::from("Ready with 1 warning(s)."),
+                checks: Vec::new(),
+                warning_count: 1,
+                blocking_review_count: 0,
+                blocking_submit_count: 0,
+                reduce_only: true,
+            },
+            source_context: TradingActionSourceContext {
+                is_in_play: true,
+                event_status: String::from("27'"),
+                market_status: String::from("tradable"),
+                live_clock: String::from("27'"),
+                can_trade_out: true,
+                current_pnl_amount: Some(1.0),
+                baseline_stake: Some(9.91),
+                baseline_liability: Some(23.29),
+                baseline_price: Some(3.35),
+            },
+            notes: vec![String::from("positions")],
+        },
+    })
+    .expect("serialize");
+
+    assert_json_eq(
+        &request,
+        r#"{
+          "ExecuteTradingAction": {
+            "intent": {
+              "action_kind": "place_bet",
+              "source": "positions",
+              "venue": "smarkets",
+              "mode": "review",
+              "side": "buy",
+              "request_id": "positions-123",
+              "source_ref": "bet-001",
+              "event_name": "Arsenal v Everton",
+              "market_name": "Match Odds",
+              "selection_name": "Arsenal",
+              "stake": 10.0,
+              "expected_price": 2.34,
+              "event_url": "https://smarkets.com/event/1",
+              "deep_link_url": null,
+              "betslip_market_id": null,
+              "betslip_selection_id": null,
+              "execution_policy": {
+                "time_in_force": "fill_or_kill",
+                "cancel_unmatched_after_ms": 1500,
+                "require_full_fill": true,
+                "max_price_drift": 0.0
+              },
+              "risk_report": {
+                "summary": "Ready with 1 warning(s).",
+                "checks": [],
+                "warning_count": 1,
+                "blocking_review_count": 0,
+                "blocking_submit_count": 0,
+                "reduce_only": true
+              },
+              "source_context": {
+                "is_in_play": true,
+                "event_status": "27'",
+                "market_status": "tradable",
+                "live_clock": "27'",
+                "can_trade_out": true,
+                "current_pnl_amount": 1.0,
+                "baseline_stake": 9.91,
+                "baseline_liability": 23.29,
+                "baseline_price": 3.35
+              },
+              "notes": ["positions"]
+            }
+          }
+        }"#,
+    );
+}
+
+#[test]
+fn worker_request_serializes_load_horse_matcher() {
+    let request = serde_json::to_string(&WorkerRequest::LoadHorseMatcher {
+        query: HorseMatcherQuery {
+            mode: HorseMatcherMode::RacesPerOffer,
+            bookmakers: vec![String::from("betfred"), String::from("coral")],
+            exchanges: vec![String::from("smarkets"), String::from("betdaq")],
+            rating_type: String::from("rating"),
+            min_rating: Some(String::from("95")),
+            min_odds: Some(String::from("3.0")),
+            search: vec![String::from("Cheltenham 15:20")],
+            limit: 25,
+            date_from: Some(String::from("2026-03-19")),
+            date_to: Some(String::from("2026-03-20")),
+            offers: vec![],
+            offer_types: vec![],
+        },
+    })
+    .expect("serialize");
+
+    assert_json_eq(
+        &request,
+        r#"{
+          "LoadHorseMatcher": {
+            "query": {
+              "mode": "races_per_offer",
+              "bookmakers": ["betfred", "coral"],
+              "exchanges": ["smarkets", "betdaq"],
+              "rating_type": "rating",
+              "min_rating": "95",
+              "min_odds": "3.0",
+              "search": ["Cheltenham 15:20"],
+              "limit": 25,
+              "date_from": "2026-03-19",
+              "date_to": "2026-03-20",
+              "offers": [],
+              "offer_types": []
+            }
+          }
+        }"#,
+    );
 }
 
 #[test]

@@ -154,6 +154,22 @@ fn oddsmatcher_result_can_seed_calculator() {
 }
 
 #[test]
+fn oddsmatcher_place_hotkey_opens_trading_action_overlay() {
+    let (_temp_dir, mut app) = oddsmatcher_app();
+    app.set_active_panel(Panel::Trading);
+    app.set_trading_section(TradingSection::OddsMatcher);
+    app.replace_oddsmatcher_rows(sample_rows(), String::from("Loaded test rows."));
+
+    app.handle_key(KeyCode::Char('p'));
+
+    let overlay = app
+        .trading_action_overlay()
+        .expect("oddsmatcher place hotkey should open overlay");
+    assert_eq!(overlay.seed.selection_name, "Arsenal");
+    assert_eq!(overlay.side.label(), "Sell");
+}
+
+#[test]
 #[ignore = "hits live OddsMatcher API"]
 fn oddsmatcher_refresh_smoke_loads_live_rows() {
     let (_temp_dir, mut app) = oddsmatcher_app();

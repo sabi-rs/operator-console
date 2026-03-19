@@ -9,7 +9,13 @@ use std::{
 use color_eyre::Result;
 
 use operator_console::domain::{ExchangePanelSnapshot, ExitPolicySummary, VenueId};
+use operator_console::horse_matcher::HorseMatcherQuery;
 use operator_console::provider::{ExchangeProvider, ProviderRequest};
+use operator_console::trading_actions::{
+    TradingActionIntent, TradingActionKind, TradingActionMode, TradingActionSide,
+    TradingActionSource, TradingActionSourceContext, TradingExecutionPolicy, TradingRiskReport,
+    TradingTimeInForce,
+};
 use operator_console::transport::WorkerConfig;
 use operator_console::worker_client::{
     BetRecorderWorkerClient, WorkerClient, WorkerClientExchangeProvider, WorkerRequest,
@@ -182,5 +188,105 @@ fn worker_backed_provider_maps_cash_out_request() {
         Some(WorkerRequest::CashOutTrackedBet {
             bet_id: String::from("bet-001"),
         })
+    );
+}
+
+#[test]
+fn worker_backed_provider_maps_execute_trading_action_request() {
+    let last_request = Rc::new(RefCell::new(None));
+    let client = RecordingWorkerClient {
+        last_request: last_request.clone(),
+    };
+    let mut provider = WorkerClientExchangeProvider::new(
+        client,
+        WorkerConfig {
+            positions_payload_path: None,
+            run_dir: None,
+            account_payload_path: None,
+            open_bets_payload_path: None,
+            companion_legs_path: None,
+            agent_browser_session: Some(String::from("helium-copy")),
+            commission_rate: 0.0,
+            target_profit: 1.0,
+            stop_loss: 1.0,
+            hard_margin_call_profit_floor: None,
+            warn_only_default: true,
+        },
+    );
+    let intent = TradingActionIntent {
+        action_kind: TradingActionKind::PlaceBet,
+        source: TradingActionSource::OddsMatcher,
+        venue: VenueId::Smarkets,
+        mode: TradingActionMode::Review,
+        side: TradingActionSide::Sell,
+        request_id: String::from("oddsmatcher-1"),
+        source_ref: String::from("match-1"),
+        event_name: String::from("Arsenal v Everton"),
+        market_name: String::from("Match Odds"),
+        selection_name: String::from("Arsenal"),
+        stake: 12.0,
+        expected_price: 2.44,
+        event_url: None,
+        deep_link_url: Some(String::from("https://smarkets.com/betslip/1")),
+        betslip_market_id: Some(String::from("market-1")),
+        betslip_selection_id: Some(String::from("selection-1")),
+        execution_policy: TradingExecutionPolicy::new(TradingTimeInForce::GoodTilCancel),
+        risk_report: TradingRiskReport {
+            summary: String::from("Ready; no blocking risk checks are active."),
+            checks: Vec::new(),
+            warning_count: 0,
+            blocking_review_count: 0,
+            blocking_submit_count: 0,
+            reduce_only: false,
+        },
+        source_context: TradingActionSourceContext::default(),
+        notes: vec![String::from("oddsmatcher")],
+    };
+
+    provider
+        .handle(ProviderRequest::ExecuteTradingAction {
+            intent: intent.clone(),
+        })
+        .expect("execute trading action should serialize");
+
+    assert_eq!(
+        *last_request.borrow(),
+        Some(WorkerRequest::ExecuteTradingAction { intent })
+    );
+}
+
+#[test]
+fn worker_backed_provider_maps_load_horse_matcher_request() {
+    let last_request = Rc::new(RefCell::new(None));
+    let client = RecordingWorkerClient {
+        last_request: last_request.clone(),
+    };
+    let mut provider = WorkerClientExchangeProvider::new(
+        client,
+        WorkerConfig {
+            positions_payload_path: None,
+            run_dir: None,
+            account_payload_path: None,
+            open_bets_payload_path: None,
+            companion_legs_path: None,
+            agent_browser_session: Some(String::from("helium-copy")),
+            commission_rate: 0.0,
+            target_profit: 1.0,
+            stop_loss: 1.0,
+            hard_margin_call_profit_floor: None,
+            warn_only_default: true,
+        },
+    );
+    let query = HorseMatcherQuery::default();
+
+    provider
+        .handle(ProviderRequest::LoadHorseMatcher {
+            query: query.clone(),
+        })
+        .expect("load horse matcher should serialize");
+
+    assert_eq!(
+        *last_request.borrow(),
+        Some(WorkerRequest::LoadHorseMatcher { query })
     );
 }

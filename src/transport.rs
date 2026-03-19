@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{ExchangePanelSnapshot, VenueId};
+use crate::horse_matcher::HorseMatcherQuery;
+use crate::trading_actions::TradingActionIntent;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerConfig {
@@ -25,6 +27,8 @@ pub enum WorkerRequestEnvelope {
     SelectVenue { venue: VenueId },
     Refresh,
     CashOutTrackedBet { bet_id: String },
+    ExecuteTradingAction { intent: TradingActionIntent },
+    LoadHorseMatcher { query: HorseMatcherQuery },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -62,6 +62,12 @@ impl<C: WorkerClient> ExchangeProvider for WorkerClientExchangeProvider<C> {
             ProviderRequest::CashOutTrackedBet { bet_id } => {
                 WorkerRequest::CashOutTrackedBet { bet_id }
             }
+            ProviderRequest::ExecuteTradingAction { intent } => {
+                WorkerRequest::ExecuteTradingAction { intent }
+            }
+            ProviderRequest::LoadHorseMatcher { query } => {
+                WorkerRequest::LoadHorseMatcher { query }
+            }
         };
 
         Ok(self.client.send(worker_request)?.snapshot)

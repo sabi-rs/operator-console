@@ -176,6 +176,7 @@ fn render_config_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn render_field_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let field = app.recorder_selected_field();
+    let snapshot = app.snapshot();
     let mut suggestions = field.suggestions();
     if suggestions.is_empty() {
         suggestions.push(String::from("<none>"));
@@ -187,7 +188,7 @@ fn render_field_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         field.display_value(app.recorder_config())
     };
-    let body = Paragraph::new(vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("󰏬 field ", Style::default().fg(muted_text())),
             Span::styled(
@@ -226,9 +227,22 @@ fn render_field_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "• {}",
             suggestions.get(2).map(String::as_str).unwrap_or("<none>")
         )),
-    ])
-    .block(section_block("󰞋 Field Detail", accent_gold()))
-    .wrap(Wrap { trim: true });
+        Line::styled("󱂬 status", Style::default().fg(accent_blue())),
+        Line::raw(app.status_message().to_string()),
+    ];
+    if snapshot.worker.detail != app.status_message() {
+        lines.push(Line::styled(
+            "󰒋 worker",
+            Style::default().fg(accent_green()),
+        ));
+        lines.push(Line::raw(snapshot.worker.detail.clone()));
+    }
+    lines.push(Line::raw("PgUp/PgDn scroll this pane"));
+
+    let body = Paragraph::new(lines)
+        .block(section_block("󰞋 Field Detail", accent_gold()))
+        .scroll((app.status_scroll(), 0))
+        .wrap(Wrap { trim: true });
     frame.render_widget(body, area);
 }
 

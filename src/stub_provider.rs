@@ -33,6 +33,19 @@ impl ExchangeProvider for StubExchangeProvider {
                 self.snapshot.status_line = format!("Cash out requested for {bet_id}.");
                 Ok(self.snapshot.clone())
             }
+            ProviderRequest::ExecuteTradingAction { intent } => {
+                self.snapshot.status_line = format!(
+                    "Stub execution requested for {} {} @ {:.2}.",
+                    intent.side.label(),
+                    intent.selection_name,
+                    intent.expected_price
+                );
+                Ok(self.snapshot.clone())
+            }
+            ProviderRequest::LoadHorseMatcher { .. } => {
+                self.snapshot.status_line = String::from("Stub horse matcher refresh requested.");
+                Ok(self.snapshot.clone())
+            }
         }
     }
 }

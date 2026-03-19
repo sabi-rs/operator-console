@@ -299,5 +299,6 @@ fn sample_snapshot() -> ExchangePanelSnapshot {
             worst_case_pnl: 1.5,
             cash_out_venue: Some(String::from("smarkets")),
         }],
+        horse_matcher: None,
     }
 }

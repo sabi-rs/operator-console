@@ -123,5 +123,6 @@ fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {
         tracked_bets: Vec::new(),
         exit_policy: Default::default(),
         exit_recommendations: Vec::new(),
+        horse_matcher: None,
     }
 }

@@ -298,6 +298,7 @@ mod tests {
             tracked_bets: vec![],
             exit_policy: Default::default(),
             exit_recommendations: vec![],
+            horse_matcher: None,
         };
 
         let text = dashboard_text(&snapshot);

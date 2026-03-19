@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
-use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -12,11 +12,12 @@ use reqwest::blocking::Client;
 
 use crate::calculator::{self, BetType, Input as CalculatorInput, Mode as CalculatorMode};
 use crate::domain::{ExchangePanelSnapshot, VenueId};
+use crate::horse_matcher::{self, HorseMatcherEditorState, HorseMatcherField, HorseMatcherQuery};
 use crate::oddsmatcher::{
     self, GetBestMatchesVariables, OddsMatcherEditorState, OddsMatcherField, OddsMatcherRow,
 };
 use crate::panels::trading_positions::{
-    active_position_row_count, next_actionable_cash_out_bet_id,
+    active_position_row_count, next_actionable_cash_out_bet_id, selected_active_position_seed,
 };
 use crate::provider::{ExchangeProvider, ProviderRequest};
 use crate::recorder::{
@@ -25,6 +26,10 @@ use crate::recorder::{
     RecorderSupervisor,
 };
 use crate::stub_provider::StubExchangeProvider;
+use crate::trading_actions::{
+    format_decimal, TradingActionMode, TradingActionSeed, TradingActionSide, TradingActionSource,
+    TradingActionSourceContext, TradingTimeInForce,
+};
 use crate::transport::WorkerConfig;
 use crate::ui;
 use crate::worker_client::{BetRecorderWorkerClient, WorkerClientExchangeProvider};
@@ -52,17 +57,19 @@ pub enum TradingSection {
     Positions,
     Markets,
     OddsMatcher,
+    HorseMatcher,
     Stats,
     Calculator,
     Recorder,
 }
 
 impl TradingSection {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Accounts,
         Self::Positions,
         Self::Markets,
         Self::OddsMatcher,
+        Self::HorseMatcher,
         Self::Stats,
         Self::Calculator,
         Self::Recorder,
@@ -74,6 +81,7 @@ impl TradingSection {
             Self::Positions => "Positions",
             Self::Markets => "Markets",
             Self::OddsMatcher => "OddsMatcher",
+            Self::HorseMatcher => "HorseMatcher",
             Self::Stats => "Stats",
             Self::Calculator => "Calculator",
             Self::Recorder => "Recorder",
@@ -257,6 +265,99 @@ pub enum OddsMatcherFocus {
     Results,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradingActionField {
+    Mode,
+    Side,
+    TimeInForce,
+    Stake,
+    Execute,
+}
+
+impl TradingActionField {
+    pub const ALL: [Self; 5] = [
+        Self::Mode,
+        Self::Side,
+        Self::TimeInForce,
+        Self::Stake,
+        Self::Execute,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mode => "Mode",
+            Self::Side => "Side",
+            Self::TimeInForce => "Order",
+            Self::Stake => "Stake",
+            Self::Execute => "Execute",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TradingActionOverlayState {
+    pub seed: TradingActionSeed,
+    pub selected_field: TradingActionField,
+    pub mode: TradingActionMode,
+    pub side: TradingActionSide,
+    pub time_in_force: TradingTimeInForce,
+    pub risk_report: crate::trading_actions::TradingRiskReport,
+    pub editing: bool,
+    pub buffer: String,
+    pub replace_on_input: bool,
+}
+
+impl TradingActionOverlayState {
+    fn new(
+        seed: TradingActionSeed,
+        risk_report: crate::trading_actions::TradingRiskReport,
+    ) -> Self {
+        Self {
+            mode: TradingActionMode::Review,
+            side: seed.default_side,
+            time_in_force: seed.default_time_in_force(),
+            risk_report,
+            buffer: seed.default_stake_label(),
+            seed,
+            selected_field: TradingActionField::Stake,
+            editing: false,
+            replace_on_input: true,
+        }
+    }
+
+    pub fn selected_price(&self) -> Option<f64> {
+        self.seed.price_for_side(self.side)
+    }
+
+    pub fn parsed_stake(&self) -> Result<f64> {
+        let parsed = self
+            .buffer
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| color_eyre::eyre::eyre!("Stake must be numeric."))?;
+        if parsed <= 0.0 {
+            return Err(color_eyre::eyre::eyre!("Stake must be greater than zero."));
+        }
+        Ok(parsed)
+    }
+
+    fn selected_field(&self) -> TradingActionField {
+        self.selected_field
+    }
+
+    fn select_next_field(&mut self) {
+        self.selected_field = next_from(self.selected_field, &TradingActionField::ALL);
+    }
+
+    fn select_previous_field(&mut self) {
+        self.selected_field = previous_from(self.selected_field, &TradingActionField::ALL);
+    }
+
+    fn can_cycle_side(&self) -> bool {
+        self.seed.buy_price.is_some() && self.seed.sell_price.is_some()
+    }
+}
+
 pub struct App {
     provider: Box<dyn ExchangeProvider>,
     make_stub_provider: Box<StubFactory>,
@@ -276,6 +377,14 @@ pub struct App {
     oddsmatcher_focus: OddsMatcherFocus,
     oddsmatcher_rows: Vec<OddsMatcherRow>,
     oddsmatcher_table_state: TableState,
+    horse_matcher_query_path: PathBuf,
+    horse_matcher_query_note: String,
+    horse_matcher_query: HorseMatcherQuery,
+    horse_matcher_editor: HorseMatcherEditorState,
+    horse_matcher_focus: OddsMatcherFocus,
+    horse_matcher_rows: Vec<OddsMatcherRow>,
+    horse_matcher_snapshot: Option<crate::domain::HorseMatcherSnapshot>,
+    horse_matcher_table_state: TableState,
     snapshot: ExchangePanelSnapshot,
     active_panel: Panel,
     trading_section: TradingSection,
@@ -285,9 +394,11 @@ pub struct App {
     historical_position_table_state: TableState,
     positions_focus: PositionsFocus,
     live_view_overlay_visible: bool,
+    trading_action_overlay: Option<TradingActionOverlayState>,
     last_recorder_refresh_at: Option<Instant>,
     running: bool,
     status_message: String,
+    status_scroll: u16,
 }
 
 impl Default for App {
@@ -378,6 +489,29 @@ impl App {
     }
 
     pub fn with_dependencies_and_storage_paths(
+        provider: Box<dyn ExchangeProvider>,
+        make_stub_provider: Box<StubFactory>,
+        make_recorder_provider: Box<ProviderFactory>,
+        recorder_supervisor: Box<dyn RecorderSupervisor>,
+        recorder_config: RecorderConfig,
+        recorder_config_path: std::path::PathBuf,
+        recorder_config_note: String,
+        oddsmatcher_query_path: PathBuf,
+    ) -> Result<Self> {
+        Self::with_dependencies_and_storage_matcher_paths(
+            provider,
+            make_stub_provider,
+            make_recorder_provider,
+            recorder_supervisor,
+            recorder_config,
+            recorder_config_path,
+            recorder_config_note,
+            oddsmatcher_query_path,
+            horse_matcher::default_query_path(),
+        )
+    }
+
+    pub fn with_dependencies_and_storage_matcher_paths(
         mut provider: Box<dyn ExchangeProvider>,
         make_stub_provider: Box<StubFactory>,
         make_recorder_provider: Box<ProviderFactory>,
@@ -386,6 +520,7 @@ impl App {
         recorder_config_path: std::path::PathBuf,
         recorder_config_note: String,
         oddsmatcher_query_path: PathBuf,
+        horse_matcher_query_path: PathBuf,
     ) -> Result<Self> {
         let snapshot = provider.handle(ProviderRequest::LoadDashboard)?;
         let status_message = snapshot.status_line.clone();
@@ -396,6 +531,15 @@ impl App {
                     format!("OddsMatcher config load failed; using defaults: {error}"),
                 )
             });
+        let (horse_matcher_query, horse_matcher_query_note) = horse_matcher::load_query_or_default(
+            &horse_matcher_query_path,
+        )
+        .unwrap_or_else(|error| {
+            (
+                HorseMatcherQuery::default(),
+                format!("Horse Matcher config load failed; using defaults: {error}"),
+            )
+        });
         let mut open_position_table_state = TableState::default();
         let mut historical_position_table_state = TableState::default();
         let positions_focus = if !snapshot.open_positions.is_empty() {
@@ -427,6 +571,14 @@ impl App {
             oddsmatcher_focus: OddsMatcherFocus::Results,
             oddsmatcher_rows: Vec::new(),
             oddsmatcher_table_state: TableState::default(),
+            horse_matcher_query_path,
+            horse_matcher_query_note,
+            horse_matcher_query,
+            horse_matcher_editor: HorseMatcherEditorState::default(),
+            horse_matcher_focus: OddsMatcherFocus::Results,
+            horse_matcher_rows: Vec::new(),
+            horse_matcher_snapshot: None,
+            horse_matcher_table_state: TableState::default(),
             snapshot,
             active_panel: Panel::Trading,
             trading_section: TradingSection::Accounts,
@@ -436,9 +588,11 @@ impl App {
             historical_position_table_state,
             positions_focus,
             live_view_overlay_visible: false,
+            trading_action_overlay: None,
             last_recorder_refresh_at: None,
             running: true,
             status_message,
+            status_scroll: 0,
         })
     }
 
@@ -458,6 +612,7 @@ impl App {
         self.active_panel = panel;
         if panel != Panel::Trading {
             self.live_view_overlay_visible = false;
+            self.trading_action_overlay = None;
         }
     }
 
@@ -470,6 +625,12 @@ impl App {
         if section != TradingSection::Positions {
             self.live_view_overlay_visible = false;
         }
+        if section != TradingSection::Positions
+            && section != TradingSection::OddsMatcher
+            && section != TradingSection::HorseMatcher
+        {
+            self.trading_action_overlay = None;
+        }
     }
 
     pub fn active_observability_section(&self) -> ObservabilitySection {
@@ -477,11 +638,15 @@ impl App {
     }
 
     pub fn help_text(&self) -> &'static str {
-        "q quit | o observability | h/l sections | arrows or j/k nav | tab switch pane | r refresh\nenter edit | esc cancel | [/] cycle suggestions | u reload | D defaults | s start recorder | x stop recorder | c cash out | v live view | b cycle type | m toggle mode"
+        "q quit | o observability | h/l sections | arrows or j/k nav | tab switch pane | r refresh\nenter edit/open | p place action | esc cancel | [/] cycle suggestions | u reload | D defaults | s start recorder | x stop recorder | c cash out | v live view | b cycle type | m toggle mode"
     }
 
     pub fn live_view_overlay_visible(&self) -> bool {
         self.live_view_overlay_visible
+    }
+
+    pub fn trading_action_overlay(&self) -> Option<&TradingActionOverlayState> {
+        self.trading_action_overlay.as_ref()
     }
 
     pub fn toggle_live_view_overlay(&mut self) {
@@ -501,6 +666,10 @@ impl App {
 
     pub fn status_message(&self) -> &str {
         &self.status_message
+    }
+
+    pub fn status_scroll(&self) -> u16 {
+        self.status_scroll
     }
 
     pub fn selected_open_position_row(&self) -> Option<usize> {
@@ -588,6 +757,46 @@ impl App {
 
     pub fn oddsmatcher_table_state(&mut self) -> &mut TableState {
         &mut self.oddsmatcher_table_state
+    }
+
+    pub fn horse_matcher_rows(&self) -> &[OddsMatcherRow] {
+        &self.horse_matcher_rows
+    }
+
+    pub fn horse_matcher_query(&self) -> &HorseMatcherQuery {
+        &self.horse_matcher_query
+    }
+
+    pub fn horse_matcher_query_note(&self) -> &str {
+        &self.horse_matcher_query_note
+    }
+
+    pub fn horse_matcher_selected_field(&self) -> HorseMatcherField {
+        self.horse_matcher_editor.selected_field()
+    }
+
+    pub fn horse_matcher_focus(&self) -> OddsMatcherFocus {
+        self.horse_matcher_focus
+    }
+
+    pub fn horse_matcher_is_editing(&self) -> bool {
+        self.horse_matcher_editor.editing
+    }
+
+    pub fn horse_matcher_edit_buffer(&self) -> Option<&str> {
+        self.horse_matcher_editor
+            .editing
+            .then_some(self.horse_matcher_editor.buffer.as_str())
+    }
+
+    pub fn selected_horse_matcher_row(&self) -> Option<&OddsMatcherRow> {
+        self.horse_matcher_table_state
+            .selected()
+            .and_then(|index| self.horse_matcher_rows.get(index))
+    }
+
+    pub fn horse_matcher_table_state(&mut self) -> &mut TableState {
+        &mut self.horse_matcher_table_state
     }
 
     pub fn recorder_config(&self) -> &RecorderConfig {
@@ -683,11 +892,116 @@ impl App {
             .collect()
     }
 
+    pub fn open_trading_action_overlay_from_positions(&mut self) {
+        if self.positions_focus != PositionsFocus::Active {
+            self.status_message =
+                String::from("Switch to the active positions pane to open a trading action.");
+            return;
+        }
+
+        let Some(seed) =
+            selected_active_position_seed(&self.snapshot, &self.open_position_table_state)
+        else {
+            self.status_message = String::from("No active position is selected.");
+            return;
+        };
+
+        self.open_trading_action_overlay(seed);
+    }
+
+    pub fn open_trading_action_overlay_from_oddsmatcher(&mut self) {
+        let Some(row) = self.selected_oddsmatcher_row().cloned() else {
+            self.status_message = String::from("No OddsMatcher row is selected.");
+            return;
+        };
+
+        self.open_trading_action_overlay_from_matcher_row(
+            row,
+            TradingActionSource::OddsMatcher,
+            "oddsmatcher",
+        );
+    }
+
+    pub fn open_trading_action_overlay_from_horse_matcher(&mut self) {
+        let Some(row) = self.selected_horse_matcher_row().cloned() else {
+            self.status_message = String::from("No Horse Matcher row is selected.");
+            return;
+        };
+
+        self.open_trading_action_overlay_from_matcher_row(
+            row,
+            TradingActionSource::HorseMatcher,
+            "horse_matcher",
+        );
+    }
+
+    fn open_trading_action_overlay_from_matcher_row(
+        &mut self,
+        row: OddsMatcherRow,
+        source: TradingActionSource,
+        note: &str,
+    ) {
+        let deep_link_url = row
+            .lay
+            .deep_link
+            .clone()
+            .filter(|value| !value.trim().is_empty());
+        let default_stake = if self.calculator.source.as_ref().is_some_and(|source| {
+            source.selection_name == row.selection_name
+                && source.event_name == row.event_name
+                && source.exchange_name == row.lay.bookmaker.display_name
+        }) {
+            Some(self.calculator.input.back_stake)
+        } else {
+            None
+        };
+        let seed = TradingActionSeed {
+            source,
+            venue: VenueId::Smarkets,
+            source_ref: row.id.clone(),
+            event_name: row.event_name.clone(),
+            market_name: row.market_name.clone(),
+            selection_name: row.selection_name.clone(),
+            event_url: None,
+            deep_link_url,
+            betslip_market_id: row
+                .lay
+                .bet_slip
+                .as_ref()
+                .map(|bet_slip| bet_slip.market_id.clone()),
+            betslip_selection_id: row
+                .lay
+                .bet_slip
+                .as_ref()
+                .map(|bet_slip| bet_slip.selection_id.clone()),
+            buy_price: None,
+            sell_price: Some(row.lay.odds),
+            default_side: TradingActionSide::Sell,
+            default_stake,
+            source_context: TradingActionSourceContext::default(),
+            notes: vec![
+                String::from(note),
+                format!("rating:{:.1}", row.rating),
+                row.bet_request_id
+                    .as_ref()
+                    .map(|request_id| format!("bet_request:{request_id}"))
+                    .unwrap_or_else(|| String::from("bet_request:missing")),
+            ],
+        };
+
+        self.open_trading_action_overlay(seed);
+    }
+
     pub fn refresh(&mut self) -> Result<()> {
         if self.active_panel == Panel::Trading
             && self.trading_section == TradingSection::OddsMatcher
         {
             return self.refresh_oddsmatcher();
+        }
+        if self.active_panel == Panel::Trading
+            && self.trading_section == TradingSection::HorseMatcher
+        {
+            return self.refresh_horse_matcher();
         }
         self.refresh_provider_snapshot()
     }
@@ -695,6 +1009,16 @@ impl App {
     pub fn replace_oddsmatcher_rows(&mut self, rows: Vec<OddsMatcherRow>, status_message: String) {
         self.oddsmatcher_rows = rows;
         self.clamp_selected_oddsmatcher_row();
+        self.status_message = status_message;
+    }
+
+    pub fn replace_horse_matcher_rows(
+        &mut self,
+        rows: Vec<OddsMatcherRow>,
+        status_message: String,
+    ) {
+        self.horse_matcher_rows = rows;
+        self.clamp_selected_horse_matcher_row();
         self.status_message = status_message;
     }
 
@@ -727,14 +1051,63 @@ impl App {
         Ok(())
     }
 
+    fn open_trading_action_overlay(&mut self, seed: TradingActionSeed) {
+        if seed.venue != VenueId::Smarkets {
+            self.status_message = format!(
+                "Trading actions are not implemented for {} yet.",
+                seed.venue.as_str()
+            );
+            return;
+        }
+        if !seed.supports_side(seed.default_side) {
+            self.status_message =
+                String::from("The selected row does not expose an executable quote.");
+            return;
+        }
+        if seed.event_url.as_deref().unwrap_or_default().is_empty()
+            && seed.deep_link_url.as_deref().unwrap_or_default().is_empty()
+        {
+            self.status_message =
+                String::from("The selected row does not expose an execution URL or deep link.");
+            return;
+        }
+        let time_in_force = seed.default_time_in_force();
+        let risk_report = match seed.evaluate(
+            &self.snapshot,
+            seed.default_side,
+            TradingActionMode::Review,
+            seed.default_stake.unwrap_or(10.0),
+            time_in_force,
+        ) {
+            Ok(intent) => intent.risk_report,
+            Err(error) => {
+                self.status_message = format!("Trading action unavailable: {error}");
+                return;
+            }
+        };
+        self.trading_action_overlay = Some(TradingActionOverlayState::new(seed, risk_report));
+        self.status_message = String::from("Trading action overlay opened.");
+    }
+
     pub fn start_recorder(&mut self) -> Result<()> {
         self.persist_recorder_config()?;
         self.recorder_supervisor.start(&self.recorder_config)?;
         self.recorder_status = self.recorder_supervisor.poll_status();
         self.provider = (self.make_recorder_provider)(&self.recorder_config);
-        let snapshot = self.load_recorder_dashboard_with_retry()?;
-        self.replace_snapshot(snapshot);
-        self.last_recorder_refresh_at = Some(Instant::now());
+        self.exchange_list_state.select(None);
+        match self.provider.handle(ProviderRequest::LoadDashboard) {
+            Ok(snapshot) => {
+                self.replace_snapshot(snapshot);
+                self.last_recorder_refresh_at = Some(Instant::now());
+                self.status_message = self.snapshot.status_line.clone();
+            }
+            Err(error) => {
+                self.last_recorder_refresh_at = None;
+                self.status_message =
+                    format!("Recorder started; waiting for first snapshot. {}", error);
+                self.status_scroll = 0;
+            }
+        }
         self.active_panel = Panel::Trading;
         self.trading_section = TradingSection::Positions;
         Ok(())
@@ -782,6 +1155,17 @@ impl App {
         Ok(())
     }
 
+    pub fn reload_horse_matcher_query(&mut self) -> Result<()> {
+        let (query, note) = horse_matcher::load_query_or_default(&self.horse_matcher_query_path)?;
+        self.horse_matcher_query = query;
+        self.horse_matcher_query_note = note;
+        self.horse_matcher_editor = HorseMatcherEditorState::default();
+        self.horse_matcher_rows.clear();
+        self.horse_matcher_table_state.select(None);
+        self.status_message = String::from("Reloaded Horse Matcher config from disk.");
+        Ok(())
+    }
+
     pub fn reset_oddsmatcher_query(&mut self) -> Result<()> {
         self.oddsmatcher_query = GetBestMatchesVariables::default();
         self.oddsmatcher_editor = OddsMatcherEditorState::default();
@@ -789,6 +1173,16 @@ impl App {
         self.oddsmatcher_table_state.select(None);
         self.persist_oddsmatcher_query()?;
         self.status_message = String::from("Reset OddsMatcher config to defaults.");
+        Ok(())
+    }
+
+    pub fn reset_horse_matcher_query(&mut self) -> Result<()> {
+        self.horse_matcher_query = HorseMatcherQuery::default();
+        self.horse_matcher_editor = HorseMatcherEditorState::default();
+        self.horse_matcher_rows.clear();
+        self.horse_matcher_table_state.select(None);
+        self.persist_horse_matcher_query()?;
+        self.status_message = String::from("Reset Horse Matcher config to defaults.");
         Ok(())
     }
 
@@ -814,6 +1208,12 @@ impl App {
         {
             self.live_view_overlay_visible = false;
         }
+        if self.trading_section != TradingSection::Positions
+            && self.trading_section != TradingSection::OddsMatcher
+            && self.trading_section != TradingSection::HorseMatcher
+        {
+            self.trading_action_overlay = None;
+        }
     }
 
     pub fn previous_section(&mut self) {
@@ -829,6 +1229,12 @@ impl App {
         if self.active_panel != Panel::Trading || self.trading_section != TradingSection::Positions
         {
             self.live_view_overlay_visible = false;
+        }
+        if self.trading_section != TradingSection::Positions
+            && self.trading_section != TradingSection::OddsMatcher
+            && self.trading_section != TradingSection::HorseMatcher
+        {
+            self.trading_action_overlay = None;
         }
     }
 
@@ -854,6 +1260,83 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key_code: KeyCode) {
+        if self.is_trading_action_overlay_active() {
+            match key_code {
+                KeyCode::Esc => {
+                    self.close_trading_action_overlay("Cancelled trading action.");
+                    return;
+                }
+                KeyCode::Backspace => {
+                    if self.is_trading_action_overlay_editing() {
+                        self.trading_action_backspace();
+                    }
+                    return;
+                }
+                KeyCode::Enter => {
+                    if self.is_trading_action_overlay_editing() {
+                        if let Err(error) = self.apply_trading_action_edit() {
+                            self.status_message = format!("Trading action input error: {error}");
+                        }
+                    } else if let Err(error) = self.activate_trading_action_field() {
+                        self.status_message = format!("Trading action failed: {error}");
+                    }
+                    return;
+                }
+                KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('[') => {
+                    if let Err(error) = self.trading_action_shift(false) {
+                        self.status_message = format!("Trading action failed: {error}");
+                    }
+                    return;
+                }
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(']') => {
+                    if let Err(error) = self.trading_action_shift(true) {
+                        self.status_message = format!("Trading action failed: {error}");
+                    }
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(overlay) = self.trading_action_overlay.as_mut() {
+                        overlay.select_previous_field();
+                        self.status_message = format!(
+                            "Trading action field set to {}.",
+                            overlay.selected_field().label()
+                        );
+                    }
+                    return;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(overlay) = self.trading_action_overlay.as_mut() {
+                        overlay.select_next_field();
+                        self.status_message = format!(
+                            "Trading action field set to {}.",
+                            overlay.selected_field().label()
+                        );
+                    }
+                    return;
+                }
+                KeyCode::Char(character) => {
+                    if self.is_trading_action_overlay_editing() {
+                        if matches!(character, '0'..='9' | '.') {
+                            self.trading_action_push_char(character);
+                        }
+                        return;
+                    }
+                    if self
+                        .trading_action_overlay
+                        .as_ref()
+                        .map(|overlay| overlay.selected_field == TradingActionField::Stake)
+                        .unwrap_or(false)
+                        && matches!(character, '0'..='9' | '.')
+                    {
+                        self.begin_trading_action_edit();
+                        self.trading_action_push_char(character);
+                    }
+                    return;
+                }
+                _ => return,
+            }
+        }
+
         if self.is_oddsmatcher_editing_context() {
             match key_code {
                 KeyCode::Esc => {
@@ -872,6 +1355,30 @@ impl App {
                 }
                 KeyCode::Char(character) => {
                     self.oddsmatcher_push_char(character);
+                    return;
+                }
+                _ => return,
+            }
+        }
+
+        if self.is_horse_matcher_editing_context() {
+            match key_code {
+                KeyCode::Esc => {
+                    self.cancel_horse_matcher_edit();
+                    return;
+                }
+                KeyCode::Enter => {
+                    if let Err(error) = self.apply_horse_matcher_edit() {
+                        self.status_message = format!("Horse Matcher filter error: {error}");
+                    }
+                    return;
+                }
+                KeyCode::Backspace => {
+                    self.horse_matcher_backspace();
+                    return;
+                }
+                KeyCode::Char(character) => {
+                    self.horse_matcher_push_char(character);
                     return;
                 }
                 _ => return,
@@ -942,6 +1449,20 @@ impl App {
             }
         }
 
+        if self.is_horse_matcher_context() {
+            match key_code {
+                KeyCode::Left => {
+                    self.focus_horse_matcher_filters();
+                    return;
+                }
+                KeyCode::Right => {
+                    self.focus_horse_matcher_results();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Positions
         {
             if key_code == KeyCode::Tab {
@@ -971,6 +1492,15 @@ impl App {
                     self.begin_oddsmatcher_edit();
                 } else if self.is_oddsmatcher_results_context() {
                     self.load_calculator_from_selected_oddsmatcher();
+                } else if self.is_horse_matcher_filters_context() {
+                    self.begin_horse_matcher_edit();
+                } else if self.is_horse_matcher_results_context() {
+                    self.load_calculator_from_selected_horse_matcher();
+                } else if self.active_panel == Panel::Trading
+                    && self.trading_section == TradingSection::Positions
+                    && self.positions_focus == PositionsFocus::Active
+                {
+                    self.open_trading_action_overlay_from_positions();
                 } else if self.is_recorder_context() {
                     self.begin_recorder_edit();
                 } else if self.is_calculator_context() {
@@ -985,6 +1515,18 @@ impl App {
             KeyCode::Char('m') => {
                 if self.is_calculator_context() {
                     self.toggle_calculator_mode();
+                }
+            }
+            KeyCode::Char('p') => {
+                if self.is_oddsmatcher_results_context() {
+                    self.open_trading_action_overlay_from_oddsmatcher();
+                } else if self.is_horse_matcher_results_context() {
+                    self.open_trading_action_overlay_from_horse_matcher();
+                } else if self.active_panel == Panel::Trading
+                    && self.trading_section == TradingSection::Positions
+                    && self.positions_focus == PositionsFocus::Active
+                {
+                    self.open_trading_action_overlay_from_positions();
                 }
             }
             KeyCode::Char('r') => {
@@ -1009,6 +1551,10 @@ impl App {
                     if let Err(error) = self.cycle_oddsmatcher_suggestion(false) {
                         self.status_message = format!("OddsMatcher suggestion failed: {error}");
                     }
+                } else if self.is_horse_matcher_filters_context() {
+                    if let Err(error) = self.cycle_horse_matcher_suggestion(false) {
+                        self.status_message = format!("Horse Matcher suggestion failed: {error}");
+                    }
                 } else if self.is_recorder_context() {
                     if let Err(error) = self.cycle_recorder_suggestion(false) {
                         self.status_message = format!("Recorder suggestion failed: {error}");
@@ -1020,6 +1566,10 @@ impl App {
                     if let Err(error) = self.cycle_oddsmatcher_suggestion(true) {
                         self.status_message = format!("OddsMatcher suggestion failed: {error}");
                     }
+                } else if self.is_horse_matcher_filters_context() {
+                    if let Err(error) = self.cycle_horse_matcher_suggestion(true) {
+                        self.status_message = format!("Horse Matcher suggestion failed: {error}");
+                    }
                 } else if self.is_recorder_context() {
                     if let Err(error) = self.cycle_recorder_suggestion(true) {
                         self.status_message = format!("Recorder suggestion failed: {error}");
@@ -1030,6 +1580,10 @@ impl App {
                 if self.is_oddsmatcher_context() {
                     if let Err(error) = self.reload_oddsmatcher_query() {
                         self.status_message = format!("OddsMatcher reload failed: {error}");
+                    }
+                } else if self.is_horse_matcher_context() {
+                    if let Err(error) = self.reload_horse_matcher_query() {
+                        self.status_message = format!("Horse Matcher reload failed: {error}");
                     }
                 } else if self.is_recorder_context() {
                     if let Err(error) = self.reload_recorder_config() {
@@ -1044,6 +1598,10 @@ impl App {
                 if self.is_oddsmatcher_context() {
                     if let Err(error) = self.reset_oddsmatcher_query() {
                         self.status_message = format!("OddsMatcher reset failed: {error}");
+                    }
+                } else if self.is_horse_matcher_context() {
+                    if let Err(error) = self.reset_horse_matcher_query() {
+                        self.status_message = format!("Horse Matcher reset failed: {error}");
                     }
                 } else if self.is_recorder_context() {
                     if let Err(error) = self.reset_recorder_config() {
@@ -1066,6 +1624,21 @@ impl App {
                     self.recorder_status = RecorderStatus::Error;
                 }
             }
+            KeyCode::PageDown => {
+                if self.supports_status_scroll() {
+                    self.scroll_status_down(4);
+                }
+            }
+            KeyCode::PageUp => {
+                if self.supports_status_scroll() {
+                    self.scroll_status_up(4);
+                }
+            }
+            KeyCode::Home => {
+                if self.supports_status_scroll() {
+                    self.status_scroll = 0;
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') => match (self.active_panel, self.trading_section) {
                 (Panel::Trading, TradingSection::Accounts) => self.select_next_exchange_row(),
                 (Panel::Trading, TradingSection::Positions) => self.select_next_positions_row(),
@@ -1075,6 +1648,13 @@ impl App {
                         self.oddsmatcher_editor.select_next_field();
                     } else {
                         self.select_next_oddsmatcher_row();
+                    }
+                }
+                (Panel::Trading, TradingSection::HorseMatcher) => {
+                    if self.horse_matcher_focus == OddsMatcherFocus::Filters {
+                        self.horse_matcher_editor.select_next_field();
+                    } else {
+                        self.select_next_horse_matcher_row();
                     }
                 }
                 (Panel::Trading, TradingSection::Calculator) => {
@@ -1098,6 +1678,13 @@ impl App {
                         self.select_previous_oddsmatcher_row();
                     }
                 }
+                (Panel::Trading, TradingSection::HorseMatcher) => {
+                    if self.horse_matcher_focus == OddsMatcherFocus::Filters {
+                        self.horse_matcher_editor.select_previous_field();
+                    } else {
+                        self.select_previous_horse_matcher_row();
+                    }
+                }
                 (Panel::Trading, TradingSection::Calculator) => {
                     self.calculator.editor.select_previous_field()
                 }
@@ -1118,20 +1705,55 @@ impl App {
         self.active_panel == Panel::Trading && self.trading_section == TradingSection::Recorder
     }
 
+    fn supports_status_scroll(&self) -> bool {
+        self.active_panel == Panel::Trading
+            && matches!(
+                self.trading_section,
+                TradingSection::Positions | TradingSection::Recorder
+            )
+    }
+
+    fn is_trading_action_overlay_active(&self) -> bool {
+        self.trading_action_overlay.is_some()
+    }
+
+    fn is_trading_action_overlay_editing(&self) -> bool {
+        self.trading_action_overlay
+            .as_ref()
+            .map(|overlay| overlay.editing)
+            .unwrap_or(false)
+    }
+
     fn is_oddsmatcher_context(&self) -> bool {
         self.active_panel == Panel::Trading && self.trading_section == TradingSection::OddsMatcher
+    }
+
+    fn is_horse_matcher_context(&self) -> bool {
+        self.active_panel == Panel::Trading && self.trading_section == TradingSection::HorseMatcher
     }
 
     fn is_oddsmatcher_filters_context(&self) -> bool {
         self.is_oddsmatcher_context() && self.oddsmatcher_focus == OddsMatcherFocus::Filters
     }
 
+    fn is_horse_matcher_filters_context(&self) -> bool {
+        self.is_horse_matcher_context() && self.horse_matcher_focus == OddsMatcherFocus::Filters
+    }
+
     fn is_oddsmatcher_results_context(&self) -> bool {
         self.is_oddsmatcher_context() && self.oddsmatcher_focus == OddsMatcherFocus::Results
     }
 
+    fn is_horse_matcher_results_context(&self) -> bool {
+        self.is_horse_matcher_context() && self.horse_matcher_focus == OddsMatcherFocus::Results
+    }
+
     fn is_oddsmatcher_editing_context(&self) -> bool {
         self.is_oddsmatcher_filters_context() && self.oddsmatcher_editor.editing
+    }
+
+    fn is_horse_matcher_editing_context(&self) -> bool {
+        self.is_horse_matcher_filters_context() && self.horse_matcher_editor.editing
     }
 
     fn is_recorder_editing_context(&self) -> bool {
@@ -1197,6 +1819,18 @@ impl App {
         match self.oddsmatcher_table_state.selected() {
             Some(index) if index < self.oddsmatcher_rows.len() => {}
             _ => self.oddsmatcher_table_state.select(Some(0)),
+        }
+    }
+
+    fn clamp_selected_horse_matcher_row(&mut self) {
+        if self.horse_matcher_rows.is_empty() {
+            self.horse_matcher_table_state.select(None);
+            return;
+        }
+
+        match self.horse_matcher_table_state.selected() {
+            Some(index) if index < self.horse_matcher_rows.len() => {}
+            _ => self.horse_matcher_table_state.select(Some(0)),
         }
     }
 
@@ -1368,6 +2002,36 @@ impl App {
         self.oddsmatcher_table_state.select(Some(previous_index));
     }
 
+    pub fn select_next_horse_matcher_row(&mut self) {
+        if self.horse_matcher_rows.is_empty() {
+            self.horse_matcher_table_state.select(None);
+            return;
+        }
+
+        let next_index = match self.horse_matcher_table_state.selected() {
+            Some(index) if index + 1 < self.horse_matcher_rows.len() => index + 1,
+            Some(index) => index,
+            None => 0,
+        };
+
+        self.horse_matcher_table_state.select(Some(next_index));
+    }
+
+    pub fn select_previous_horse_matcher_row(&mut self) {
+        if self.horse_matcher_rows.is_empty() {
+            self.horse_matcher_table_state.select(None);
+            return;
+        }
+
+        let previous_index = match self.horse_matcher_table_state.selected() {
+            Some(index) if index > 0 => index - 1,
+            Some(index) => index,
+            None => 0,
+        };
+
+        self.horse_matcher_table_state.select(Some(previous_index));
+    }
+
     fn sync_selected_venue(&mut self) {
         let Some(selected_index) = self.exchange_list_state.selected() else {
             return;
@@ -1402,6 +2066,7 @@ impl App {
             self.recorder_status = next_status.clone();
             if matches!(next_status, RecorderStatus::Stopped | RecorderStatus::Error) {
                 self.status_message = format!("Recorder status changed to {next_status:?}.");
+                self.status_scroll = 0;
                 self.last_recorder_refresh_at = None;
             }
         }
@@ -1420,6 +2085,7 @@ impl App {
     ) {
         let message = format!("{context}: {detail}");
         self.status_message = message.clone();
+        self.status_scroll = 0;
         self.snapshot.status_line = message.clone();
         self.snapshot.worker.status = crate::domain::WorkerStatus::Error;
         self.snapshot.worker.detail = message.clone();
@@ -1440,53 +2106,15 @@ impl App {
     fn replace_snapshot(&mut self, snapshot: ExchangePanelSnapshot) {
         self.snapshot = snapshot;
         self.status_message = self.snapshot.status_line.clone();
+        self.status_scroll = 0;
         self.clamp_selected_exchange_row();
         self.clamp_selected_open_position_row();
         self.clamp_selected_oddsmatcher_row();
+        self.clamp_selected_horse_matcher_row();
         if active_position_row_count(&self.snapshot) == 0 {
             self.live_view_overlay_visible = false;
         }
-    }
-
-    fn load_recorder_dashboard_with_retry(&mut self) -> Result<ExchangePanelSnapshot> {
-        let start = Instant::now();
-        let timeout = self.recorder_startup_timeout();
-        let retry_delay = Duration::from_millis(100);
-        let log_path = self.recorder_log_path();
-        loop {
-            let last_error = match self.provider.handle(ProviderRequest::LoadDashboard) {
-                Ok(snapshot) => return Ok(snapshot),
-                Err(error) => error.to_string(),
-            };
-
-            self.recorder_status = self.recorder_supervisor.poll_status();
-            if matches!(
-                self.recorder_status,
-                RecorderStatus::Stopped | RecorderStatus::Error
-            ) {
-                return Err(color_eyre::eyre::eyre!(
-                    "recorder watcher stopped before first snapshot: {last_error}. See {}",
-                    log_path.display()
-                ));
-            }
-
-            if start.elapsed() >= timeout {
-                return Err(color_eyre::eyre::eyre!(
-                    "timed out waiting for recorder snapshot: {last_error}. See {}",
-                    log_path.display()
-                ));
-            }
-
-            thread::sleep(retry_delay);
-        }
-    }
-
-    fn recorder_startup_timeout(&self) -> Duration {
-        Duration::from_secs(self.recorder_config.interval_seconds.max(1) + 5)
-    }
-
-    fn recorder_log_path(&self) -> std::path::PathBuf {
-        self.recorder_config.run_dir.join("watcher.log")
+        self.trading_action_overlay = None;
     }
 
     fn recorder_refresh_due(&self) -> bool {
@@ -1495,12 +2123,21 @@ impl App {
             .is_none_or(|last| last.elapsed() >= refresh_interval)
     }
 
+    fn scroll_status_down(&mut self, lines: u16) {
+        self.status_scroll = self.status_scroll.saturating_add(lines);
+    }
+
+    fn scroll_status_up(&mut self, lines: u16) {
+        self.status_scroll = self.status_scroll.saturating_sub(lines);
+    }
+
     fn begin_recorder_edit(&mut self) {
         let field = self.recorder_editor.selected_field();
         self.recorder_editor.buffer = field.display_value(&self.recorder_config);
         self.recorder_editor.editing = true;
         self.recorder_editor.replace_on_input = true;
         self.status_message = format!("Editing recorder {}.", field.label());
+        self.status_scroll = 0;
     }
 
     fn apply_recorder_edit(&mut self) -> Result<()> {
@@ -1579,14 +2216,221 @@ impl App {
             self.recorder_supervisor.start(&self.recorder_config)?;
             self.recorder_status = self.recorder_supervisor.poll_status();
             self.provider = (self.make_recorder_provider)(&self.recorder_config);
-            let snapshot = self.load_recorder_dashboard_with_retry()?;
-            self.replace_snapshot(snapshot);
-            self.last_recorder_refresh_at = Some(Instant::now());
-            self.status_message = format!("{message} Restarted recorder to apply the change.");
+            self.exchange_list_state.select(None);
+            match self.provider.handle(ProviderRequest::LoadDashboard) {
+                Ok(snapshot) => {
+                    self.replace_snapshot(snapshot);
+                    self.last_recorder_refresh_at = Some(Instant::now());
+                    self.status_message =
+                        format!("{message} Restarted recorder to apply the change.");
+                    self.status_scroll = 0;
+                }
+                Err(error) => {
+                    self.last_recorder_refresh_at = None;
+                    self.status_message = format!(
+                        "{message} Restarted recorder to apply the change; waiting for next snapshot. {error}"
+                    );
+                    self.status_scroll = 0;
+                }
+            }
             return Ok(());
         }
 
         self.status_message = String::from(message);
+        self.status_scroll = 0;
+        Ok(())
+    }
+
+    fn close_trading_action_overlay(&mut self, message: &str) {
+        self.trading_action_overlay = None;
+        self.status_message = String::from(message);
+    }
+
+    fn refresh_trading_action_risk_report(&mut self) -> Result<()> {
+        let Some(overlay) = self.trading_action_overlay.as_mut() else {
+            return Ok(());
+        };
+        let stake = overlay.parsed_stake()?;
+        let preview = overlay.seed.evaluate(
+            &self.snapshot,
+            overlay.side,
+            overlay.mode,
+            stake,
+            overlay.time_in_force,
+        )?;
+        overlay.risk_report = preview.risk_report;
+        Ok(())
+    }
+
+    fn begin_trading_action_edit(&mut self) {
+        let Some(overlay) = self.trading_action_overlay.as_mut() else {
+            return;
+        };
+        if overlay.selected_field != TradingActionField::Stake {
+            return;
+        }
+        overlay.editing = true;
+        overlay.replace_on_input = true;
+        self.status_message = String::from("Editing trading action stake.");
+    }
+
+    fn apply_trading_action_edit(&mut self) -> Result<()> {
+        let buffer = {
+            let Some(overlay) = self.trading_action_overlay.as_mut() else {
+                return Ok(());
+            };
+            if overlay.selected_field != TradingActionField::Stake {
+                return Ok(());
+            }
+            let parsed = overlay.parsed_stake()?;
+            overlay.buffer = format_decimal(parsed);
+            overlay.editing = false;
+            overlay.replace_on_input = false;
+            overlay.buffer.clone()
+        };
+        self.refresh_trading_action_risk_report()?;
+        self.status_message = format!("Trading action stake set to {buffer}.");
+        Ok(())
+    }
+
+    fn trading_action_push_char(&mut self, character: char) {
+        let Some(overlay) = self.trading_action_overlay.as_mut() else {
+            return;
+        };
+        if overlay.replace_on_input {
+            overlay.buffer.clear();
+            overlay.replace_on_input = false;
+        }
+        overlay.buffer.push(character);
+    }
+
+    fn trading_action_backspace(&mut self) {
+        let Some(overlay) = self.trading_action_overlay.as_mut() else {
+            return;
+        };
+        if overlay.replace_on_input {
+            overlay.buffer.clear();
+            overlay.replace_on_input = false;
+            return;
+        }
+        overlay.buffer.pop();
+    }
+
+    fn trading_action_shift(&mut self, forward: bool) -> Result<()> {
+        let Some(overlay) = self.trading_action_overlay.as_mut() else {
+            return Ok(());
+        };
+
+        match overlay.selected_field {
+            TradingActionField::Mode => {
+                let index = TradingActionMode::ALL
+                    .iter()
+                    .position(|candidate| candidate == &overlay.mode)
+                    .unwrap_or(0);
+                let next_index = if forward {
+                    (index + 1) % TradingActionMode::ALL.len()
+                } else if index == 0 {
+                    TradingActionMode::ALL.len() - 1
+                } else {
+                    index - 1
+                };
+                overlay.mode = TradingActionMode::ALL[next_index];
+                self.status_message =
+                    format!("Trading action mode set to {}.", overlay.mode.label());
+            }
+            TradingActionField::Side => {
+                if !overlay.can_cycle_side() {
+                    return Err(color_eyre::eyre::eyre!(
+                        "The selected source only exposes one executable side."
+                    ));
+                }
+                let sides = TradingActionSide::ALL
+                    .into_iter()
+                    .filter(|side| overlay.seed.supports_side(*side))
+                    .collect::<Vec<_>>();
+                let index = sides
+                    .iter()
+                    .position(|candidate| candidate == &overlay.side)
+                    .unwrap_or(0);
+                let next_index = if forward {
+                    (index + 1) % sides.len()
+                } else if index == 0 {
+                    sides.len() - 1
+                } else {
+                    index - 1
+                };
+                overlay.side = sides[next_index];
+                self.status_message =
+                    format!("Trading action side set to {}.", overlay.side.label());
+            }
+            TradingActionField::TimeInForce => {
+                let index = TradingTimeInForce::ALL
+                    .iter()
+                    .position(|candidate| candidate == &overlay.time_in_force)
+                    .unwrap_or(0);
+                let next_index = if forward {
+                    (index + 1) % TradingTimeInForce::ALL.len()
+                } else if index == 0 {
+                    TradingTimeInForce::ALL.len() - 1
+                } else {
+                    index - 1
+                };
+                overlay.time_in_force = TradingTimeInForce::ALL[next_index];
+                self.status_message = format!(
+                    "Trading action order policy set to {}.",
+                    overlay.time_in_force.label()
+                );
+            }
+            TradingActionField::Stake => self.begin_trading_action_edit(),
+            TradingActionField::Execute => {
+                if forward {
+                    self.execute_trading_action()?;
+                }
+            }
+        }
+        self.refresh_trading_action_risk_report()?;
+        Ok(())
+    }
+
+    fn activate_trading_action_field(&mut self) -> Result<()> {
+        let Some(selected_field) = self
+            .trading_action_overlay
+            .as_ref()
+            .map(|overlay| overlay.selected_field)
+        else {
+            return Ok(());
+        };
+        match selected_field {
+            TradingActionField::Mode => self.trading_action_shift(true),
+            TradingActionField::Side => self.trading_action_shift(true),
+            TradingActionField::TimeInForce => self.trading_action_shift(true),
+            TradingActionField::Stake => {
+                self.begin_trading_action_edit();
+                Ok(())
+            }
+            TradingActionField::Execute => self.execute_trading_action(),
+        }
+    }
+
+    fn execute_trading_action(&mut self) -> Result<()> {
+        let overlay = self
+            .trading_action_overlay
+            .clone()
+            .ok_or_else(|| color_eyre::eyre::eyre!("Trading action overlay is not open."))?;
+        let stake = overlay.parsed_stake()?;
+        let request_id = new_trading_action_request_id(overlay.seed.source);
+        let intent = overlay.seed.build_intent(
+            &self.snapshot,
+            request_id.clone(),
+            overlay.side,
+            overlay.mode,
+            stake,
+            overlay.time_in_force,
+        )?;
+        let snapshot = self
+            .provider
+            .handle(ProviderRequest::ExecuteTradingAction { intent })?;
+        self.replace_snapshot(snapshot);
         Ok(())
     }
 
@@ -1681,6 +2525,16 @@ impl App {
         self.status_message = String::from("OddsMatcher focus set to results.");
     }
 
+    fn focus_horse_matcher_filters(&mut self) {
+        self.horse_matcher_focus = OddsMatcherFocus::Filters;
+        self.status_message = String::from("Horse Matcher focus set to filters.");
+    }
+
+    fn focus_horse_matcher_results(&mut self) {
+        self.horse_matcher_focus = OddsMatcherFocus::Results;
+        self.status_message = String::from("Horse Matcher focus set to results.");
+    }
+
     fn begin_oddsmatcher_edit(&mut self) {
         let field = self.oddsmatcher_editor.selected_field();
         self.oddsmatcher_editor.buffer = field.display_value(&self.oddsmatcher_query);
@@ -1730,6 +2584,55 @@ impl App {
         self.oddsmatcher_editor.buffer.pop();
     }
 
+    fn begin_horse_matcher_edit(&mut self) {
+        let field = self.horse_matcher_editor.selected_field();
+        self.horse_matcher_editor.buffer = field.display_value(&self.horse_matcher_query);
+        self.horse_matcher_editor.editing = true;
+        self.horse_matcher_editor.replace_on_input = true;
+        self.status_message = format!("Editing Horse Matcher {}.", field.label());
+    }
+
+    fn apply_horse_matcher_edit(&mut self) -> Result<()> {
+        let field = self.horse_matcher_editor.selected_field();
+        let value = self.horse_matcher_editor.buffer.clone();
+        field.apply_value(&mut self.horse_matcher_query, &value)?;
+        self.horse_matcher_editor.editing = false;
+        self.horse_matcher_editor.buffer.clear();
+        self.horse_matcher_editor.replace_on_input = false;
+        self.horse_matcher_rows.clear();
+        self.horse_matcher_table_state.select(None);
+        self.persist_horse_matcher_query()?;
+        self.status_message = format!(
+            "Updated Horse Matcher {} and saved config. Press r to refresh.",
+            field.label()
+        );
+        Ok(())
+    }
+
+    fn cancel_horse_matcher_edit(&mut self) {
+        self.horse_matcher_editor.editing = false;
+        self.horse_matcher_editor.buffer.clear();
+        self.horse_matcher_editor.replace_on_input = false;
+        self.status_message = String::from("Cancelled Horse Matcher edit.");
+    }
+
+    fn horse_matcher_push_char(&mut self, character: char) {
+        if self.horse_matcher_editor.replace_on_input {
+            self.horse_matcher_editor.buffer.clear();
+            self.horse_matcher_editor.replace_on_input = false;
+        }
+        self.horse_matcher_editor.buffer.push(character);
+    }
+
+    fn horse_matcher_backspace(&mut self) {
+        if self.horse_matcher_editor.replace_on_input {
+            self.horse_matcher_editor.buffer.clear();
+            self.horse_matcher_editor.replace_on_input = false;
+            return;
+        }
+        self.horse_matcher_editor.buffer.pop();
+    }
+
     fn cycle_oddsmatcher_suggestion(&mut self, forward: bool) -> Result<()> {
         let field = self.oddsmatcher_editor.selected_field();
         let suggestions = field.suggestions();
@@ -1765,12 +2668,60 @@ impl App {
         Ok(())
     }
 
+    fn cycle_horse_matcher_suggestion(&mut self, forward: bool) -> Result<()> {
+        let field = self.horse_matcher_editor.selected_field();
+        let suggestions = field.suggestions();
+        if suggestions.is_empty() {
+            return Ok(());
+        }
+
+        let current_value = field.display_value(&self.horse_matcher_query);
+        let current_index = suggestions.iter().position(|value| value == &current_value);
+        let next_index = match (current_index, forward) {
+            (Some(index), true) => (index + 1) % suggestions.len(),
+            (Some(index), false) => {
+                if index == 0 {
+                    suggestions.len() - 1
+                } else {
+                    index - 1
+                }
+            }
+            (None, _) => 0,
+        };
+
+        field.apply_value(&mut self.horse_matcher_query, &suggestions[next_index])?;
+        self.horse_matcher_rows.clear();
+        self.horse_matcher_table_state.select(None);
+        self.persist_horse_matcher_query()?;
+        self.status_message = format!("Applied Horse Matcher suggestion for {}.", field.label());
+        Ok(())
+    }
+
+    fn persist_horse_matcher_query(&mut self) -> Result<()> {
+        self.horse_matcher_query_note =
+            horse_matcher::save_query(&self.horse_matcher_query_path, &self.horse_matcher_query)?;
+        Ok(())
+    }
+
     fn load_calculator_from_selected_oddsmatcher(&mut self) {
         let Some(row) = self.selected_oddsmatcher_row().cloned() else {
             self.status_message = String::from("No OddsMatcher row is selected.");
             return;
         };
 
+        self.load_calculator_from_matcher_row(row, "OddsMatcher");
+    }
+
+    fn load_calculator_from_selected_horse_matcher(&mut self) {
+        let Some(row) = self.selected_horse_matcher_row().cloned() else {
+            self.status_message = String::from("No Horse Matcher row is selected.");
+            return;
+        };
+
+        self.load_calculator_from_matcher_row(row, "Horse Matcher");
+    }
+
+    fn load_calculator_from_matcher_row(&mut self, row: OddsMatcherRow, source_name: &str) {
         self.calculator.input.back_odds = row.back.odds;
         self.calculator.input.lay_odds = row.lay.odds;
         self.calculator.source = Some(CalculatorSourceContext {
@@ -1783,7 +2734,7 @@ impl App {
         });
         self.trading_section = TradingSection::Calculator;
         self.status_message = format!(
-            "Loaded calculator from OddsMatcher row: {} @ {:.2} / {:.2}.",
+            "Loaded calculator from {source_name}: {} @ {:.2} / {:.2}.",
             row.selection_name, row.back.odds, row.lay.odds
         );
     }
@@ -1800,6 +2751,41 @@ impl App {
         Ok(())
     }
 
+    fn refresh_horse_matcher(&mut self) -> Result<()> {
+        let snapshot = self
+            .provider
+            .handle(ProviderRequest::LoadHorseMatcher {
+                query: self.horse_matcher_query.clone(),
+            })
+            .map_err(|error| {
+                self.status_message = format!("Horse Matcher refresh failed: {error}");
+                error
+            })?;
+        let market_snapshot = snapshot
+            .horse_matcher
+            .clone()
+            .ok_or_else(|| {
+                color_eyre::eyre::eyre!("worker response did not include horse matcher market data")
+            })
+            .map_err(|error| {
+                self.status_message = format!("Horse Matcher refresh failed: {error}");
+                error
+            })?;
+        let rows = horse_matcher::build_rows(&market_snapshot, &self.horse_matcher_query).map_err(
+            |error| {
+                self.status_message = format!("Horse Matcher refresh failed: {error}");
+                error
+            },
+        )?;
+        let row_count = rows.len();
+        self.horse_matcher_snapshot = Some(market_snapshot);
+        self.replace_horse_matcher_rows(
+            rows,
+            format!("Loaded {row_count} internal Horse Matcher row(s)."),
+        );
+        Ok(())
+    }
+
     fn toggle_observability_panel(&mut self) {
         self.active_panel = match self.active_panel {
             Panel::Trading => Panel::Observability,
@@ -1808,6 +2794,13 @@ impl App {
         if self.active_panel != Panel::Trading || self.trading_section != TradingSection::Positions
         {
             self.live_view_overlay_visible = false;
+        }
+        if self.active_panel != Panel::Trading
+            || (self.trading_section != TradingSection::Positions
+                && self.trading_section != TradingSection::OddsMatcher
+                && self.trading_section != TradingSection::HorseMatcher)
+        {
+            self.trading_action_overlay = None;
         }
     }
 }
@@ -1842,7 +2835,7 @@ fn default_recorder_provider_factory() -> Box<ProviderFactory> {
                 account_payload_path: None,
                 open_bets_payload_path: None,
                 companion_legs_path: config.companion_legs_path.clone(),
-                agent_browser_session: None,
+                agent_browser_session: Some(config.session.clone()),
                 commission_rate: config.commission_rate.parse::<f64>().unwrap_or(0.0),
                 target_profit: config.target_profit.parse::<f64>().unwrap_or(1.0),
                 stop_loss: config.stop_loss.parse::<f64>().unwrap_or(1.0),
@@ -1862,6 +2855,14 @@ fn parse_optional_f64(value: &str) -> Option<f64> {
     } else {
         trimmed.parse::<f64>().ok()
     }
+}
+
+fn new_trading_action_request_id(source: TradingActionSource) -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("{source:?}-{millis}").to_lowercase()
 }
 
 #[cfg(test)]
@@ -1895,9 +2896,10 @@ mod tests {
                     *self.refresh_count.borrow_mut() += 1;
                     Ok(self.refresh_snapshot.clone())
                 }
-                ProviderRequest::SelectVenue(_) | ProviderRequest::CashOutTrackedBet { .. } => {
-                    Ok(self.refresh_snapshot.clone())
-                }
+                ProviderRequest::SelectVenue(_)
+                | ProviderRequest::CashOutTrackedBet { .. }
+                | ProviderRequest::ExecuteTradingAction { .. }
+                | ProviderRequest::LoadHorseMatcher { .. } => Ok(self.refresh_snapshot.clone()),
             }
         }
     }
@@ -2128,6 +3130,7 @@ mod tests {
             tracked_bets: Vec::new(),
             exit_policy: Default::default(),
             exit_recommendations: Vec::new(),
+            horse_matcher: None,
         }
     }
 }

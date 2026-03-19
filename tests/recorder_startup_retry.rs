@@ -40,7 +40,9 @@ impl ExchangeProvider for FlakyLoadProvider {
             }
             ProviderRequest::Refresh
             | ProviderRequest::SelectVenue(_)
-            | ProviderRequest::CashOutTrackedBet { .. } => Ok(self.snapshot.clone()),
+            | ProviderRequest::CashOutTrackedBet { .. }
+            | ProviderRequest::ExecuteTradingAction { .. }
+            | ProviderRequest::LoadHorseMatcher { .. } => Ok(self.snapshot.clone()),
         }
     }
 }
@@ -62,7 +64,7 @@ impl RecorderSupervisor for RunningSupervisor {
 }
 
 #[test]
-fn start_recorder_retries_until_first_snapshot_is_ready() {
+fn start_recorder_returns_immediately_when_first_snapshot_is_not_ready() {
     let load_attempts = Rc::new(RefCell::new(0));
     let remaining_failures = Rc::new(RefCell::new(2));
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -109,8 +111,13 @@ fn start_recorder_retries_until_first_snapshot_is_ready() {
 
     app.start_recorder().expect("start recorder");
 
+    assert!(app.status_message().contains("waiting for first snapshot"));
+    assert_eq!(*load_attempts.borrow(), 1);
+
+    app.refresh().expect("refresh");
+
+    assert_eq!(*load_attempts.borrow(), 1);
     assert_eq!(app.snapshot().status_line, "Recorder dashboard");
-    assert_eq!(*load_attempts.borrow(), 3);
 }
 
 fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {
@@ -144,5 +151,6 @@ fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {
         tracked_bets: Vec::new(),
         exit_policy: Default::default(),
         exit_recommendations: Vec::new(),
+        horse_matcher: None,
     }
 }

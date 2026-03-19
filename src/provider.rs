@@ -1,4 +1,6 @@
 use crate::domain::{ExchangePanelSnapshot, VenueId};
+use crate::horse_matcher::HorseMatcherQuery;
+use crate::trading_actions::TradingActionIntent;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderRequest {
@@ -6,6 +8,8 @@ pub enum ProviderRequest {
     SelectVenue(VenueId),
     Refresh,
     CashOutTrackedBet { bet_id: String },
+    ExecuteTradingAction { intent: TradingActionIntent },
+    LoadHorseMatcher { query: HorseMatcherQuery },
 }
 
 pub trait ExchangeProvider {

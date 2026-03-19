@@ -1,12 +1,14 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crossterm::event::KeyCode;
 use operator_console::app::App;
 use operator_console::domain::{
     ExchangePanelSnapshot, ExitPolicySummary, ExitRecommendation, OpenPositionRow, TrackedBetRow,
     TrackedLeg, ValueMetric, VenueId, VenueStatus, VenueSummary, WorkerStatus, WorkerSummary,
 };
 use operator_console::provider::{ExchangeProvider, ProviderRequest};
+use operator_console::trading_actions::TradingActionIntent;
 
 #[derive(Clone)]
 struct StubProvider {
@@ -28,7 +30,32 @@ impl ExchangeProvider for StubProvider {
                 Ok(self.snapshots.borrow_mut().remove(0))
             }
             ProviderRequest::SelectVenue(_) => unreachable!("selection not used in this test"),
-            ProviderRequest::CashOutTrackedBet { .. } => Ok(self.snapshots.borrow_mut().remove(0)),
+            ProviderRequest::CashOutTrackedBet { .. }
+            | ProviderRequest::ExecuteTradingAction { .. }
+            | ProviderRequest::LoadHorseMatcher { .. } => Ok(self.snapshots.borrow_mut().remove(0)),
+        }
+    }
+}
+
+struct RecordingActionProvider {
+    captured: Rc<RefCell<Option<TradingActionIntent>>>,
+    snapshots: Rc<RefCell<Vec<ExchangePanelSnapshot>>>,
+}
+
+impl ExchangeProvider for RecordingActionProvider {
+    fn handle(&mut self, request: ProviderRequest) -> color_eyre::Result<ExchangePanelSnapshot> {
+        match request {
+            ProviderRequest::LoadDashboard => Ok(self.snapshots.borrow_mut().remove(0)),
+            ProviderRequest::ExecuteTradingAction { intent } => {
+                *self.captured.borrow_mut() = Some(intent);
+                Ok(self.snapshots.borrow_mut().remove(0))
+            }
+            ProviderRequest::Refresh
+            | ProviderRequest::CashOutTrackedBet { .. }
+            | ProviderRequest::SelectVenue(_)
+            | ProviderRequest::LoadHorseMatcher { .. } => {
+                unreachable!("unexpected request in trading action test")
+            }
         }
     }
 }
@@ -69,6 +96,35 @@ fn app_cash_out_uses_provider_action_and_replaces_snapshot() {
         app.snapshot().worker.detail,
         "Cash out requested for bet-001"
     );
+}
+
+#[test]
+fn app_executes_positions_trading_action_via_provider() {
+    let captured = Rc::new(RefCell::new(None));
+    let initial = sample_snapshot("Initial dashboard");
+    let mut executed = sample_snapshot("Action executed");
+    executed.worker.detail = String::from("Smarkets review ready");
+
+    let mut app = App::from_provider(RecordingActionProvider {
+        captured: captured.clone(),
+        snapshots: Rc::new(RefCell::new(vec![initial, executed])),
+    })
+    .expect("app should load initial snapshot");
+    app.set_trading_section(operator_console::app::TradingSection::Positions);
+
+    app.handle_key(KeyCode::Enter);
+    assert!(app.trading_action_overlay().is_some());
+    app.handle_key(KeyCode::Down);
+    app.handle_key(KeyCode::Enter);
+
+    let intent = captured
+        .borrow()
+        .clone()
+        .expect("execute request should be captured");
+    assert_eq!(intent.selection_name, "Draw");
+    assert_eq!(intent.venue, VenueId::Smarkets);
+    assert_eq!(app.snapshot().status_line, "Action executed");
+    assert!(app.trading_action_overlay().is_none());
 }
 
 fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {
@@ -205,5 +261,6 @@ fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {
             worst_case_pnl: 3.2,
             cash_out_venue: Some(String::from("smarkets")),
         }],
+        horse_matcher: None,
     }
 }

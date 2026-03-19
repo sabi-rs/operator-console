@@ -36,6 +36,8 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     if !positions_owns_footer {
         render_footer(frame, shell[2], app);
     }
+
+    panels::trading_action_overlay::render(frame, frame.area(), app);
 }
 
 fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -64,6 +66,7 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     let snapshot = app.snapshot().clone();
                     let status_message = app.status_message().to_string();
                     let help_text = app.help_text().to_string();
+                    let status_scroll = app.status_scroll();
                     let positions_focus = app.positions_focus();
                     let show_live_view_overlay = app.live_view_overlay_visible();
                     let (open_state, historical_state) = app.position_table_states();
@@ -77,6 +80,7 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                         show_live_view_overlay,
                         &status_message,
                         &help_text,
+                        status_scroll,
                     )
                 }
                 TradingSection::Markets => {
@@ -89,6 +93,9 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     )
                 }
                 TradingSection::OddsMatcher => panels::oddsmatcher::render(frame, layout[1], app),
+                TradingSection::HorseMatcher => {
+                    panels::horse_matcher::render(frame, layout[1], app)
+                }
                 TradingSection::Stats => {
                     panels::trading_stats::render(frame, layout[1], app.snapshot())
                 }
@@ -315,6 +322,9 @@ fn panel_subtitle(app: &App) -> &'static str {
             TradingSection::OddsMatcher => {
                 "Live bookmaker/exchange opportunities from OddsMatcher."
             }
+            TradingSection::HorseMatcher => {
+                "Internal horse-racing matches built from live bookmaker and exchange tabs."
+            }
             TradingSection::Stats => "Trading account and performance rollups.",
             TradingSection::Calculator => {
                 "Native matched-betting calculator and scenario analysis."
@@ -403,9 +413,10 @@ fn trading_index(section: TradingSection) -> usize {
         TradingSection::Positions => 1,
         TradingSection::Markets => 2,
         TradingSection::OddsMatcher => 3,
-        TradingSection::Stats => 4,
-        TradingSection::Calculator => 5,
-        TradingSection::Recorder => 6,
+        TradingSection::HorseMatcher => 4,
+        TradingSection::Stats => 5,
+        TradingSection::Calculator => 6,
+        TradingSection::Recorder => 7,
     }
 }
 

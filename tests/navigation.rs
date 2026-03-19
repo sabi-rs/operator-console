@@ -132,6 +132,24 @@ fn v_toggles_live_view_overlay_in_positions() {
     assert!(app.is_running());
 }
 
+#[test]
+fn enter_opens_trading_action_overlay_for_active_position() {
+    let mut app = App::from_provider(StaticProvider {
+        snapshot: positions_snapshot(),
+    })
+    .expect("app");
+    app.set_active_panel(Panel::Trading);
+    app.set_trading_section(TradingSection::Positions);
+
+    app.handle_key(KeyCode::Enter);
+
+    let overlay = app
+        .trading_action_overlay()
+        .expect("positions enter should open trading action overlay");
+    assert_eq!(overlay.seed.selection_name, "Selection");
+    assert_eq!(overlay.seed.venue, VenueId::Smarkets);
+}
+
 fn positions_snapshot() -> ExchangePanelSnapshot {
     ExchangePanelSnapshot {
         worker: WorkerSummary {
@@ -174,6 +192,7 @@ fn positions_snapshot() -> ExchangePanelSnapshot {
         tracked_bets: Vec::new(),
         exit_policy: Default::default(),
         exit_recommendations: Vec::new(),
+        horse_matcher: None,
     }
 }
 
@@ -181,7 +200,7 @@ fn sample_row(event: &str) -> OpenPositionRow {
     OpenPositionRow {
         event: event.to_string(),
         event_status: String::from("Settled"),
-        event_url: String::new(),
+        event_url: String::from("https://smarkets.com/event/active-0"),
         contract: String::from("Selection"),
         market: String::from("Match Odds"),
         status: String::from("matched"),

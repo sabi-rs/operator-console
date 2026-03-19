@@ -19,6 +19,12 @@ impl ExchangeProvider for FailingRefreshProvider {
             ProviderRequest::CashOutTrackedBet { .. } => {
                 Err(eyre!("cash out not used in this test"))
             }
+            ProviderRequest::ExecuteTradingAction { .. } => {
+                Err(eyre!("trading action not used in this test"))
+            }
+            ProviderRequest::LoadHorseMatcher { .. } => {
+                Err(eyre!("horse matcher not used in this test"))
+            }
         }
     }
 }
@@ -76,5 +82,6 @@ fn sample_snapshot() -> ExchangePanelSnapshot {
         tracked_bets: Vec::new(),
         exit_policy: Default::default(),
         exit_recommendations: Vec::new(),
+        horse_matcher: None,
     }
 }
