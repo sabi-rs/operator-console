@@ -12,7 +12,8 @@ use ratatui::Frame;
 use crate::app::PositionsFocus;
 use crate::domain::VenueId;
 use crate::domain::{
-    ExchangePanelSnapshot, OpenPositionRow, OtherOpenBetRow, TrackedBetRow, TrackedLeg,
+    ExchangePanelSnapshot, OpenPositionRow, OtherOpenBetRow, RecorderEventSummary, TrackedBetRow,
+    TrackedLeg, TransportMarkerSummary,
 };
 use crate::trading_actions::{
     TradingActionSeed, TradingActionSide, TradingActionSource, TradingActionSourceContext,
@@ -72,19 +73,20 @@ pub fn render(
         &active_title,
         vec![
             Constraint::Percentage(18),
-            Constraint::Percentage(22),
+            Constraint::Percentage(21),
             Constraint::Length(10),
             Constraint::Length(5),
-            Constraint::Length(13),
-            Constraint::Length(13),
+            Constraint::Length(11),
+            Constraint::Length(11),
             Constraint::Length(3),
+            Constraint::Length(10),
             Constraint::Length(8),
-            Constraint::Min(14),
+            Constraint::Min(12),
         ],
-        active_position_rows(&active_views),
+        active_position_rows(snapshot, &active_views),
         empty_row(
             "No active positions are loaded. Start the recorder or refresh the provider.",
-            9,
+            10,
         ),
         active_table_state,
     );
@@ -189,6 +191,8 @@ pub fn render(
     render_operator_log(
         frame,
         right[4],
+        snapshot,
+        selected_active,
         status_message,
         help_text,
         positions_focus,
@@ -196,7 +200,7 @@ pub fn render(
     );
 
     if show_live_view_overlay {
-        render_live_view_overlay(frame, area, selected_active);
+        render_live_view_overlay(frame, area, snapshot, selected_active);
     }
 }
 
@@ -543,6 +547,8 @@ fn render_summary(
     let (standard_funding_count, promo_funding_count, unknown_funding_count) =
         tracked_bet_funding_counts(snapshot);
     let (realised_pnl, live_pnl, net_pnl, promo_pnl) = positions_pnl_summary(snapshot);
+    let (recent_interactions, pending_interactions, issue_interactions) =
+        active_interaction_summary(snapshot);
     let overview_rows = vec![
         (
             "󰅐 Refresh",
@@ -594,6 +600,24 @@ fn render_summary(
                 exit_recommendations.len(),
             ),
             accent_pink(),
+        ),
+        (
+            "󰐊 I/O",
+            if recent_interactions == 0 {
+                String::from("no recent action markers")
+            } else {
+                format!(
+                    "recent {} | pending {} | issues {}",
+                    recent_interactions, pending_interactions, issue_interactions
+                )
+            },
+            if issue_interactions > 0 {
+                accent_red()
+            } else if pending_interactions > 0 {
+                accent_gold()
+            } else {
+                accent_cyan()
+            },
         ),
         (
             "󰤑 Funding",
@@ -756,6 +780,11 @@ fn render_summary(
             ),
             accent_pink(),
         ),
+        (
+            "󰐊 Legend",
+            String::from("bet/cash + req/subm/err/n-i"),
+            accent_cyan(),
+        ),
     ];
     render_key_value_table(
         frame,
@@ -823,6 +852,8 @@ fn render_key_value_table(
 #[cfg(test)]
 fn summary_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'static>> {
     let exit_recommendations = derived_exit_recommendations(snapshot);
+    let (recent_interactions, pending_interactions, issue_interactions) =
+        active_interaction_summary(snapshot);
     vec![
         Line::raw(format!(
             "Positions: {} | Other bets: {} | Tracked bets: {} | Recommendations: {}",
@@ -855,6 +886,10 @@ fn summary_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'static>> {
             "Tracked sources: {} | Market EV proxy: {}",
             tracked_source_count(snapshot),
             format_optional_value(total_market_ev(snapshot))
+        )),
+        Line::raw(format!(
+            "I/O recent {} | pending {} | issues {}",
+            recent_interactions, pending_interactions, issue_interactions
         )),
     ]
 }
@@ -925,7 +960,10 @@ fn open_position_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'static>> {
     rows
 }
 
-fn active_position_rows(active_views: &[ActivePositionView<'_>]) -> Vec<Row<'static>> {
+fn active_position_rows(
+    snapshot: &ExchangePanelSnapshot,
+    active_views: &[ActivePositionView<'_>],
+) -> Vec<Row<'static>> {
     active_views
         .iter()
         .copied()
@@ -938,6 +976,7 @@ fn active_position_rows(active_views: &[ActivePositionView<'_>]) -> Vec<Row<'sta
                 Cell::from(active_hold_label(view)),
                 Cell::from(active_lock_label(view)),
                 active_action_cell(view),
+                active_interaction_cell(snapshot, view),
                 Cell::from(active_probability_label(view)),
                 Cell::from(active_trigger_label(view)),
             ])
@@ -1876,6 +1915,231 @@ fn empty_selected_rows() -> Vec<(&'static str, String, Color)> {
     ]
 }
 
+fn active_position_reference_id(view: ActivePositionView<'_>) -> Option<&str> {
+    view.tracked_bet
+        .map(|tracked_bet| tracked_bet.bet_id.trim())
+        .filter(|bet_id| !bet_id.is_empty())
+}
+
+fn selected_transport_marker<'a>(
+    snapshot: &'a ExchangePanelSnapshot,
+    view: ActivePositionView<'_>,
+) -> Option<&'a TransportMarkerSummary> {
+    let reference_id = active_position_reference_id(view)?;
+    snapshot
+        .transport_events
+        .iter()
+        .find(|event| event.reference_id == reference_id)
+}
+
+fn selected_recorder_event<'a>(
+    snapshot: &'a ExchangePanelSnapshot,
+    view: ActivePositionView<'_>,
+    transport_event: Option<&TransportMarkerSummary>,
+) -> Option<&'a RecorderEventSummary> {
+    let reference_id = active_position_reference_id(view);
+    let request_id = transport_event
+        .map(|event| event.request_id.as_str())
+        .filter(|value| !value.is_empty());
+    snapshot.recorder_events.iter().find(|event| {
+        if event.kind != "operator_interaction" {
+            return false;
+        }
+        if let Some(reference_id) = reference_id {
+            if event.reference_id == reference_id {
+                return true;
+            }
+        }
+        if let Some(request_id) = request_id {
+            return event.request_id == request_id;
+        }
+        false
+    })
+}
+
+fn compact_transport_label(event: &TransportMarkerSummary) -> String {
+    let mut parts = vec![event.phase.clone(), event.action.clone()];
+    if !event.request_id.is_empty() {
+        parts.push(event.request_id.clone());
+    } else if !event.reference_id.is_empty() {
+        parts.push(event.reference_id.clone());
+    }
+    parts.join(" ")
+}
+
+fn compact_recorder_label(event: &RecorderEventSummary) -> String {
+    let mut parts = Vec::new();
+    if !event.action.is_empty() {
+        parts.push(event.action.clone());
+    } else if !event.kind.is_empty() {
+        parts.push(event.kind.clone());
+    }
+    if !event.status.is_empty() {
+        parts.push(event.status.clone());
+    }
+    if !event.request_id.is_empty() {
+        parts.push(event.request_id.clone());
+    } else if !event.reference_id.is_empty() {
+        parts.push(event.reference_id.clone());
+    }
+    if parts.is_empty() {
+        return String::from("none");
+    }
+    parts.join(" ")
+}
+
+fn interaction_action_code(action: &str) -> String {
+    match action.trim() {
+        "place_bet" => String::from("bet"),
+        "cash_out" => String::from("cash"),
+        value if value.is_empty() => String::from("-"),
+        value => truncate_text(value, 4),
+    }
+}
+
+fn interaction_state_code(status: &str, phase: &str) -> String {
+    let normalized_status = status.trim().split(':').next_back().unwrap_or("").trim();
+    match normalized_status {
+        "requested" => String::from("req"),
+        "submitted" => String::from("subm"),
+        "not_implemented" => String::from("n/i"),
+        "error" => String::from("err"),
+        value if !value.is_empty() => truncate_text(value, 4),
+        _ => match phase.trim() {
+            "request" => String::from("req"),
+            "response" => String::from("resp"),
+            value if value.is_empty() => String::from("-"),
+            value => truncate_text(value, 4),
+        },
+    }
+}
+
+fn active_interaction_label(
+    snapshot: &ExchangePanelSnapshot,
+    view: ActivePositionView<'_>,
+) -> String {
+    let transport_event = selected_transport_marker(snapshot, view);
+    let recorder_event = selected_recorder_event(snapshot, view, transport_event);
+    let action = recorder_event
+        .map(|event| event.action.as_str())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            transport_event
+                .map(|event| event.action.as_str())
+                .filter(|value| !value.is_empty())
+        });
+    let phase = transport_event
+        .map(|event| event.phase.as_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("");
+    let status = recorder_event
+        .map(|event| event.status.as_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("");
+
+    let Some(action) = action else {
+        return String::from("-");
+    };
+    let action_code = interaction_action_code(action);
+    let state_code = interaction_state_code(status, phase);
+    if state_code == "-" {
+        action_code
+    } else {
+        format!("{action_code} {state_code}")
+    }
+}
+
+fn active_interaction_summary(snapshot: &ExchangePanelSnapshot) -> (usize, usize, usize) {
+    let mut recent = 0;
+    let mut pending = 0;
+    let mut issues = 0;
+
+    for view in active_position_views(snapshot) {
+        let label = active_interaction_label(snapshot, view);
+        if label == "-" {
+            continue;
+        }
+        recent += 1;
+        if label.ends_with(" req") {
+            pending += 1;
+        }
+        if label.ends_with(" err") || label.ends_with(" n/i") {
+            issues += 1;
+        }
+    }
+
+    (recent, pending, issues)
+}
+
+fn active_interaction_cell(
+    snapshot: &ExchangePanelSnapshot,
+    view: ActivePositionView<'_>,
+) -> Cell<'static> {
+    let label = active_interaction_label(snapshot, view);
+    let color = if label == "-" {
+        muted_text()
+    } else if label.ends_with(" err") || label.ends_with(" n/i") {
+        accent_red()
+    } else if label.ends_with(" req") {
+        accent_gold()
+    } else if label.ends_with(" subm") || label.ends_with(" resp") {
+        accent_cyan()
+    } else {
+        accent_blue()
+    };
+    Cell::from(truncate_text(&label, 10)).style(Style::default().fg(color))
+}
+
+fn selected_position_interaction_lines(
+    snapshot: &ExchangePanelSnapshot,
+    selected_active: Option<ActivePositionView<'_>>,
+) -> Vec<Line<'static>> {
+    let Some(view) = selected_active else {
+        return Vec::new();
+    };
+    let Some(reference_id) = active_position_reference_id(view) else {
+        return vec![Line::raw(
+            "󰐊 selected position has no tracked bet id, so no correlated interaction markers are available.",
+        )];
+    };
+    let transport_event = selected_transport_marker(snapshot, view);
+    let recorder_event = selected_recorder_event(snapshot, view, transport_event);
+    let mut lines = vec![Line::raw(format!(
+        "󰋼 selected ref {reference_id} • {}",
+        active_selection_label(view)
+    ))];
+
+    if let Some(event) = transport_event {
+        lines.push(Line::raw(format!(
+            "󰐊 transport {}",
+            compact_transport_label(event)
+        )));
+        if !event.detail.is_empty() {
+            lines.push(Line::raw(format!("    {}", event.detail)));
+        }
+    } else {
+        lines.push(Line::raw(
+            "󰐊 transport no correlated request/response markers",
+        ));
+    }
+
+    if let Some(event) = recorder_event {
+        lines.push(Line::raw(format!(
+            "󰛿 recorder {}",
+            compact_recorder_label(event)
+        )));
+        if !event.detail.is_empty() {
+            lines.push(Line::raw(format!("    {}", event.detail)));
+        }
+    } else {
+        lines.push(Line::raw(
+            "󰛿 recorder no correlated operator interaction event",
+        ));
+    }
+
+    lines
+}
+
 #[cfg(test)]
 fn exit_recommendation_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'static>> {
     let recommendations = derived_exit_recommendations(snapshot);
@@ -2059,22 +2323,26 @@ fn render_table(
 fn render_operator_log(
     frame: &mut Frame<'_>,
     area: Rect,
+    snapshot: &ExchangePanelSnapshot,
+    selected_active: Option<ActivePositionView<'_>>,
     status_message: &str,
     help_text: &str,
     positions_focus: PositionsFocus,
     status_scroll: u16,
 ) {
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("󱂬 ", Style::default().fg(accent_blue())),
-            Span::raw(status_message.to_string()),
-        ]),
-        Line::raw(format!(
-            "󰕮 pane {} • history scrolls when selected • PgUp/PgDn scroll status",
-            positions_focus.label()
-        )),
-    ]
+    let lines = vec![Line::from(vec![
+        Span::styled("󱂬 ", Style::default().fg(accent_blue())),
+        Span::raw(status_message.to_string()),
+    ])]
     .into_iter()
+    .chain(selected_position_interaction_lines(
+        snapshot,
+        selected_active,
+    ))
+    .chain(std::iter::once(Line::raw(format!(
+        "󰕮 pane {} • history scrolls when selected • PgUp/PgDn scroll status",
+        positions_focus.label()
+    ))))
     .chain(
         help_text
             .lines()
@@ -2092,6 +2360,7 @@ fn render_operator_log(
 fn render_live_view_overlay(
     frame: &mut Frame<'_>,
     area: Rect,
+    snapshot: &ExchangePanelSnapshot,
     selected_active: Option<ActivePositionView<'_>>,
 ) {
     let popup = popup_area(area, 84, 78);
@@ -2116,6 +2385,8 @@ fn render_live_view_overlay(
     .split(inner);
     let middle = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(layout[1]);
+    let selected_transport = selected_transport_marker(snapshot, view);
+    let selected_recorder = selected_recorder_event(snapshot, view, selected_transport);
 
     let header = Paragraph::new(vec![
         Line::from(vec![
@@ -2161,19 +2432,46 @@ fn render_live_view_overlay(
             ("󰆼 Position", active_position_label(view), accent_gold()),
             ("󰇈 Market", active_market_name(view), accent_blue()),
             (
-                "󰈀 Entry Prob",
-                active_entry_probability_label(view),
+                "󰈀 Prob",
+                format!(
+                    "entry {} | live {}",
+                    active_entry_probability_label(view),
+                    active_probability_label(view)
+                ),
                 accent_cyan(),
             ),
-            ("󰥔 Live Prob", active_probability_label(view), accent_cyan()),
             (
-                "󰐃 Book Cash",
-                active_bookie_cashout_label(view),
+                "󰐃 Cash / Lay",
+                format!(
+                    "{} | {}",
+                    active_bookie_cashout_label(view),
+                    active_live_odds_label(view)
+                ),
                 accent_green(),
             ),
-            ("󰑭 Lay Live", active_live_odds_label(view), accent_green()),
-            ("󰌑 Status", active_status_label(view), accent_green()),
-            ("󰄬 Trigger", active_trigger_label(view), accent_gold()),
+            (
+                "󰌑 Flow",
+                format!(
+                    "{} | {}",
+                    active_status_label(view),
+                    active_trigger_label(view)
+                ),
+                accent_green(),
+            ),
+            (
+                "󰐊 Last I/O",
+                selected_transport
+                    .map(compact_transport_label)
+                    .unwrap_or_else(|| String::from("no correlated marker")),
+                accent_gold(),
+            ),
+            (
+                "󰛿 Recorder",
+                selected_recorder
+                    .map(compact_recorder_label)
+                    .unwrap_or_else(|| String::from("no correlated event")),
+                accent_cyan(),
+            ),
         ],
         Constraint::Length(12),
     );
@@ -2386,7 +2684,7 @@ fn table_header(title: &str) -> Vec<&'static str> {
     match title {
         heading if heading.contains("Active Positions") => {
             vec![
-                "Event", "Position", "Date", "Time", "Hold", "Lock", "A", "Prob", "Trigger",
+                "Event", "Position", "Date", "Time", "Hold", "Lock", "A", "I/O", "Prob", "Trigger",
             ]
         }
         heading if heading.contains("Historical Positions") => {
@@ -2840,14 +3138,16 @@ fn accent_red() -> Color {
 mod tests {
     use crate::domain::{
         ExchangePanelSnapshot, ExitPolicySummary, ExitRecommendation, OpenPositionRow,
-        TrackedBetRow, TrackedLeg, ValueMetric, VenueId, VenueStatus, VenueSummary, WatchSnapshot,
-        WorkerStatus, WorkerSummary,
+        RecorderEventSummary, TrackedBetRow, TrackedLeg, TransportMarkerSummary, ValueMetric,
+        VenueId, VenueStatus, VenueSummary, WatchSnapshot, WorkerStatus, WorkerSummary,
     };
 
     use super::{
-        exit_recommendation_lines, historical_position_rows, open_position_lines,
-        positions_pnl_summary, summary_lines, tracked_bet_funding_counts,
-        tracked_bet_funding_label, tracked_bet_lines, watch_lines,
+        active_interaction_label, active_interaction_summary, active_position_rows,
+        active_position_views, exit_recommendation_lines, historical_position_rows,
+        open_position_lines, positions_pnl_summary, selected_position_interaction_lines,
+        summary_lines, tracked_bet_funding_counts, tracked_bet_funding_label, tracked_bet_lines,
+        watch_lines,
     };
 
     #[test]
@@ -2886,6 +3186,10 @@ mod tests {
                 stop_loss: 1.0,
                 watches: Vec::new(),
             }),
+            recorder_bundle: None,
+            recorder_events: Vec::new(),
+            transport_summary: None,
+            transport_events: Vec::new(),
             tracked_bets: Vec::new(),
             exit_policy: Default::default(),
             exit_recommendations: Vec::new(),
@@ -2913,6 +3217,161 @@ mod tests {
 
         assert!(rendered.contains("Tracked bets: 1"));
         assert!(rendered.contains("Recommendations: 1"));
+        assert!(rendered.contains("I/O recent 0 | pending 0 | issues 0"));
+    }
+
+    #[test]
+    fn selected_position_interaction_lines_show_correlated_transport_and_recorder_events() {
+        let mut snapshot = sample_snapshot();
+        snapshot.transport_events = vec![TransportMarkerSummary {
+            captured_at: String::from("2026-03-20T12:00:01Z"),
+            kind: String::from("interaction_marker"),
+            action: String::from("place_bet"),
+            phase: String::from("response"),
+            request_id: String::from("req-7"),
+            reference_id: String::from("bet-001"),
+            summary: String::from("response place_bet req-7 bet-001"),
+            detail: String::from("loaded in review mode"),
+        }];
+        snapshot.recorder_events = vec![RecorderEventSummary {
+            captured_at: String::from("2026-03-20T12:00:01Z"),
+            kind: String::from("operator_interaction"),
+            source: String::from("operator_console"),
+            page: String::from("worker_request"),
+            action: String::from("place_bet"),
+            status: String::from("response:submitted"),
+            request_id: String::from("req-7"),
+            reference_id: String::from("bet-001"),
+            summary: String::from("place_bet bet-001 -> response:submitted"),
+            detail: String::from("loaded in review mode"),
+        }];
+
+        let active_view = active_position_views(&snapshot)
+            .into_iter()
+            .next()
+            .expect("active position");
+        let rendered = selected_position_interaction_lines(&snapshot, Some(active_view))
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("selected ref bet-001"));
+        assert!(rendered.contains("transport response place_bet req-7"));
+        assert!(rendered.contains("recorder place_bet response:submitted req-7"));
+        assert!(rendered.contains("loaded in review mode"));
+    }
+
+    #[test]
+    fn active_position_rows_include_compact_interaction_state() {
+        let mut snapshot = sample_snapshot();
+        snapshot.transport_events = vec![TransportMarkerSummary {
+            captured_at: String::from("2026-03-20T12:00:01Z"),
+            kind: String::from("interaction_marker"),
+            action: String::from("place_bet"),
+            phase: String::from("response"),
+            request_id: String::from("req-7"),
+            reference_id: String::from("bet-001"),
+            summary: String::from("response place_bet req-7 bet-001"),
+            detail: String::from("loaded in review mode"),
+        }];
+        snapshot.recorder_events = vec![RecorderEventSummary {
+            captured_at: String::from("2026-03-20T12:00:01Z"),
+            kind: String::from("operator_interaction"),
+            source: String::from("operator_console"),
+            page: String::from("worker_request"),
+            action: String::from("place_bet"),
+            status: String::from("response:submitted"),
+            request_id: String::from("req-7"),
+            reference_id: String::from("bet-001"),
+            summary: String::from("place_bet bet-001 -> response:submitted"),
+            detail: String::from("loaded in review mode"),
+        }];
+
+        let active_view = active_position_views(&snapshot)
+            .into_iter()
+            .next()
+            .expect("active position");
+        assert_eq!(active_interaction_label(&snapshot, active_view), "bet subm");
+
+        let rows = active_position_rows(&snapshot, &active_position_views(&snapshot));
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn active_interaction_summary_counts_pending_and_issue_rows() {
+        let mut snapshot = sample_snapshot();
+        snapshot.transport_events = vec![
+            TransportMarkerSummary {
+                captured_at: String::from("2026-03-20T12:00:01Z"),
+                kind: String::from("interaction_marker"),
+                action: String::from("place_bet"),
+                phase: String::from("request"),
+                request_id: String::from("req-7"),
+                reference_id: String::from("bet-001"),
+                summary: String::from("request place_bet req-7 bet-001"),
+                detail: String::from("review buy"),
+            },
+            TransportMarkerSummary {
+                captured_at: String::from("2026-03-20T12:00:02Z"),
+                kind: String::from("interaction_marker"),
+                action: String::from("cash_out"),
+                phase: String::from("response"),
+                request_id: String::new(),
+                reference_id: String::from("bet-002"),
+                summary: String::from("response cash_out bet-002"),
+                detail: String::from("not implemented"),
+            },
+        ];
+        snapshot.recorder_events = vec![
+            RecorderEventSummary {
+                captured_at: String::from("2026-03-20T12:00:01Z"),
+                kind: String::from("operator_interaction"),
+                source: String::from("operator_console"),
+                page: String::from("worker_request"),
+                action: String::from("place_bet"),
+                status: String::from("request:requested"),
+                request_id: String::from("req-7"),
+                reference_id: String::from("bet-001"),
+                summary: String::from("place_bet bet-001 -> request:requested"),
+                detail: String::from("review buy"),
+            },
+            RecorderEventSummary {
+                captured_at: String::from("2026-03-20T12:00:02Z"),
+                kind: String::from("operator_interaction"),
+                source: String::from("operator_console"),
+                page: String::from("worker_request"),
+                action: String::from("cash_out"),
+                status: String::from("response:not_implemented"),
+                request_id: String::new(),
+                reference_id: String::from("bet-002"),
+                summary: String::from("cash_out bet-002 -> response:not_implemented"),
+                detail: String::from("not implemented"),
+            },
+        ];
+        snapshot.tracked_bets.push(TrackedBetRow {
+            bet_id: String::from("bet-002"),
+            group_id: String::from("group-arsenal-everton-2"),
+            event: String::from("Arsenal v Everton"),
+            market: String::from("Full-time result"),
+            selection: String::from("Arsenal"),
+            status: String::from("open"),
+            platform: String::from("bet365"),
+            legs: vec![TrackedLeg {
+                venue: String::from("bet365"),
+                outcome: String::from("Arsenal"),
+                side: String::from("back"),
+                odds: 3.10,
+                stake: 10.0,
+                status: String::from("open"),
+                ..TrackedLeg::default()
+            }],
+            ..TrackedBetRow::default()
+        });
+
+        let (recent, pending, issues) = active_interaction_summary(&snapshot);
+
+        assert_eq!((recent, pending, issues), (2, 1, 1));
     }
 
     #[test]
@@ -3432,6 +3891,10 @@ mod tests {
                 stop_loss: 5.0,
                 watches: Vec::new(),
             }),
+            recorder_bundle: None,
+            recorder_events: Vec::new(),
+            transport_summary: None,
+            transport_events: Vec::new(),
             tracked_bets: vec![TrackedBetRow {
                 bet_id: String::from("bet-001"),
                 group_id: String::from("group-arsenal-everton"),

@@ -356,10 +356,94 @@ pub struct ExchangePanelSnapshot {
     pub other_open_bets: Vec<OtherOpenBetRow>,
     pub decisions: Vec<DecisionSummary>,
     pub watch: Option<WatchSnapshot>,
+    pub recorder_bundle: Option<RecorderBundleSummary>,
+    pub recorder_events: Vec<RecorderEventSummary>,
+    pub transport_summary: Option<TransportCaptureSummary>,
+    pub transport_events: Vec<TransportMarkerSummary>,
     pub tracked_bets: Vec<TrackedBetRow>,
     pub exit_policy: ExitPolicySummary,
     pub exit_recommendations: Vec<ExitRecommendation>,
     pub horse_matcher: Option<HorseMatcherSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecorderBundleSummary {
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub run_dir: String,
+    pub event_count: usize,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub latest_event_at: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub latest_event_kind: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub latest_event_summary: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub latest_positions_at: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub latest_watch_plan_at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecorderEventSummary {
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub captured_at: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub kind: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub source: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub page: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub action: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub status: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub request_id: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub reference_id: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub summary: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TransportCaptureSummary {
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub transport_path: String,
+    pub marker_count: usize,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub latest_marker_at: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub latest_marker_action: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub latest_marker_phase: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub latest_marker_summary: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TransportMarkerSummary {
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub captured_at: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub kind: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub action: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub phase: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub request_id: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub reference_id: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub summary: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

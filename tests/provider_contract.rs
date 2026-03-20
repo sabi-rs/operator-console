@@ -144,6 +144,52 @@ fn exchange_panel_snapshot_deserializes_account_positions_and_other_bets() {
             "target_profit": 1.0,
             "stop_loss": 1.0,
             "watches": []
+          },
+          "recorder_bundle": {
+            "run_dir": "/tmp/sabi-run",
+            "event_count": 3,
+            "latest_event_at": "2026-03-11T12:05:00Z",
+            "latest_event_kind": "action_snapshot",
+            "latest_event_summary": "place_order Draw -> submitted",
+            "latest_positions_at": "2026-03-11T12:03:00Z",
+            "latest_watch_plan_at": "2026-03-11T12:04:00Z"
+          },
+          "recorder_events": [
+            {
+              "captured_at": "2026-03-11T12:05:00Z",
+              "kind": "action_snapshot",
+              "source": "smarkets_exchange",
+              "page": "betslip",
+              "summary": "place_order Draw -> submitted",
+              "detail": "https://smarkets.com/betslip"
+            }
+          ],
+          "transport_summary": {
+            "transport_path": "/tmp/sabi-run/transport.jsonl",
+            "marker_count": 2,
+            "latest_marker_at": "2026-03-11T12:05:01Z",
+            "latest_marker_action": "place_bet",
+            "latest_marker_phase": "response",
+            "latest_marker_summary": "response place_bet req-1 bet-1"
+          },
+          "transport_events": [
+            {
+              "captured_at": "2026-03-11T12:05:01Z",
+              "kind": "interaction_marker",
+              "action": "place_bet",
+              "phase": "response",
+              "request_id": "req-1",
+              "reference_id": "bet-1",
+              "summary": "response place_bet req-1 bet-1",
+              "detail": "loaded in review mode"
+            }
+          ],
+          "tracked_bets": [],
+          "exit_policy": {
+            "target_profit": 1.0,
+            "stop_loss": 1.0,
+            "hard_margin_call_profit_floor": null,
+            "warn_only_default": true
           }
         }"#,
     )
@@ -164,6 +210,26 @@ fn exchange_panel_snapshot_deserializes_account_positions_and_other_bets() {
     assert_eq!(snapshot.decisions[0].status, "take_profit_ready");
     assert_eq!(snapshot.open_positions[0].current_back_odds, Some(2.80));
     assert_eq!(snapshot.open_positions[0].current_score, "0-0");
+    assert_eq!(
+        snapshot
+            .recorder_bundle
+            .as_ref()
+            .expect("bundle summary")
+            .event_count,
+        3
+    );
+    assert_eq!(snapshot.recorder_events.len(), 1);
+    assert_eq!(snapshot.recorder_events[0].kind, "action_snapshot");
+    assert_eq!(
+        snapshot
+            .transport_summary
+            .as_ref()
+            .expect("transport summary")
+            .marker_count,
+        2
+    );
+    assert_eq!(snapshot.transport_events.len(), 1);
+    assert_eq!(snapshot.transport_events[0].phase, "response");
     assert_eq!(
         snapshot.open_positions[0].event_url,
         "https://smarkets.com/football/england-premier-league/2026/03/14/20-00/west-ham-vs-manchester-city/44919693/"

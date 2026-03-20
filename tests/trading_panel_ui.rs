@@ -2,8 +2,9 @@ use color_eyre::Result;
 use operator_console::app::{App, TradingSection};
 use operator_console::domain::{
     AccountStats, DecisionSummary, ExchangePanelSnapshot, ExitRecommendation, OpenPositionRow,
-    OtherOpenBetRow, RuntimeSummary, TrackedBetRow, TrackedLeg, VenueId, VenueStatus, VenueSummary,
-    WatchRow, WatchSnapshot, WorkerStatus, WorkerSummary,
+    OtherOpenBetRow, RecorderEventSummary, RuntimeSummary, TrackedBetRow, TrackedLeg,
+    TransportMarkerSummary, VenueId, VenueStatus, VenueSummary, WatchRow, WatchSnapshot,
+    WorkerStatus, WorkerSummary,
 };
 use operator_console::provider::{ExchangeProvider, ProviderRequest};
 use ratatui::backend::TestBackend;
@@ -65,6 +66,16 @@ fn positions_live_view_overlay_renders_cashout_and_matrix() {
         current_cashout_value: Some(16.16),
         supports_cash_out: true,
     }];
+    snapshot.transport_events = vec![TransportMarkerSummary {
+        captured_at: String::from("2026-03-18T12:35:01Z"),
+        kind: String::from("interaction_marker"),
+        action: String::from("cash_out"),
+        phase: String::from("response"),
+        request_id: String::new(),
+        reference_id: String::from("bet-1"),
+        summary: String::from("response cash_out bet-1"),
+        detail: String::from("Cash out requested for bet-1."),
+    }];
     let mut app = App::from_provider(StaticProvider { snapshot }).expect("app");
     app.set_trading_section(TradingSection::Positions);
     app.toggle_live_view_overlay();
@@ -88,9 +99,65 @@ fn positions_live_view_overlay_renders_cashout_and_matrix() {
     let rendered = lines.join("\n");
 
     assert!(rendered.contains("Live View"));
-    assert!(rendered.contains("Book Cash"));
+    assert!(rendered.contains("Cash / Lay"));
     assert!(rendered.contains("Decision Matrix"));
+    assert!(rendered.contains("cash_out bet-1"));
     assert!(rendered.contains("16.16"));
+}
+
+#[test]
+fn positions_panel_renders_selected_interaction_evidence() {
+    let mut snapshot = sample_snapshot();
+    snapshot.transport_events = vec![TransportMarkerSummary {
+        captured_at: String::from("2026-03-18T12:35:01Z"),
+        kind: String::from("interaction_marker"),
+        action: String::from("place_bet"),
+        phase: String::from("response"),
+        request_id: String::from("req-77"),
+        reference_id: String::from("bet-1"),
+        summary: String::from("response place_bet req-77 bet-1"),
+        detail: String::from("loaded in review mode"),
+    }];
+    snapshot.recorder_events = vec![RecorderEventSummary {
+        captured_at: String::from("2026-03-18T12:35:01Z"),
+        kind: String::from("operator_interaction"),
+        source: String::from("operator_console"),
+        page: String::from("worker_request"),
+        action: String::from("place_bet"),
+        status: String::from("response:submitted"),
+        request_id: String::from("req-77"),
+        reference_id: String::from("bet-1"),
+        summary: String::from("place_bet bet-1 -> response:submitted"),
+        detail: String::from("loaded in review mode"),
+    }];
+
+    let mut app = App::from_provider(StaticProvider { snapshot }).expect("app");
+    app.set_trading_section(TradingSection::Positions);
+
+    let backend = TestBackend::new(160, 40);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| operator_console::ui::render(frame, &mut app))
+        .expect("draw ui");
+
+    let buffer = terminal.backend().buffer().clone();
+    let area = buffer.area;
+    let mut lines = Vec::new();
+    for y in 0..area.height {
+        let mut line = String::new();
+        for x in 0..area.width {
+            line.push_str(buffer.cell((x, y)).expect("cell").symbol());
+        }
+        lines.push(line);
+    }
+    let rendered = lines.join("\n");
+
+    assert!(rendered.contains("I/O"));
+    assert!(rendered.contains("bet subm"));
+    assert!(rendered.contains("bet/cash"));
+    assert!(rendered.contains("selected ref bet-1"));
+    assert!(rendered.contains("place_bet"));
+    assert!(rendered.contains("req-77"));
 }
 
 fn render_section(section: TradingSection) -> String {
@@ -269,6 +336,10 @@ fn sample_snapshot() -> ExchangePanelSnapshot {
                 stop_loss_implied_probability: 0.333,
             }],
         }),
+        recorder_bundle: None,
+        recorder_events: Vec::new(),
+        transport_summary: None,
+        transport_events: Vec::new(),
         tracked_bets: vec![TrackedBetRow {
             bet_id: String::from("bet-1"),
             group_id: String::from("grp-1"),

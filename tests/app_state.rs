@@ -184,6 +184,10 @@ fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {
         other_open_bets: Vec::new(),
         decisions: Vec::new(),
         watch: None,
+        recorder_bundle: None,
+        recorder_events: Vec::new(),
+        transport_summary: None,
+        transport_events: Vec::new(),
         tracked_bets: vec![TrackedBetRow {
             bet_id: String::from("bet-001"),
             group_id: String::from("group-arsenal-everton"),

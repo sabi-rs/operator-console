@@ -83,10 +83,10 @@ fn section_blocks(
             path_lines(app),
         ),
         ObservabilitySection::Logs => (
-            "Recent Events",
-            recent_event_lines(app),
-            "Restart History",
-            restart_history_lines(app),
+            "Recorder Evidence",
+            recorder_evidence_lines(app),
+            "Transport + Operator",
+            transport_and_operator_lines(app),
         ),
         ObservabilitySection::Health => (
             "Health Summary",
@@ -162,6 +162,22 @@ fn watcher_lines(app: &App) -> Vec<Line<'static>> {
         Line::raw(format!(
             "Reconnect count: {}",
             runtime.worker_reconnect_count
+        )),
+        Line::raw(format!(
+            "Bundle events: {}",
+            app.snapshot()
+                .recorder_bundle
+                .as_ref()
+                .map(|bundle| bundle.event_count)
+                .unwrap_or(0)
+        )),
+        Line::raw(format!(
+            "Transport markers: {}",
+            app.snapshot()
+                .transport_summary
+                .as_ref()
+                .map(|summary| summary.marker_count)
+                .unwrap_or(0)
         )),
         decision_preview_line(app),
     ]
@@ -265,19 +281,63 @@ fn path_lines(app: &App) -> Vec<Line<'static>> {
     ]
 }
 
-fn recent_event_lines(app: &App) -> Vec<Line<'static>> {
-    let events = app.recent_events();
-    if events.is_empty() {
-        return vec![Line::raw("No operator events recorded yet.")];
+fn recorder_evidence_lines(app: &App) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+
+    if let Some(bundle) = app.snapshot().recorder_bundle.as_ref() {
+        rows.push(Line::raw(format!("Run dir: {}", bundle.run_dir)));
+        rows.push(Line::raw(format!("Event count: {}", bundle.event_count)));
+        rows.push(Line::raw(format!(
+            "Latest event: {} {}",
+            bundle.latest_event_kind, bundle.latest_event_at
+        )));
+        if !bundle.latest_event_summary.trim().is_empty() {
+            rows.push(Line::raw(format!(
+                "Latest summary: {}",
+                bundle.latest_event_summary
+            )));
+        }
+        if !bundle.latest_positions_at.trim().is_empty() {
+            rows.push(Line::raw(format!(
+                "Latest positions snapshot: {}",
+                bundle.latest_positions_at
+            )));
+        }
+        if !bundle.latest_watch_plan_at.trim().is_empty() {
+            rows.push(Line::raw(format!(
+                "Latest watch plan: {}",
+                bundle.latest_watch_plan_at
+            )));
+        }
+    } else {
+        rows.push(Line::raw(
+            "No recorder bundle is attached to this snapshot.",
+        ));
     }
 
-    events
-        .into_iter()
-        .map(|event| Line::raw(format!("- {event}")))
-        .collect()
+    if app.snapshot().recorder_events.is_empty() {
+        rows.push(Line::raw("No normalized recorder events are available."));
+        return rows;
+    }
+
+    rows.push(Line::raw(String::new()));
+    for event in &app.snapshot().recorder_events {
+        let prefix = if event.captured_at.trim().is_empty() {
+            event.kind.clone()
+        } else {
+            format!("{} {}", event.captured_at, event.kind)
+        };
+        let mut line = format!("- {} | {}", prefix.trim(), event.summary);
+        if !event.detail.trim().is_empty() {
+            line.push_str(&format!(" | {}", event.detail));
+        }
+        rows.push(Line::raw(line));
+    }
+
+    rows
 }
 
-fn restart_history_lines(app: &App) -> Vec<Line<'static>> {
+fn transport_and_operator_lines(app: &App) -> Vec<Line<'static>> {
     let mut rows = vec![
         Line::raw(format!(
             "Recorder lifecycle: {}",
@@ -307,6 +367,59 @@ fn restart_history_lines(app: &App) -> Vec<Line<'static>> {
         "Current worker detail: {}",
         app.snapshot().worker.detail
     )));
+
+    rows.push(Line::raw(String::new()));
+    if let Some(summary) = app.snapshot().transport_summary.as_ref() {
+        rows.push(Line::raw(format!(
+            "Transport path: {}",
+            summary.transport_path
+        )));
+        rows.push(Line::raw(format!(
+            "Transport markers: {}",
+            summary.marker_count
+        )));
+        rows.push(Line::raw(format!(
+            "Latest transport marker: {} {} {}",
+            summary.latest_marker_phase, summary.latest_marker_action, summary.latest_marker_at
+        )));
+        if !summary.latest_marker_summary.trim().is_empty() {
+            rows.push(Line::raw(format!(
+                "Latest marker summary: {}",
+                summary.latest_marker_summary
+            )));
+        }
+    } else {
+        rows.push(Line::raw(
+            "No transport marker summary is attached to this snapshot.",
+        ));
+    }
+
+    if app.snapshot().transport_events.is_empty() {
+        rows.push(Line::raw("No transport markers are available."));
+    } else {
+        for event in &app.snapshot().transport_events {
+            let prefix = if event.captured_at.trim().is_empty() {
+                format!("{} {}", event.phase, event.action)
+            } else {
+                format!("{} {} {}", event.captured_at, event.phase, event.action)
+            };
+            let mut line = format!("- {} | {}", prefix.trim(), event.summary);
+            if !event.detail.trim().is_empty() {
+                line.push_str(&format!(" | {}", event.detail));
+            }
+            rows.push(Line::raw(line));
+        }
+    }
+
+    let events = app.recent_events();
+    if events.is_empty() {
+        rows.push(Line::raw("No operator events recorded yet."));
+    } else {
+        rows.push(Line::raw(String::new()));
+        for event in events {
+            rows.push(Line::raw(format!("- {event}")));
+        }
+    }
     rows
 }
 
@@ -402,9 +515,9 @@ fn health_text(app: &App) -> Vec<String> {
 
 #[cfg(test)]
 fn log_text(app: &App) -> Vec<String> {
-    recent_event_lines(app)
+    recorder_evidence_lines(app)
         .into_iter()
-        .chain(restart_history_lines(app))
+        .chain(transport_and_operator_lines(app))
         .map(|line| line.to_string())
         .collect()
 }
@@ -413,7 +526,10 @@ fn log_text(app: &App) -> Vec<String> {
 mod tests {
     use super::{health_text, log_text};
     use crate::app::App;
-    use crate::domain::{ExchangePanelSnapshot, RuntimeSummary, WorkerStatus, WorkerSummary};
+    use crate::domain::{
+        ExchangePanelSnapshot, RecorderBundleSummary, RecorderEventSummary, RuntimeSummary,
+        TransportCaptureSummary, TransportMarkerSummary, WorkerStatus, WorkerSummary,
+    };
     use crate::provider::{ExchangeProvider, ProviderRequest};
     use color_eyre::Result;
 
@@ -436,6 +552,45 @@ mod tests {
                     watcher_iteration: Some(14),
                     stale: true,
                 }),
+                recorder_bundle: Some(RecorderBundleSummary {
+                    run_dir: String::from("/tmp/sabi-run"),
+                    event_count: 3,
+                    latest_event_at: String::from("2026-03-11T15:00:00Z"),
+                    latest_event_kind: String::from("action_snapshot"),
+                    latest_event_summary: String::from("place_order Draw -> submitted"),
+                    latest_positions_at: String::from("2026-03-11T14:58:00Z"),
+                    latest_watch_plan_at: String::from("2026-03-11T14:59:00Z"),
+                }),
+                recorder_events: vec![RecorderEventSummary {
+                    captured_at: String::from("2026-03-11T15:00:00Z"),
+                    kind: String::from("action_snapshot"),
+                    source: String::from("smarkets_exchange"),
+                    page: String::from("betslip"),
+                    action: String::new(),
+                    status: String::new(),
+                    request_id: String::new(),
+                    reference_id: String::new(),
+                    summary: String::from("place_order Draw -> submitted"),
+                    detail: String::from("https://smarkets.com/betslip"),
+                }],
+                transport_summary: Some(TransportCaptureSummary {
+                    transport_path: String::from("/tmp/sabi-run/transport.jsonl"),
+                    marker_count: 2,
+                    latest_marker_at: String::from("2026-03-11T15:00:01Z"),
+                    latest_marker_action: String::from("place_bet"),
+                    latest_marker_phase: String::from("response"),
+                    latest_marker_summary: String::from("response place_bet req-1 bet-1"),
+                }),
+                transport_events: vec![TransportMarkerSummary {
+                    captured_at: String::from("2026-03-11T15:00:01Z"),
+                    kind: String::from("interaction_marker"),
+                    action: String::from("place_bet"),
+                    phase: String::from("response"),
+                    request_id: String::from("req-1"),
+                    reference_id: String::from("bet-1"),
+                    summary: String::from("response place_bet req-1 bet-1"),
+                    detail: String::from("loaded in review mode"),
+                }],
                 status_line: String::from("refresh failed"),
                 ..ExchangePanelSnapshot::default()
             })
@@ -466,9 +621,16 @@ mod tests {
         let app = App::from_provider(FixedProvider).expect("fixed provider should initialize");
         let text = log_text(&app);
 
+        assert!(text.iter().any(|line| line.contains("Event count: 3")));
         assert!(text
             .iter()
-            .any(|line| line.contains("Loaded initial dashboard from watcher-state.")));
+            .any(|line| line.contains("place_order Draw -> submitted")));
+        assert!(text
+            .iter()
+            .any(|line| line.contains("Transport markers: 2")));
+        assert!(text
+            .iter()
+            .any(|line| line.contains("response place_bet req-1 bet-1")));
         assert!(text
             .iter()
             .any(|line| line.contains("Worker reconnect count: 2")));

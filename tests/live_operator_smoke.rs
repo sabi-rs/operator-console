@@ -81,13 +81,16 @@ fn live_operator_smoke_exercises_real_recorder_flow() -> Result<()> {
         assert_eq!(app.recorder_lifecycle_state(), "running");
         assert_eq!(app.recorder_snapshot_freshness(), "fresh");
         assert!(app.last_successful_snapshot_at().is_some());
+        assert_recorder_evidence(&app)?;
 
         app.refresh()?;
         assert_eq!(app.recorder_snapshot_mode(), "cached");
+        assert_recorder_evidence(&app)?;
 
         app.refresh_live()?;
         assert_eq!(app.recorder_snapshot_mode(), "live");
         assert!(!app.status_message().trim().is_empty());
+        assert_recorder_evidence(&app)?;
 
         app.set_trading_section(TradingSection::Accounts);
         select_first_non_smarkets_venue(&mut app)?;
@@ -98,10 +101,12 @@ fn live_operator_smoke_exercises_real_recorder_flow() -> Result<()> {
         app.refresh()?;
         assert_eq!(app.selected_venue(), Some(selected_venue));
         assert!(!app.status_message().trim().is_empty());
+        assert_recorder_evidence(&app)?;
 
         app.refresh_live()?;
         assert_eq!(app.selected_venue(), Some(selected_venue));
         assert!(!app.status_message().trim().is_empty());
+        assert_recorder_evidence(&app)?;
 
         Ok(())
     })();
@@ -179,6 +184,24 @@ fn live_timeout() -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(90))
+}
+
+fn assert_recorder_evidence(app: &App) -> Result<()> {
+    let bundle = app
+        .snapshot()
+        .recorder_bundle
+        .as_ref()
+        .ok_or_else(|| eyre!("live recorder snapshot did not include bundle provenance"))?;
+    if bundle.run_dir.trim().is_empty() {
+        bail!("live recorder bundle provenance did not include run_dir");
+    }
+    if bundle.event_count == 0 {
+        bail!("live recorder bundle provenance reported zero events");
+    }
+    if app.snapshot().recorder_events.is_empty() {
+        bail!("live recorder snapshot did not include normalized recorder events");
+    }
+    Ok(())
 }
 
 fn stub_snapshot(status_line: &str) -> ExchangePanelSnapshot {

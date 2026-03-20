@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::Instant;
@@ -2253,6 +2253,7 @@ impl App {
     fn replace_snapshot(&mut self, snapshot: ExchangePanelSnapshot) {
         let had_successful_snapshot = self.last_successful_snapshot_at.is_some();
         let previous_reconnect_count = self.worker_reconnect_count();
+        let previous_decision_counts = decision_status_counts(&self.snapshot);
         self.snapshot = snapshot;
         if let Some(updated_at) = runtime_updated_at(&self.snapshot) {
             self.last_successful_snapshot_at = Some(updated_at.to_string());
@@ -2265,6 +2266,13 @@ impl App {
         }
         if !had_successful_snapshot && self.last_successful_snapshot_at.is_some() {
             self.record_event("Received first successful recorder snapshot.");
+        }
+        let current_decision_counts = decision_status_counts(&self.snapshot);
+        if previous_decision_counts != current_decision_counts {
+            self.record_event(format!(
+                "Decision queue changed: {}.",
+                format_decision_status_counts(&current_decision_counts)
+            ));
         }
         self.status_message = self.snapshot.status_line.clone();
         self.status_scroll = 0;
@@ -3010,6 +3018,25 @@ fn runtime_updated_at(snapshot: &ExchangePanelSnapshot) -> Option<&str> {
         .filter(|value| !value.trim().is_empty())
 }
 
+fn decision_status_counts(snapshot: &ExchangePanelSnapshot) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for decision in &snapshot.decisions {
+        *counts.entry(decision.status.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn format_decision_status_counts(counts: &BTreeMap<String, usize>) -> String {
+    if counts.is_empty() {
+        return String::from("empty");
+    }
+    counts
+        .iter()
+        .map(|(status, count)| format!("{status}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn next_from<T: Copy + PartialEq>(value: T, all: &[T]) -> T {
     let index = all
         .iter()
@@ -3629,6 +3656,10 @@ mod tests {
             other_open_bets: Vec::new(),
             decisions: Vec::new(),
             watch: None,
+            recorder_bundle: None,
+            recorder_events: Vec::new(),
+            transport_summary: None,
+            transport_events: Vec::new(),
             tracked_bets: Vec::new(),
             exit_policy: Default::default(),
             exit_recommendations: Vec::new(),
