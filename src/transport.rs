@@ -25,7 +25,8 @@ pub struct WorkerConfig {
 pub enum WorkerRequestEnvelope {
     LoadDashboard { config: WorkerConfig },
     SelectVenue { venue: VenueId },
-    Refresh,
+    RefreshCached,
+    RefreshLive,
     CashOutTrackedBet { bet_id: String },
     ExecuteTradingAction { intent: TradingActionIntent },
     LoadHorseMatcher { query: HorseMatcherQuery },

@@ -169,6 +169,7 @@ fn sample_snapshot() -> ExchangePanelSnapshot {
         runtime: Some(RuntimeSummary {
             updated_at: String::from("2026-03-18T12:34:56Z"),
             source: String::from("bet-recorder"),
+            refresh_kind: String::from("live_capture"),
             decision_count: 2,
             watcher_iteration: Some(42),
             stale: false,

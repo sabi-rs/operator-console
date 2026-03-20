@@ -715,6 +715,7 @@ mod tests {
             runtime: Some(crate::domain::RuntimeSummary {
                 updated_at: String::from("2026-03-19T10:00:00Z"),
                 source: String::from("watcher-state"),
+                refresh_kind: String::from("live_capture"),
                 decision_count: 1,
                 watcher_iteration: Some(4),
                 stale: false,

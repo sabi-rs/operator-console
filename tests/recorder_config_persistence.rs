@@ -71,9 +71,16 @@ fn recorder_config_backfills_default_profile_path_for_legacy_json() {
 
     assert_eq!(
         loaded.profile_path,
-        Some(PathBuf::from(
-            "/home/thomas/.config/smarkets-automation/profile"
-        ))
+        Some(
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+                })
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join("smarkets-automation")
+                .join("profile"),
+        )
     );
     assert!(note.contains("Loaded recorder config"));
 }

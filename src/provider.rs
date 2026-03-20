@@ -6,7 +6,8 @@ use crate::trading_actions::TradingActionIntent;
 pub enum ProviderRequest {
     LoadDashboard,
     SelectVenue(VenueId),
-    Refresh,
+    RefreshCached,
+    RefreshLive,
     CashOutTrackedBet { bet_id: String },
     ExecuteTradingAction { intent: TradingActionIntent },
     LoadHorseMatcher { query: HorseMatcherQuery },

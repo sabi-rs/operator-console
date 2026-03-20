@@ -98,10 +98,17 @@ fn worker_request_serializes_bet365_select_venue() {
 }
 
 #[test]
-fn worker_request_serializes_refresh_stably() {
-    let request = serde_json::to_string(&WorkerRequest::Refresh).expect("serialize");
+fn worker_request_serializes_refresh_cached_stably() {
+    let request = serde_json::to_string(&WorkerRequest::RefreshCached).expect("serialize");
 
-    assert_json_eq(&request, &fixture("refresh_request.json"));
+    assert_json_eq(&request, r#""RefreshCached""#);
+}
+
+#[test]
+fn worker_request_serializes_refresh_live_stably() {
+    let request = serde_json::to_string(&WorkerRequest::RefreshLive).expect("serialize");
+
+    assert_json_eq(&request, r#""RefreshLive""#);
 }
 
 #[test]

@@ -435,6 +435,8 @@ pub struct RuntimeSummary {
     pub updated_at: String,
     #[serde(default, deserialize_with = "null_string_as_default")]
     pub source: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub refresh_kind: String,
     pub decision_count: usize,
     pub watcher_iteration: Option<usize>,
     pub stale: bool,

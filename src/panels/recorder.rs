@@ -10,7 +10,7 @@ use crate::recorder::RecorderField;
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let layout = Layout::vertical([
-        Constraint::Length(9),
+        Constraint::Length(11),
         Constraint::Min(14),
         Constraint::Length(8),
     ])
@@ -45,29 +45,45 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             accent_blue(),
         ),
         key_value_row(
+            "󰐹 Lifecycle",
+            app.recorder_lifecycle_state().to_string(),
+            lifecycle_color(app.recorder_lifecycle_state()),
+        ),
+        key_value_row(
             "󰒋 Worker",
             format!("{:?}", snapshot.worker.status),
             worker_color(snapshot.worker.status),
         ),
-        key_value_row("󰀵 Venue", selected_venue, accent_cyan()),
         key_value_row(
-            "󰞋 Mode",
-            if app.recorder_is_editing() {
-                String::from("editing buffer")
-            } else {
-                String::from("field navigation")
-            },
+            "󰄬 Snapshot",
+            app.recorder_snapshot_freshness().to_string(),
+            snapshot_freshness_color(app.recorder_snapshot_freshness()),
+        ),
+        key_value_row(
+            "󰞋 Refresh",
+            app.recorder_snapshot_mode().to_string(),
             accent_gold(),
         ),
         key_value_row(
-            "󰏬 Selected",
-            app.recorder_selected_field().label().to_string(),
+            "󰅐 Updated",
+            app.last_successful_snapshot_at()
+                .unwrap_or("none")
+                .to_string(),
             text_color(),
         ),
+        key_value_row("󰀵 Venue", selected_venue, accent_cyan()),
         key_value_row(
-            "󱂬 Note",
-            app.recorder_config_note().to_string(),
-            muted_text(),
+            "󱂬 Failure",
+            if let Some(detail) = app.last_recorder_start_failure() {
+                detail.to_string()
+            } else {
+                String::from("<none>")
+            },
+            if app.last_recorder_start_failure().is_some() {
+                accent_red()
+            } else {
+                muted_text()
+            },
         ),
     ];
     let table = Table::new(rows, [Constraint::Length(18), Constraint::Min(10)])
@@ -295,7 +311,10 @@ fn render_runbook(frame: &mut Frame<'_>, area: Rect, _app: &App) {
         action_row("󰮳 Navigate", "j/k move field"),
         action_row("󰌑 Edit", "Enter apply • Esc cancel • [/] cycle suggestions"),
         action_row("󰑓 Control", "s start recorder • x stop recorder"),
-        action_row("󰑓 Config", "u reload config • D defaults • r refresh"),
+        action_row(
+            "󰑓 Config",
+            "u reload config • D defaults • r cache • R live",
+        ),
     ];
     let table = Table::new(rows, [Constraint::Length(14), Constraint::Min(10)])
         .block(section_block("󰌑 Recorder Runbook", accent_red()))
@@ -406,6 +425,23 @@ fn worker_color(status: crate::domain::WorkerStatus) -> Color {
         crate::domain::WorkerStatus::Busy => accent_gold(),
         crate::domain::WorkerStatus::Idle => muted_text(),
         crate::domain::WorkerStatus::Error => accent_red(),
+    }
+}
+
+fn lifecycle_color(state: &str) -> Color {
+    match state {
+        "running" => accent_green(),
+        "stale" | "waiting" | "stopped" => accent_gold(),
+        "failed" => accent_red(),
+        _ => muted_text(),
+    }
+}
+
+fn snapshot_freshness_color(state: &str) -> Color {
+    match state {
+        "fresh" => accent_green(),
+        "stale" | "waiting" => accent_gold(),
+        _ => muted_text(),
     }
 }
 

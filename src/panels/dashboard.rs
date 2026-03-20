@@ -109,18 +109,25 @@ fn runtime_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'static>> {
                 .unwrap_or("unknown")
         )),
         Line::raw(format!(
-            "Source: {} | Decisions: {}",
+            "Source: {} | Mode: {}",
             runtime
                 .map(|summary| summary.source.as_str())
                 .unwrap_or("snapshot"),
-            runtime.map(|summary| summary.decision_count).unwrap_or(0),
+            runtime
+                .map(|summary| summary.refresh_kind.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("unknown"),
         )),
         Line::raw(format!(
-            "Iteration: {} | Stale: {}",
+            "Decisions: {} | Iteration: {}",
+            runtime.map(|summary| summary.decision_count).unwrap_or(0),
             runtime
                 .and_then(|summary| summary.watcher_iteration)
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| String::from("-")),
+        )),
+        Line::raw(format!(
+            "Stale: {}",
             runtime
                 .map(|summary| yes_no(summary.stale))
                 .unwrap_or("unknown"),
@@ -275,6 +282,7 @@ mod tests {
             runtime: Some(RuntimeSummary {
                 updated_at: String::from("2026-03-11T14:00:00Z"),
                 source: String::from("watcher-state"),
+                refresh_kind: String::from("cached"),
                 decision_count: 2,
                 watcher_iteration: Some(8),
                 stale: false,
@@ -308,5 +316,6 @@ mod tests {
             .any(|line| line.contains("Worker: bet-recorder")));
         assert!(text.iter().any(|line| line.contains("Balance 144.50 GBP")));
         assert!(text.iter().any(|line| line.contains("watcher-state")));
+        assert!(text.iter().any(|line| line.contains("Mode: cached")));
     }
 }

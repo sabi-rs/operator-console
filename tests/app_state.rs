@@ -26,9 +26,9 @@ impl StubProvider {
 impl ExchangeProvider for StubProvider {
     fn handle(&mut self, request: ProviderRequest) -> color_eyre::Result<ExchangePanelSnapshot> {
         match request {
-            ProviderRequest::LoadDashboard | ProviderRequest::Refresh => {
-                Ok(self.snapshots.borrow_mut().remove(0))
-            }
+            ProviderRequest::LoadDashboard
+            | ProviderRequest::RefreshCached
+            | ProviderRequest::RefreshLive => Ok(self.snapshots.borrow_mut().remove(0)),
             ProviderRequest::SelectVenue(_) => unreachable!("selection not used in this test"),
             ProviderRequest::CashOutTrackedBet { .. }
             | ProviderRequest::ExecuteTradingAction { .. }
@@ -50,7 +50,8 @@ impl ExchangeProvider for RecordingActionProvider {
                 *self.captured.borrow_mut() = Some(intent);
                 Ok(self.snapshots.borrow_mut().remove(0))
             }
-            ProviderRequest::Refresh
+            ProviderRequest::RefreshCached
+            | ProviderRequest::RefreshLive
             | ProviderRequest::CashOutTrackedBet { .. }
             | ProviderRequest::SelectVenue(_)
             | ProviderRequest::LoadHorseMatcher { .. } => {

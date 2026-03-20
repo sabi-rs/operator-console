@@ -3,6 +3,9 @@ use std::path::PathBuf;
 
 use color_eyre::eyre::Result;
 use operator_console::app::App;
+use operator_console::recorder::{
+    default_bet_recorder_command, default_bet_recorder_python, default_bet_recorder_root,
+};
 use operator_console::stub_provider::StubExchangeProvider;
 use operator_console::transport::WorkerConfig;
 use operator_console::worker_client::{BetRecorderWorkerClient, WorkerClientExchangeProvider};
@@ -69,12 +72,6 @@ fn help_text() -> &'static str {
     "operator-console\n\nUsage:\n  operator-console [options]\n\nOptions:\n  --bet-recorder-payload-path <path>       Load positions from a captured payload\n  --bet-recorder-run-dir <path>            Load the latest exchange snapshot from a bet-recorder run bundle\n  --bet-recorder-account-path <path>       Optional account stats payload\n  --bet-recorder-open-bets-path <path>     Optional open bets payload\n  --bet-recorder-session <name>            agent-browser session to capture before refresh\n  --bet-recorder-command <path>            bet-recorder executable to run\n  --bet-recorder-python <path>             Python executable override for bet-recorder\n  --bet-recorder-root <path>               bet-recorder checkout root override\n  --commission-rate <value>                Exchange commission rate for worker calculations\n  --target-profit <value>                  Target profit for worker calculations\n  --stop-loss <value>                      Stop-loss for worker calculations\n  -h, --help                               Show this help\n"
 }
 
-const DEFAULT_BET_RECORDER_ROOT: &str = "/home/thomas/projects/sabi/bet-recorder";
-const DEFAULT_BET_RECORDER_PYTHON: &str =
-    "/home/thomas/projects/sabi/bet-recorder/.venv/bin/python";
-const DEFAULT_BET_RECORDER_COMMAND: &str =
-    "/home/thomas/projects/sabi/bet-recorder/bin/bet-recorder";
-
 enum LaunchMode {
     Stub,
     BetRecorder {
@@ -99,9 +96,9 @@ impl LaunchMode {
         let mut account_payload_path = None;
         let mut open_bets_payload_path = None;
         let mut agent_browser_session = None;
-        let mut bet_recorder_command = PathBuf::from(DEFAULT_BET_RECORDER_COMMAND);
-        let mut python_executable = PathBuf::from(DEFAULT_BET_RECORDER_PYTHON);
-        let mut bet_recorder_root = PathBuf::from(DEFAULT_BET_RECORDER_ROOT);
+        let mut bet_recorder_command = default_bet_recorder_command();
+        let mut python_executable = default_bet_recorder_python();
+        let mut bet_recorder_root = default_bet_recorder_root();
         let mut commission_rate = 0.0;
         let mut target_profit = 1.0;
         let mut stop_loss = 1.0;

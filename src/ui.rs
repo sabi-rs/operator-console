@@ -127,8 +127,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled("󱂬 ", Style::default().fg(accent_blue())),
             Span::raw(app.status_message()),
         ]),
-        Line::raw("q quit • o observability • r refresh • v live view • s start recorder • x stop recorder"),
-        Line::raw("enter edit • esc cancel • [/] cycle suggestions • u reload • D defaults"),
+        Line::raw("q quit • o observability • r refresh cache • R recapture live"),
+        Line::raw("s start recorder • x stop recorder • v live view • enter edit • esc cancel"),
     ])
     .block(shell_block("󰘳 Keymap", accent_gold()).padding(Padding::horizontal(1)))
     .wrap(Wrap { trim: true });
@@ -222,6 +222,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let refresh = Paragraph::new(vec![
         badge_line("󰅐 Last refresh", &last_refresh_label(app), accent_green()),
+        badge_line("󰑐 Mode", &refresh_kind_label(app), accent_gold()),
         badge_line(
             "󰑮 Iteration",
             &runtime
@@ -386,6 +387,21 @@ fn source_mode(app: &App) -> &'static str {
         "recorder-backed"
     } else {
         "provider-backed"
+    }
+}
+
+fn refresh_kind_label(app: &App) -> String {
+    match app
+        .snapshot()
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.refresh_kind.as_str())
+    {
+        Some("bootstrap") => String::from("bootstrap"),
+        Some("cached") => String::from("cached"),
+        Some("live_capture") => String::from("live"),
+        Some(value) if !value.trim().is_empty() => value.replace('_', " "),
+        _ => String::from("unknown"),
     }
 }
 

@@ -24,7 +24,9 @@ impl Default for StubExchangeProvider {
 impl ExchangeProvider for StubExchangeProvider {
     fn handle(&mut self, request: ProviderRequest) -> Result<ExchangePanelSnapshot> {
         match request {
-            ProviderRequest::LoadDashboard | ProviderRequest::Refresh => Ok(self.snapshot.clone()),
+            ProviderRequest::LoadDashboard
+            | ProviderRequest::RefreshCached
+            | ProviderRequest::RefreshLive => Ok(self.snapshot.clone()),
             ProviderRequest::SelectVenue(venue) => {
                 self.select_venue(venue)?;
                 Ok(self.snapshot.clone())

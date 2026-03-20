@@ -62,7 +62,7 @@ def main() -> None:
             }}
         }}:
             status_line = "response 1"
-        elif request == "Refresh":
+        elif request == "RefreshCached":
             status_line = "response 2"
         else:
             raise SystemExit(f"unexpected request: {{request}}")
@@ -115,7 +115,7 @@ if __name__ == "__main__":
         })
         .expect("first worker response");
     let second = client
-        .send(WorkerRequest::Refresh)
+        .send(WorkerRequest::RefreshCached)
         .expect("second worker response");
 
     assert_eq!(first.snapshot.status_line, "response 1");
@@ -226,7 +226,7 @@ def main() -> None:
 
     second = json.loads(sys.stdin.readline())
     record_request(spawn_number, second)
-    if second != "Refresh":
+    if second != "RefreshCached":
         raise SystemExit(f"unexpected replayed request: {{second}}")
     sys.stdout.write(json.dumps({{
         "snapshot": {{
@@ -274,7 +274,7 @@ if __name__ == "__main__":
         })
         .expect("first worker response");
     let second = client
-        .send(WorkerRequest::Refresh)
+        .send(WorkerRequest::RefreshCached)
         .expect("refreshed after worker restart");
 
     assert_eq!(first.snapshot.status_line, "boot-1");
@@ -310,7 +310,7 @@ if __name__ == "__main__":
         vec![
             (1, expected_bootstrap.clone()),
             (2, expected_bootstrap),
-            (2, serde_json::json!("Refresh")),
+            (2, serde_json::json!("RefreshCached")),
         ]
     );
 }
@@ -392,7 +392,7 @@ def main() -> None:
             sys.stdout.flush()
             continue
 
-        if request == "Refresh" and bootstrapped:
+        if request == "RefreshCached" and bootstrapped:
             sys.stdout.write(json.dumps({{
                 "snapshot": {{
                     "worker": {{
@@ -448,7 +448,7 @@ if __name__ == "__main__":
         .contains("No positions_snapshot event found in run bundle"));
 
     let refresh = client
-        .send(WorkerRequest::Refresh)
+        .send(WorkerRequest::RefreshCached)
         .expect("refresh should reuse the same session");
     assert_eq!(refresh.snapshot.status_line, "response 2");
     assert_eq!(

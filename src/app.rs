@@ -11,7 +11,7 @@ use ratatui::{Frame, Terminal};
 use reqwest::blocking::Client;
 
 use crate::calculator::{self, BetType, Input as CalculatorInput, Mode as CalculatorMode};
-use crate::domain::{ExchangePanelSnapshot, VenueId};
+use crate::domain::{ExchangePanelSnapshot, VenueId, WorkerStatus};
 use crate::horse_matcher::{self, HorseMatcherEditorState, HorseMatcherField, HorseMatcherQuery};
 use crate::oddsmatcher::{
     self, GetBestMatchesVariables, OddsMatcherEditorState, OddsMatcherField, OddsMatcherRow,
@@ -396,6 +396,8 @@ pub struct App {
     live_view_overlay_visible: bool,
     trading_action_overlay: Option<TradingActionOverlayState>,
     last_recorder_refresh_at: Option<Instant>,
+    last_successful_snapshot_at: Option<String>,
+    last_recorder_start_failure: Option<String>,
     running: bool,
     status_message: String,
     status_scroll: u16,
@@ -523,6 +525,7 @@ impl App {
         horse_matcher_query_path: PathBuf,
     ) -> Result<Self> {
         let snapshot = provider.handle(ProviderRequest::LoadDashboard)?;
+        let last_successful_snapshot_at = runtime_updated_at(&snapshot).map(str::to_string);
         let status_message = snapshot.status_line.clone();
         let (oddsmatcher_query, oddsmatcher_query_note) =
             oddsmatcher::load_query_or_default(&oddsmatcher_query_path).unwrap_or_else(|error| {
@@ -590,6 +593,8 @@ impl App {
             live_view_overlay_visible: false,
             trading_action_overlay: None,
             last_recorder_refresh_at: None,
+            last_successful_snapshot_at,
+            last_recorder_start_failure: None,
             running: true,
             status_message,
             status_scroll: 0,
@@ -638,7 +643,7 @@ impl App {
     }
 
     pub fn help_text(&self) -> &'static str {
-        "q quit | o observability | h/l sections | arrows or j/k nav | tab switch pane | r refresh\nenter edit/open | p place action | esc cancel | [/] cycle suggestions | u reload | D defaults | s start recorder | x stop recorder | c cash out | v live view | b cycle type | m toggle mode"
+        "q quit | o observability | h/l sections | arrows or j/k nav | tab switch pane | r refresh cache | R recapture live\nenter edit/open | p place action | esc cancel | [/] cycle suggestions | u reload | D defaults | s start recorder | x stop recorder | c cash out | v live view | b cycle type | m toggle mode"
     }
 
     pub fn live_view_overlay_visible(&self) -> bool {
@@ -805,6 +810,64 @@ impl App {
 
     pub fn recorder_status(&self) -> &RecorderStatus {
         &self.recorder_status
+    }
+
+    pub fn recorder_lifecycle_state(&self) -> &'static str {
+        match self.recorder_status {
+            RecorderStatus::Disabled => "disabled",
+            RecorderStatus::Stopped => "stopped",
+            RecorderStatus::Error => "failed",
+            RecorderStatus::Running => {
+                if self.last_recorder_start_failure.is_some() {
+                    return "failed";
+                }
+                if self.waiting_for_first_snapshot() {
+                    return "waiting";
+                }
+                if self
+                    .snapshot
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.stale)
+                {
+                    return "stale";
+                }
+                "running"
+            }
+        }
+    }
+
+    pub fn recorder_snapshot_freshness(&self) -> &'static str {
+        if self.waiting_for_first_snapshot() {
+            return "waiting";
+        }
+        match self.snapshot.runtime.as_ref() {
+            Some(runtime) if runtime.stale => "stale",
+            Some(_) => "fresh",
+            None => "unknown",
+        }
+    }
+
+    pub fn recorder_snapshot_mode(&self) -> &'static str {
+        match self
+            .snapshot
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.refresh_kind.as_str())
+        {
+            Some("bootstrap") => "bootstrap",
+            Some("cached") => "cached",
+            Some("live_capture") => "live",
+            _ => "unknown",
+        }
+    }
+
+    pub fn last_successful_snapshot_at(&self) -> Option<&str> {
+        self.last_successful_snapshot_at.as_deref()
+    }
+
+    pub fn last_recorder_start_failure(&self) -> Option<&str> {
+        self.last_recorder_start_failure.as_deref()
     }
 
     pub fn recorder_config_path(&self) -> &Path {
@@ -1003,7 +1066,21 @@ impl App {
         {
             return self.refresh_horse_matcher();
         }
-        self.refresh_provider_snapshot()
+        self.refresh_provider_snapshot(ProviderRequest::RefreshCached, "Refresh failed")
+    }
+
+    pub fn refresh_live(&mut self) -> Result<()> {
+        if self.active_panel == Panel::Trading
+            && self.trading_section == TradingSection::OddsMatcher
+        {
+            return self.refresh_oddsmatcher();
+        }
+        if self.active_panel == Panel::Trading
+            && self.trading_section == TradingSection::HorseMatcher
+        {
+            return self.refresh_horse_matcher();
+        }
+        self.refresh_provider_snapshot(ProviderRequest::RefreshLive, "Live refresh failed")
     }
 
     pub fn replace_oddsmatcher_rows(&mut self, rows: Vec<OddsMatcherRow>, status_message: String) {
@@ -1022,15 +1099,19 @@ impl App {
         self.status_message = status_message;
     }
 
-    fn refresh_provider_snapshot(&mut self) -> Result<()> {
-        match self.provider.handle(ProviderRequest::Refresh) {
+    fn refresh_provider_snapshot(
+        &mut self,
+        request: ProviderRequest,
+        failure_context: &str,
+    ) -> Result<()> {
+        match self.provider.handle(request) {
             Ok(snapshot) => {
                 self.replace_snapshot(snapshot);
                 Ok(())
             }
             Err(error) => {
                 self.record_provider_error(
-                    "Refresh failed",
+                    failure_context,
                     &error.to_string(),
                     self.selected_venue(),
                 );
@@ -1093,6 +1174,7 @@ impl App {
         self.persist_recorder_config()?;
         self.recorder_supervisor.start(&self.recorder_config)?;
         self.recorder_status = self.recorder_supervisor.poll_status();
+        self.last_recorder_start_failure = None;
         self.provider = (self.make_recorder_provider)(&self.recorder_config);
         self.exchange_list_state.select(None);
         match self.provider.handle(ProviderRequest::LoadDashboard) {
@@ -1124,6 +1206,7 @@ impl App {
         self.recorder_supervisor.stop()?;
         self.recorder_status = RecorderStatus::Disabled;
         self.last_recorder_refresh_at = None;
+        self.last_recorder_start_failure = None;
         self.provider = (self.make_stub_provider)();
         let snapshot = self.provider.handle(ProviderRequest::LoadDashboard)?;
         self.replace_snapshot(snapshot);
@@ -1534,6 +1617,11 @@ impl App {
                     self.status_message = format!("Refresh failed: {error}");
                 }
             }
+            KeyCode::Char('R') => {
+                if let Err(error) = self.refresh_live() {
+                    self.status_message = format!("Live refresh failed: {error}");
+                }
+            }
             KeyCode::Char('c') => {
                 if self.active_panel == Panel::Trading
                     && self.trading_section == TradingSection::Positions
@@ -1616,6 +1704,7 @@ impl App {
                 if let Err(error) = self.start_recorder() {
                     self.status_message = format!("Recorder start failed: {error}");
                     self.recorder_status = RecorderStatus::Error;
+                    self.last_recorder_start_failure = Some(error.to_string());
                 }
             }
             KeyCode::Char('x') => {
@@ -2073,7 +2162,8 @@ impl App {
 
         if self.recorder_status == RecorderStatus::Running && self.recorder_refresh_due() {
             self.last_recorder_refresh_at = Some(Instant::now());
-            let _ = self.refresh_provider_snapshot();
+            let _ =
+                self.refresh_provider_snapshot(ProviderRequest::RefreshCached, "Refresh failed");
         }
     }
 
@@ -2105,6 +2195,9 @@ impl App {
 
     fn replace_snapshot(&mut self, snapshot: ExchangePanelSnapshot) {
         self.snapshot = snapshot;
+        if let Some(updated_at) = runtime_updated_at(&self.snapshot) {
+            self.last_successful_snapshot_at = Some(updated_at.to_string());
+        }
         self.status_message = self.snapshot.status_line.clone();
         self.status_scroll = 0;
         self.clamp_selected_exchange_row();
@@ -2121,6 +2214,15 @@ impl App {
         let refresh_interval = Duration::from_secs(1);
         self.last_recorder_refresh_at
             .is_none_or(|last| last.elapsed() >= refresh_interval)
+    }
+
+    fn waiting_for_first_snapshot(&self) -> bool {
+        self.recorder_status == RecorderStatus::Running
+            && (self
+                .status_message
+                .to_ascii_lowercase()
+                .contains("waiting for first snapshot")
+                || self.snapshot.worker.status == WorkerStatus::Busy)
     }
 
     fn scroll_status_down(&mut self, lines: u16) {
@@ -2805,6 +2907,14 @@ impl App {
     }
 }
 
+fn runtime_updated_at(snapshot: &ExchangePanelSnapshot) -> Option<&str> {
+    snapshot
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.updated_at.as_str())
+        .filter(|value| !value.trim().is_empty())
+}
+
 fn next_from<T: Copy + PartialEq>(value: T, all: &[T]) -> T {
     let index = all
         .iter()
@@ -2872,17 +2982,21 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::domain::{
-        ExchangePanelSnapshot, VenueId, VenueStatus, VenueSummary, WorkerStatus, WorkerSummary,
+        ExchangePanelSnapshot, RuntimeSummary, VenueId, VenueStatus, VenueSummary, WorkerStatus,
+        WorkerSummary,
     };
     use crate::provider::{ExchangeProvider, ProviderRequest};
     use crate::recorder::{RecorderConfig, RecorderStatus, RecorderSupervisor};
+    use crossterm::event::KeyCode;
 
     use super::{App, Panel, TradingSection};
 
     struct RefreshingProvider {
-        refresh_count: Rc<RefCell<usize>>,
+        cached_refresh_count: Rc<RefCell<usize>>,
+        live_refresh_count: Rc<RefCell<usize>>,
         load_snapshot: ExchangePanelSnapshot,
-        refresh_snapshot: ExchangePanelSnapshot,
+        cached_refresh_snapshot: ExchangePanelSnapshot,
+        live_refresh_snapshot: ExchangePanelSnapshot,
     }
 
     impl ExchangeProvider for RefreshingProvider {
@@ -2892,14 +3006,20 @@ mod tests {
         ) -> color_eyre::Result<ExchangePanelSnapshot> {
             match request {
                 ProviderRequest::LoadDashboard => Ok(self.load_snapshot.clone()),
-                ProviderRequest::Refresh => {
-                    *self.refresh_count.borrow_mut() += 1;
-                    Ok(self.refresh_snapshot.clone())
+                ProviderRequest::RefreshCached => {
+                    *self.cached_refresh_count.borrow_mut() += 1;
+                    Ok(self.cached_refresh_snapshot.clone())
+                }
+                ProviderRequest::RefreshLive => {
+                    *self.live_refresh_count.borrow_mut() += 1;
+                    Ok(self.live_refresh_snapshot.clone())
                 }
                 ProviderRequest::SelectVenue(_)
                 | ProviderRequest::CashOutTrackedBet { .. }
                 | ProviderRequest::ExecuteTradingAction { .. }
-                | ProviderRequest::LoadHorseMatcher { .. } => Ok(self.refresh_snapshot.clone()),
+                | ProviderRequest::LoadHorseMatcher { .. } => {
+                    Ok(self.cached_refresh_snapshot.clone())
+                }
             }
         }
     }
@@ -2907,6 +3027,8 @@ mod tests {
     struct RunningSupervisor;
 
     struct DisabledSupervisor;
+
+    struct FailingSupervisor;
 
     impl RecorderSupervisor for RunningSupervisor {
         fn start(&mut self, _config: &RecorderConfig) -> color_eyre::Result<()> {
@@ -2936,28 +3058,49 @@ mod tests {
         }
     }
 
+    impl RecorderSupervisor for FailingSupervisor {
+        fn start(&mut self, _config: &RecorderConfig) -> color_eyre::Result<()> {
+            Err(color_eyre::eyre::eyre!("watcher binary missing"))
+        }
+
+        fn stop(&mut self) -> color_eyre::Result<()> {
+            Ok(())
+        }
+
+        fn poll_status(&mut self) -> RecorderStatus {
+            RecorderStatus::Error
+        }
+    }
+
     #[test]
     fn poll_recorder_refreshes_running_recorder_automatically() {
-        let refresh_count = Rc::new(RefCell::new(0));
+        let cached_refresh_count = Rc::new(RefCell::new(0));
+        let live_refresh_count = Rc::new(RefCell::new(0));
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let mut app = App::with_dependencies_and_storage(
             Box::new(RefreshingProvider {
-                refresh_count: refresh_count.clone(),
+                cached_refresh_count: cached_refresh_count.clone(),
+                live_refresh_count: live_refresh_count.clone(),
                 load_snapshot: sample_snapshot("Initial dashboard"),
-                refresh_snapshot: sample_snapshot("Auto refreshed dashboard"),
+                cached_refresh_snapshot: sample_snapshot("Auto refreshed dashboard"),
+                live_refresh_snapshot: sample_snapshot("Live refreshed dashboard"),
             }),
             Box::new(|| {
                 Box::new(RefreshingProvider {
-                    refresh_count: Rc::new(RefCell::new(0)),
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
                     load_snapshot: sample_snapshot("Stub dashboard"),
-                    refresh_snapshot: sample_snapshot("Stub dashboard"),
+                    cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Stub dashboard"),
                 }) as Box<dyn ExchangeProvider>
             }),
             Box::new(|_| {
                 Box::new(RefreshingProvider {
-                    refresh_count: Rc::new(RefCell::new(0)),
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
                     load_snapshot: sample_snapshot("Recorder dashboard"),
-                    refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                    cached_refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Recorder dashboard"),
                 }) as Box<dyn ExchangeProvider>
             }),
             Box::new(RunningSupervisor),
@@ -2973,31 +3116,39 @@ mod tests {
         app.poll_recorder();
 
         assert_eq!(app.snapshot().status_line, "Auto refreshed dashboard");
-        assert_eq!(*refresh_count.borrow(), 1);
+        assert_eq!(*cached_refresh_count.borrow(), 1);
+        assert_eq!(*live_refresh_count.borrow(), 0);
     }
 
     #[test]
     fn poll_recorder_skips_auto_refresh_when_not_running() {
-        let refresh_count = Rc::new(RefCell::new(0));
+        let cached_refresh_count = Rc::new(RefCell::new(0));
+        let live_refresh_count = Rc::new(RefCell::new(0));
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let mut app = App::with_dependencies_and_storage(
             Box::new(RefreshingProvider {
-                refresh_count: refresh_count.clone(),
+                cached_refresh_count: cached_refresh_count.clone(),
+                live_refresh_count: live_refresh_count.clone(),
                 load_snapshot: sample_snapshot("Initial dashboard"),
-                refresh_snapshot: sample_snapshot("Auto refreshed dashboard"),
+                cached_refresh_snapshot: sample_snapshot("Auto refreshed dashboard"),
+                live_refresh_snapshot: sample_snapshot("Live refreshed dashboard"),
             }),
             Box::new(|| {
                 Box::new(RefreshingProvider {
-                    refresh_count: Rc::new(RefCell::new(0)),
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
                     load_snapshot: sample_snapshot("Stub dashboard"),
-                    refresh_snapshot: sample_snapshot("Stub dashboard"),
+                    cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Stub dashboard"),
                 }) as Box<dyn ExchangeProvider>
             }),
             Box::new(|_| {
                 Box::new(RefreshingProvider {
-                    refresh_count: Rc::new(RefCell::new(0)),
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
                     load_snapshot: sample_snapshot("Recorder dashboard"),
-                    refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                    cached_refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Recorder dashboard"),
                 }) as Box<dyn ExchangeProvider>
             }),
             Box::new(DisabledSupervisor),
@@ -3013,31 +3164,39 @@ mod tests {
         app.poll_recorder();
 
         assert_eq!(app.snapshot().status_line, "Initial dashboard");
-        assert_eq!(*refresh_count.borrow(), 0);
+        assert_eq!(*cached_refresh_count.borrow(), 0);
+        assert_eq!(*live_refresh_count.borrow(), 0);
     }
 
     #[test]
     fn poll_recorder_skips_auto_refresh_before_interval_elapses() {
-        let refresh_count = Rc::new(RefCell::new(0));
+        let cached_refresh_count = Rc::new(RefCell::new(0));
+        let live_refresh_count = Rc::new(RefCell::new(0));
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let mut app = App::with_dependencies_and_storage(
             Box::new(RefreshingProvider {
-                refresh_count: refresh_count.clone(),
+                cached_refresh_count: cached_refresh_count.clone(),
+                live_refresh_count: live_refresh_count.clone(),
                 load_snapshot: sample_snapshot("Initial dashboard"),
-                refresh_snapshot: sample_snapshot("Auto refreshed dashboard"),
+                cached_refresh_snapshot: sample_snapshot("Auto refreshed dashboard"),
+                live_refresh_snapshot: sample_snapshot("Live refreshed dashboard"),
             }),
             Box::new(|| {
                 Box::new(RefreshingProvider {
-                    refresh_count: Rc::new(RefCell::new(0)),
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
                     load_snapshot: sample_snapshot("Stub dashboard"),
-                    refresh_snapshot: sample_snapshot("Stub dashboard"),
+                    cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Stub dashboard"),
                 }) as Box<dyn ExchangeProvider>
             }),
             Box::new(|_| {
                 Box::new(RefreshingProvider {
-                    refresh_count: Rc::new(RefCell::new(0)),
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
                     load_snapshot: sample_snapshot("Recorder dashboard"),
-                    refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                    cached_refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Recorder dashboard"),
                 }) as Box<dyn ExchangeProvider>
             }),
             Box::new(RunningSupervisor),
@@ -3053,31 +3212,39 @@ mod tests {
         app.poll_recorder();
 
         assert_eq!(app.snapshot().status_line, "Initial dashboard");
-        assert_eq!(*refresh_count.borrow(), 0);
+        assert_eq!(*cached_refresh_count.borrow(), 0);
+        assert_eq!(*live_refresh_count.borrow(), 0);
     }
 
     #[test]
     fn poll_recorder_keeps_provider_refresh_running_inside_oddsmatcher() {
-        let refresh_count = Rc::new(RefCell::new(0));
+        let cached_refresh_count = Rc::new(RefCell::new(0));
+        let live_refresh_count = Rc::new(RefCell::new(0));
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let mut app = App::with_dependencies_and_storage(
             Box::new(RefreshingProvider {
-                refresh_count: refresh_count.clone(),
+                cached_refresh_count: cached_refresh_count.clone(),
+                live_refresh_count: live_refresh_count.clone(),
                 load_snapshot: sample_snapshot("Initial dashboard"),
-                refresh_snapshot: sample_snapshot("Auto refreshed dashboard"),
+                cached_refresh_snapshot: sample_snapshot("Auto refreshed dashboard"),
+                live_refresh_snapshot: sample_snapshot("Live refreshed dashboard"),
             }),
             Box::new(|| {
                 Box::new(RefreshingProvider {
-                    refresh_count: Rc::new(RefCell::new(0)),
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
                     load_snapshot: sample_snapshot("Stub dashboard"),
-                    refresh_snapshot: sample_snapshot("Stub dashboard"),
+                    cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Stub dashboard"),
                 }) as Box<dyn ExchangeProvider>
             }),
             Box::new(|_| {
                 Box::new(RefreshingProvider {
-                    refresh_count: Rc::new(RefCell::new(0)),
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
                     load_snapshot: sample_snapshot("Recorder dashboard"),
-                    refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                    cached_refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Recorder dashboard"),
                 }) as Box<dyn ExchangeProvider>
             }),
             Box::new(RunningSupervisor),
@@ -3096,7 +3263,150 @@ mod tests {
 
         assert_eq!(app.snapshot().status_line, "Auto refreshed dashboard");
         assert!(app.oddsmatcher_rows().is_empty());
-        assert_eq!(*refresh_count.borrow(), 1);
+        assert_eq!(*cached_refresh_count.borrow(), 1);
+        assert_eq!(*live_refresh_count.borrow(), 0);
+    }
+
+    #[test]
+    fn manual_live_refresh_uses_live_request() {
+        let cached_refresh_count = Rc::new(RefCell::new(0));
+        let live_refresh_count = Rc::new(RefCell::new(0));
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(RefreshingProvider {
+                cached_refresh_count: cached_refresh_count.clone(),
+                live_refresh_count: live_refresh_count.clone(),
+                load_snapshot: sample_snapshot("Initial dashboard"),
+                cached_refresh_snapshot: sample_snapshot("Cached dashboard"),
+                live_refresh_snapshot: sample_snapshot("Live refreshed dashboard"),
+            }),
+            Box::new(|| {
+                Box::new(RefreshingProvider {
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: sample_snapshot("Stub dashboard"),
+                    cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                }) as Box<dyn ExchangeProvider>
+            }),
+            Box::new(|_| {
+                Box::new(RefreshingProvider {
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: sample_snapshot("Recorder dashboard"),
+                    cached_refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                }) as Box<dyn ExchangeProvider>
+            }),
+            Box::new(RunningSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        app.refresh_live().expect("live refresh should succeed");
+
+        assert_eq!(app.snapshot().status_line, "Live refreshed dashboard");
+        assert_eq!(*cached_refresh_count.borrow(), 0);
+        assert_eq!(*live_refresh_count.borrow(), 1);
+    }
+
+    #[test]
+    fn recorder_lifecycle_reports_stale_when_runtime_is_stale() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(RefreshingProvider {
+                cached_refresh_count: Rc::new(RefCell::new(0)),
+                live_refresh_count: Rc::new(RefCell::new(0)),
+                load_snapshot: sample_runtime_snapshot(
+                    "Initial dashboard",
+                    "2026-03-19T10:00:00Z",
+                    true,
+                    "cached",
+                ),
+                cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                live_refresh_snapshot: sample_snapshot("Stub dashboard"),
+            }),
+            Box::new(|| {
+                Box::new(RefreshingProvider {
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: sample_snapshot("Stub dashboard"),
+                    cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                }) as Box<dyn ExchangeProvider>
+            }),
+            Box::new(|_| {
+                Box::new(RefreshingProvider {
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: sample_snapshot("Recorder dashboard"),
+                    cached_refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                }) as Box<dyn ExchangeProvider>
+            }),
+            Box::new(RunningSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        app.recorder_status = RecorderStatus::Running;
+
+        assert_eq!(app.recorder_lifecycle_state(), "stale");
+        assert_eq!(app.recorder_snapshot_freshness(), "stale");
+        assert_eq!(app.recorder_snapshot_mode(), "cached");
+        assert_eq!(
+            app.last_successful_snapshot_at(),
+            Some("2026-03-19T10:00:00Z")
+        );
+    }
+
+    #[test]
+    fn handle_key_start_failure_tracks_startup_failure_detail() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(RefreshingProvider {
+                cached_refresh_count: Rc::new(RefCell::new(0)),
+                live_refresh_count: Rc::new(RefCell::new(0)),
+                load_snapshot: sample_snapshot("Initial dashboard"),
+                cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                live_refresh_snapshot: sample_snapshot("Stub dashboard"),
+            }),
+            Box::new(|| {
+                Box::new(RefreshingProvider {
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: sample_snapshot("Stub dashboard"),
+                    cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                }) as Box<dyn ExchangeProvider>
+            }),
+            Box::new(|_| {
+                Box::new(RefreshingProvider {
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: sample_snapshot("Recorder dashboard"),
+                    cached_refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                }) as Box<dyn ExchangeProvider>
+            }),
+            Box::new(FailingSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        app.handle_key(KeyCode::Char('s'));
+
+        assert_eq!(app.recorder_lifecycle_state(), "failed");
+        assert!(app
+            .last_recorder_start_failure()
+            .is_some_and(|detail| detail.contains("watcher binary missing")));
+        assert!(app.status_message().contains("Recorder start failed"));
     }
 
     fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {
@@ -3132,5 +3442,23 @@ mod tests {
             exit_recommendations: Vec::new(),
             horse_matcher: None,
         }
+    }
+
+    fn sample_runtime_snapshot(
+        status_line: &str,
+        updated_at: &str,
+        stale: bool,
+        refresh_kind: &str,
+    ) -> ExchangePanelSnapshot {
+        let mut snapshot = sample_snapshot(status_line);
+        snapshot.runtime = Some(RuntimeSummary {
+            updated_at: String::from(updated_at),
+            source: String::from("watcher-state"),
+            refresh_kind: String::from(refresh_kind),
+            decision_count: 1,
+            watcher_iteration: Some(4),
+            stale,
+        });
+        snapshot
     }
 }

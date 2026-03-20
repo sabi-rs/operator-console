@@ -6,7 +6,7 @@ use ratatui::Frame;
 use crate::app::{App, ObservabilitySection};
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, section: ObservabilitySection) {
-    let layout = Layout::vertical([Constraint::Length(5), Constraint::Min(10)]).split(area);
+    let layout = Layout::vertical([Constraint::Length(6), Constraint::Min(10)]).split(area);
     let lower = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(layout[1]);
 
@@ -26,10 +26,10 @@ fn summary_lines(app: &App, section: ObservabilitySection) -> Vec<Line<'static>>
     vec![
         Line::raw(format!("Section: {}", section.label())),
         Line::raw(format!(
-            "Worker: {} [{:?}] | Recorder: {:?}",
+            "Worker: {} [{:?}] | Recorder: {}",
             app.snapshot().worker.name,
             app.snapshot().worker.status,
-            app.recorder_status()
+            app.recorder_lifecycle_state()
         )),
         Line::raw(format!(
             "Updated: {} | Source: {}",
@@ -39,6 +39,13 @@ fn summary_lines(app: &App, section: ObservabilitySection) -> Vec<Line<'static>>
             runtime
                 .map(|summary| summary.source.as_str())
                 .unwrap_or("snapshot")
+        )),
+        Line::raw(format!(
+            "Refresh mode: {}",
+            runtime
+                .map(|summary| summary.refresh_kind.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("unknown")
         )),
     ]
 }
@@ -127,6 +134,14 @@ fn watcher_lines(app: &App) -> Vec<Line<'static>> {
     vec![
         Line::raw(format!("Updated at: {}", runtime.updated_at)),
         Line::raw(format!("Source: {}", runtime.source)),
+        Line::raw(format!(
+            "Refresh mode: {}",
+            if runtime.refresh_kind.trim().is_empty() {
+                "unknown"
+            } else {
+                runtime.refresh_kind.as_str()
+            }
+        )),
         Line::raw(format!("Decisions: {}", runtime.decision_count)),
         Line::raw(format!(
             "Iteration: {}",
@@ -244,6 +259,10 @@ fn path_lines(app: &App) -> Vec<Line<'static>> {
 fn log_lines(app: &App) -> Vec<Line<'static>> {
     let mut rows = vec![
         Line::raw(format!("UI status: {}", app.status_message())),
+        Line::raw(format!(
+            "Recorder lifecycle: {}",
+            app.recorder_lifecycle_state()
+        )),
         Line::raw(format!("Worker detail: {}", app.snapshot().worker.detail)),
         Line::raw(format!("Snapshot status: {}", app.snapshot().status_line)),
     ];
@@ -253,6 +272,9 @@ fn log_lines(app: &App) -> Vec<Line<'static>> {
             "Runtime event: updated {} from {}",
             runtime.updated_at, runtime.source
         )));
+    }
+    if let Some(detail) = app.last_recorder_start_failure() {
+        rows.push(Line::raw(format!("Last startup failure: {}", detail)));
     }
 
     rows
@@ -284,7 +306,17 @@ fn health_lines(app: &App) -> Vec<Line<'static>> {
     vec![
         Line::raw(format!("Worker health: {}", worker_health)),
         Line::raw(format!("Snapshot freshness: {}", freshness)),
-        Line::raw(format!("Recorder process: {:?}", app.recorder_status())),
+        Line::raw(format!(
+            "Recorder lifecycle: {}",
+            app.recorder_lifecycle_state()
+        )),
+        Line::raw(format!(
+            "Refresh mode: {}",
+            runtime
+                .map(|summary| summary.refresh_kind.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("unknown")
+        )),
         Line::raw(format!(
             "Selected venue: {}",
             app.snapshot()
@@ -310,6 +342,11 @@ fn recommended_action_lines(app: &App) -> Vec<Line<'static>> {
     if runtime.map(|summary| summary.stale).unwrap_or(false) {
         rows.push(Line::raw(
             "Refresh or restart recorder to clear stale data.",
+        ));
+    }
+    if app.last_recorder_start_failure().is_some() {
+        rows.push(Line::raw(
+            "Fix the recorder startup failure before relying on auto-refresh.",
         ));
     }
     if rows.is_empty() {
@@ -361,6 +398,7 @@ mod tests {
                 runtime: Some(RuntimeSummary {
                     updated_at: String::from("2026-03-11T15:00:00Z"),
                     source: String::from("watcher-state"),
+                    refresh_kind: String::from("cached"),
                     decision_count: 4,
                     watcher_iteration: Some(14),
                     stale: true,
@@ -382,6 +420,9 @@ mod tests {
         assert!(text
             .iter()
             .any(|line| line.contains("Snapshot freshness: stale")));
+        assert!(text
+            .iter()
+            .any(|line| line.contains("Refresh mode: cached")));
         assert!(text
             .iter()
             .any(|line| line.contains("Investigate worker failure")));

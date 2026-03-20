@@ -3,6 +3,8 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use color_eyre::eyre::{eyre, Result};
 use serde::{Deserialize, Serialize};
@@ -35,7 +37,7 @@ pub struct RecorderConfig {
 impl Default for RecorderConfig {
     fn default() -> Self {
         Self {
-            command: PathBuf::from("/home/thomas/projects/sabi/bet-recorder/bin/bet-recorder"),
+            command: default_bet_recorder_command(),
             run_dir: PathBuf::from("/tmp/sabi-smarkets-watcher"),
             session: String::from("helium-copy"),
             companion_legs_path: None,
@@ -51,10 +53,74 @@ impl Default for RecorderConfig {
     }
 }
 
+const RECORDER_TRANSIENT_FILES: [&str; 5] = [
+    "watcher-state.json",
+    "events.jsonl",
+    "metadata.json",
+    "transport.jsonl",
+    "watcher.log",
+];
+const RECORDER_SCREENSHOTS_DIR: &str = "screenshots";
+const WATCHER_STARTUP_GRACE_PERIOD: Duration = Duration::from_millis(50);
+
+fn config_root() -> PathBuf {
+    env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
 fn default_profile_path() -> Option<PathBuf> {
-    Some(PathBuf::from(
-        "/home/thomas/.config/smarkets-automation/profile",
-    ))
+    Some(config_root().join("smarkets-automation").join("profile"))
+}
+
+pub fn default_bet_recorder_root() -> PathBuf {
+    env::var_os("SABI_BET_RECORDER_ROOT")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(discover_bet_recorder_root)
+        .unwrap_or_else(|| PathBuf::from("bet-recorder"))
+}
+
+pub fn default_bet_recorder_command() -> PathBuf {
+    default_bet_recorder_root().join("bin").join("bet-recorder")
+}
+
+pub fn default_bet_recorder_python() -> PathBuf {
+    default_bet_recorder_root()
+        .join(".venv")
+        .join("bin")
+        .join("python")
+}
+
+fn discover_bet_recorder_root() -> Option<PathBuf> {
+    env::current_dir()
+        .ok()
+        .and_then(|path| discover_bet_recorder_root_from(&path))
+        .or_else(|| {
+            env::current_exe()
+                .ok()
+                .and_then(|path| discover_bet_recorder_root_from(&path))
+        })
+}
+
+fn discover_bet_recorder_root_from(start: &Path) -> Option<PathBuf> {
+    for ancestor in start.ancestors() {
+        if is_bet_recorder_root(ancestor) {
+            return Some(ancestor.to_path_buf());
+        }
+
+        let sibling = ancestor.join("bet-recorder");
+        if is_bet_recorder_root(&sibling) {
+            return Some(sibling);
+        }
+    }
+
+    None
+}
+
+fn is_bet_recorder_root(path: &Path) -> bool {
+    path.join("src").join("bet_recorder").is_dir() && path.join("pyproject.toml").is_file()
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -62,12 +128,7 @@ pub fn default_config_path() -> PathBuf {
         return PathBuf::from(path);
     }
 
-    let config_root = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-
-    config_root.join("sabi").join("recorder.json")
+    config_root().join("sabi").join("recorder.json")
 }
 
 pub fn load_recorder_config_or_default(path: &Path) -> Result<(RecorderConfig, String)> {
@@ -216,9 +277,7 @@ impl RecorderField {
 
     pub fn suggestions(self) -> Vec<String> {
         match self {
-            Self::Command => vec![String::from(
-                "/home/thomas/projects/sabi/bet-recorder/bin/bet-recorder",
-            )],
+            Self::Command => vec![default_bet_recorder_command().display().to_string()],
             Self::RunDir => vec![
                 String::from("/tmp/sabi-smarkets-watcher"),
                 String::from("/tmp/sabi-live-smarkets"),
@@ -244,7 +303,9 @@ impl RecorderField {
             Self::WarnOnlyDefault => vec![String::from("true"), String::from("false")],
             Self::ProfilePath => vec![
                 String::new(),
-                String::from("/home/thomas/.config/smarkets-automation/profile"),
+                default_profile_path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
             ],
         }
     }
@@ -309,51 +370,25 @@ impl RecorderSupervisor for ProcessRecorderSupervisor {
             return Ok(());
         }
 
-        reset_run_dir(&config.run_dir)?;
+        let mut backup = stage_run_dir_for_startup(&config.run_dir)?;
         let log_path = config.run_dir.join("watcher.log");
-        let log_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&log_path)
-            .map_err(|error| {
-                eyre!(
-                    "failed to open recorder watcher log {}: {error}",
-                    log_path.display()
-                )
-            })?;
-        let stdout = log_file
-            .try_clone()
-            .map_err(|error| eyre!("failed to clone recorder watcher log handle: {error}"))?;
 
-        let child = Command::new(&config.command)
-            .arg("watch-smarkets-session")
-            .arg("--run-dir")
-            .arg(&config.run_dir)
-            .arg("--session")
-            .arg(&config.session)
-            .args(
-                config
-                    .profile_path
-                    .as_ref()
-                    .map(|path| vec![String::from("--profile-path"), path.display().to_string()])
-                    .unwrap_or_default(),
-            )
-            .arg("--interval-seconds")
-            .arg(config.interval_seconds.to_string())
-            .arg("--commission-rate")
-            .arg(&config.commission_rate)
-            .arg("--target-profit")
-            .arg(&config.target_profit)
-            .arg("--stop-loss")
-            .arg(&config.stop_loss)
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(log_file))
-            .spawn()
-            .map_err(|error| eyre!("failed to start recorder watcher: {error}"))?;
-
-        self.child = Some(child);
-        Ok(())
+        match spawn_recorder_watcher(config, &log_path) {
+            Ok(child) => {
+                backup.discard()?;
+                self.child = Some(child);
+                Ok(())
+            }
+            Err(error) => {
+                let restore_error = backup.restore();
+                if let Err(restore_error) = restore_error {
+                    return Err(error.wrap_err(format!(
+                        "failed to restore recorder run dir after startup error: {restore_error}"
+                    )));
+                }
+                Err(error)
+            }
+        }
     }
 
     fn stop(&mut self) -> Result<()> {
@@ -383,26 +418,217 @@ impl RecorderSupervisor for ProcessRecorderSupervisor {
     }
 }
 
-fn reset_run_dir(run_dir: &Path) -> Result<()> {
-    fs::create_dir_all(run_dir)?;
+fn spawn_recorder_watcher(config: &RecorderConfig, log_path: &Path) -> Result<Child> {
+    let log_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(log_path)
+        .map_err(|error| {
+            eyre!(
+                "failed to open recorder watcher log {}: {error}",
+                log_path.display()
+            )
+        })?;
+    let stdout = log_file
+        .try_clone()
+        .map_err(|error| eyre!("failed to clone recorder watcher log handle: {error}"))?;
 
-    for relative_path in [
-        "watcher-state.json",
-        "events.jsonl",
-        "metadata.json",
-        "transport.jsonl",
-    ] {
-        let path = run_dir.join(relative_path);
-        if path.exists() {
-            fs::remove_file(&path)?;
+    let mut child = Command::new(&config.command)
+        .arg("watch-smarkets-session")
+        .arg("--run-dir")
+        .arg(&config.run_dir)
+        .arg("--session")
+        .arg(&config.session)
+        .args(
+            config
+                .profile_path
+                .as_ref()
+                .map(|path| vec![String::from("--profile-path"), path.display().to_string()])
+                .unwrap_or_default(),
+        )
+        .arg("--interval-seconds")
+        .arg(config.interval_seconds.to_string())
+        .arg("--commission-rate")
+        .arg(&config.commission_rate)
+        .arg("--target-profit")
+        .arg(&config.target_profit)
+        .arg("--stop-loss")
+        .arg(&config.stop_loss)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(log_file))
+        .spawn()
+        .map_err(|error| eyre!("failed to start recorder watcher: {error}"))?;
+
+    thread::sleep(WATCHER_STARTUP_GRACE_PERIOD);
+    match child
+        .try_wait()
+        .map_err(|error| eyre!("failed to inspect recorder watcher startup: {error}"))?
+    {
+        None => Ok(child),
+        Some(status) => {
+            let detail = fs::read_to_string(log_path)
+                .ok()
+                .map(|content| content.trim().to_string())
+                .filter(|content| !content.is_empty())
+                .unwrap_or_else(|| String::from("watcher log was empty"));
+            Err(eyre!(
+                "recorder watcher exited immediately with status {status}: {detail}"
+            ))
+        }
+    }
+}
+
+fn stage_run_dir_for_startup(run_dir: &Path) -> Result<RunDirBackup> {
+    let mut backup = RunDirBackup::new(run_dir.to_path_buf());
+    let result = (|| -> Result<()> {
+        fs::create_dir_all(run_dir)?;
+
+        for relative_path in RECORDER_TRANSIENT_FILES {
+            backup.move_entry(relative_path)?;
+        }
+        backup.move_entry(RECORDER_SCREENSHOTS_DIR)?;
+
+        fs::create_dir_all(run_dir.join(RECORDER_SCREENSHOTS_DIR))?;
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        let _ = backup.restore();
+        return Err(error);
+    }
+
+    Ok(backup)
+}
+
+struct RunDirBackup {
+    run_dir: PathBuf,
+    backup_dir: Option<PathBuf>,
+}
+
+impl RunDirBackup {
+    fn new(run_dir: PathBuf) -> Self {
+        Self {
+            run_dir,
+            backup_dir: None,
         }
     }
 
-    let screenshots_dir = run_dir.join("screenshots");
-    if screenshots_dir.exists() {
-        fs::remove_dir_all(&screenshots_dir)?;
-    }
-    fs::create_dir_all(&screenshots_dir)?;
+    fn move_entry(&mut self, relative_path: &str) -> Result<()> {
+        let source = self.run_dir.join(relative_path);
+        if !source.exists() {
+            return Ok(());
+        }
 
+        let Some(backup_dir) = self.ensure_backup_dir()? else {
+            return Ok(());
+        };
+        let destination = backup_dir.join(relative_path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&source, &destination)?;
+        Ok(())
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        let Some(backup_dir) = self.backup_dir.take() else {
+            return Ok(());
+        };
+
+        for relative_path in RECORDER_TRANSIENT_FILES {
+            remove_entry_if_present(&self.run_dir.join(relative_path))?;
+        }
+        remove_entry_if_present(&self.run_dir.join(RECORDER_SCREENSHOTS_DIR))?;
+
+        for entry in fs::read_dir(&backup_dir)? {
+            let entry = entry?;
+            fs::rename(entry.path(), self.run_dir.join(entry.file_name()))?;
+        }
+        fs::remove_dir_all(backup_dir)?;
+        Ok(())
+    }
+
+    fn discard(&mut self) -> Result<()> {
+        let Some(backup_dir) = self.backup_dir.take() else {
+            return Ok(());
+        };
+        fs::remove_dir_all(backup_dir)?;
+        Ok(())
+    }
+
+    fn ensure_backup_dir(&mut self) -> Result<Option<&Path>> {
+        if self.backup_dir.is_none() {
+            let parent = self
+                .run_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.run_dir.clone());
+            let file_stem = self
+                .run_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("run-dir");
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let backup_dir = parent.join(format!(
+                ".{file_stem}.startup-backup-{}-{timestamp}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&backup_dir)?;
+            self.backup_dir = Some(backup_dir);
+        }
+
+        Ok(self.backup_dir.as_deref())
+    }
+}
+
+fn remove_entry_if_present(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    if path.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        default_bet_recorder_command, discover_bet_recorder_root_from, is_bet_recorder_root,
+    };
+    use std::fs;
+
+    #[test]
+    fn discover_bet_recorder_root_from_workspace_tree() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let workspace_root = temp_dir.path().join("sabi");
+        let bet_recorder_root = workspace_root.join("bet-recorder");
+        let console_root = workspace_root.join("console").join("operator-console");
+
+        fs::create_dir_all(bet_recorder_root.join("src").join("bet_recorder")).expect("mkdir");
+        fs::write(
+            bet_recorder_root.join("pyproject.toml"),
+            "[project]\nname='bet-recorder'\n",
+        )
+        .expect("pyproject");
+        fs::create_dir_all(console_root.join("target").join("debug")).expect("console tree");
+
+        let discovered =
+            discover_bet_recorder_root_from(&console_root.join("target").join("debug"))
+                .expect("discover root");
+
+        assert_eq!(discovered, bet_recorder_root);
+        assert!(is_bet_recorder_root(&discovered));
+        assert_eq!(
+            default_bet_recorder_command().file_name().unwrap(),
+            "bet-recorder"
+        );
+    }
 }

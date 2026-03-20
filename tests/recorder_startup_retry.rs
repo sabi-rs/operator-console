@@ -38,7 +38,8 @@ impl ExchangeProvider for FlakyLoadProvider {
                 }
                 Ok(self.snapshot.clone())
             }
-            ProviderRequest::Refresh
+            ProviderRequest::RefreshCached
+            | ProviderRequest::RefreshLive
             | ProviderRequest::SelectVenue(_)
             | ProviderRequest::CashOutTrackedBet { .. }
             | ProviderRequest::ExecuteTradingAction { .. }
@@ -112,12 +113,15 @@ fn start_recorder_returns_immediately_when_first_snapshot_is_not_ready() {
     app.start_recorder().expect("start recorder");
 
     assert!(app.status_message().contains("waiting for first snapshot"));
+    assert_eq!(app.recorder_lifecycle_state(), "waiting");
+    assert_eq!(app.last_successful_snapshot_at(), None);
     assert_eq!(*load_attempts.borrow(), 1);
 
     app.refresh().expect("refresh");
 
     assert_eq!(*load_attempts.borrow(), 1);
     assert_eq!(app.snapshot().status_line, "Recorder dashboard");
+    assert_eq!(app.recorder_lifecycle_state(), "running");
 }
 
 fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {

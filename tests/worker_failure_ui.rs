@@ -14,7 +14,9 @@ impl ExchangeProvider for FailingRefreshProvider {
     fn handle(&mut self, request: ProviderRequest) -> color_eyre::Result<ExchangePanelSnapshot> {
         match request {
             ProviderRequest::LoadDashboard => Ok(self.load_snapshot.clone()),
-            ProviderRequest::Refresh => Err(eyre!("worker session closed")),
+            ProviderRequest::RefreshCached | ProviderRequest::RefreshLive => {
+                Err(eyre!("worker session closed"))
+            }
             ProviderRequest::SelectVenue(_) => Err(eyre!("selection not used in this test")),
             ProviderRequest::CashOutTrackedBet { .. } => {
                 Err(eyre!("cash out not used in this test"))

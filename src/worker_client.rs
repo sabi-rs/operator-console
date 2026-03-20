@@ -57,7 +57,8 @@ impl<C: WorkerClient> ExchangeProvider for WorkerClientExchangeProvider<C> {
             ProviderRequest::LoadDashboard => WorkerRequest::LoadDashboard {
                 config: self.config.clone(),
             },
-            ProviderRequest::Refresh => WorkerRequest::Refresh,
+            ProviderRequest::RefreshCached => WorkerRequest::RefreshCached,
+            ProviderRequest::RefreshLive => WorkerRequest::RefreshLive,
             ProviderRequest::SelectVenue(venue) => WorkerRequest::SelectVenue { venue },
             ProviderRequest::CashOutTrackedBet { bet_id } => {
                 WorkerRequest::CashOutTrackedBet { bet_id }

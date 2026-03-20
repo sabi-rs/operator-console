@@ -25,6 +25,7 @@ fn help_text_mentions_core_operator_keys() {
     assert!(help.contains("q"));
     assert!(help.contains("o"));
     assert!(help.contains("r"));
+    assert!(help.contains("R"));
     assert!(help.contains("v"));
     assert!(help.contains("s"));
     assert!(help.contains("x"));
@@ -88,6 +89,7 @@ fn startup_footer_guidance_stays_visible_at_standard_terminal_size() {
 
     assert!(rendered.contains("press s for live data."));
     assert!(rendered.contains("o observability"));
+    assert!(rendered.contains("R recapture live"));
     assert!(rendered.contains("v live view"));
     assert!(rendered.contains("s start recorder"));
 }
