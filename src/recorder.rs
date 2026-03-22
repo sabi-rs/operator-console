@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -38,7 +39,7 @@ impl Default for RecorderConfig {
     fn default() -> Self {
         Self {
             command: default_bet_recorder_command(),
-            run_dir: PathBuf::from("/tmp/sabi-smarkets-watcher"),
+            run_dir: default_run_dir(),
             session: String::from("helium-copy"),
             companion_legs_path: None,
             profile_path: default_profile_path(),
@@ -72,6 +73,10 @@ fn config_root() -> PathBuf {
 
 fn default_profile_path() -> Option<PathBuf> {
     Some(config_root().join("smarkets-automation").join("profile"))
+}
+
+fn default_run_dir() -> PathBuf {
+    config_root().join("sabi").join("runs").join("smarkets-watcher")
 }
 
 pub fn default_bet_recorder_root() -> PathBuf {
@@ -148,11 +153,43 @@ pub fn load_recorder_config_or_default(path: &Path) -> Result<(RecorderConfig, S
 }
 
 pub fn save_recorder_config(path: &Path, config: &RecorderConfig) -> Result<String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_string_pretty(config)? + "\n")?;
+    write_private_file(path, &(serde_json::to_string_pretty(config)? + "\n"))?;
     Ok(format!("Saved recorder config to {}.", path.display()))
+}
+
+fn ensure_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn write_private_file(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_private_dir(parent)?;
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.flush()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,13 +316,21 @@ impl RecorderField {
         match self {
             Self::Command => vec![default_bet_recorder_command().display().to_string()],
             Self::RunDir => vec![
-                String::from("/tmp/sabi-smarkets-watcher"),
-                String::from("/tmp/sabi-live-smarkets"),
+                default_run_dir().display().to_string(),
+                config_root()
+                    .join("sabi")
+                    .join("runs")
+                    .join("smarkets-live")
+                    .display()
+                    .to_string(),
             ],
             Self::Session => vec![String::from("helium-copy"), String::from("default")],
             Self::CompanionLegsPath => vec![
                 String::new(),
-                String::from("/tmp/sabi-smarkets-watcher/companion-legs.json"),
+                default_run_dir()
+                    .join("companion-legs.json")
+                    .display()
+                    .to_string(),
             ],
             Self::Autostart => vec![String::from("false"), String::from("true")],
             Self::IntervalSeconds => {
@@ -482,14 +527,14 @@ fn spawn_recorder_watcher(config: &RecorderConfig, log_path: &Path) -> Result<Ch
 fn stage_run_dir_for_startup(run_dir: &Path) -> Result<RunDirBackup> {
     let mut backup = RunDirBackup::new(run_dir.to_path_buf());
     let result = (|| -> Result<()> {
-        fs::create_dir_all(run_dir)?;
+        ensure_private_dir(run_dir)?;
 
         for relative_path in RECORDER_TRANSIENT_FILES {
             backup.move_entry(relative_path)?;
         }
         backup.move_entry(RECORDER_SCREENSHOTS_DIR)?;
 
-        fs::create_dir_all(run_dir.join(RECORDER_SCREENSHOTS_DIR))?;
+        ensure_private_dir(&run_dir.join(RECORDER_SCREENSHOTS_DIR))?;
         Ok(())
     })();
 

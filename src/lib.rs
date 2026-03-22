@@ -1,4 +1,5 @@
 pub mod app;
+mod app_state;
 pub mod calculator;
 pub mod domain;
 pub mod horse_matcher;

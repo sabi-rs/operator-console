@@ -42,6 +42,7 @@ fn recorder_config_defaults_when_file_is_missing() {
 
     assert_eq!(loaded, RecorderConfig::default());
     assert_eq!(note, "Using default recorder config.");
+    assert!(loaded.run_dir.to_string_lossy().contains("sabi/runs"));
 }
 
 #[test]
@@ -113,4 +114,22 @@ fn recorder_config_preserves_explicit_null_profile_path() {
         load_recorder_config_or_default(&config_path).expect("load explicit null config");
 
     assert_eq!(loaded.profile_path, None);
+}
+
+#[cfg(unix)]
+#[test]
+fn recorder_config_is_saved_with_private_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let config_path = temp_dir.path().join("recorder.json");
+
+    save_recorder_config(&config_path, &RecorderConfig::default()).expect("save config");
+
+    let mode = std::fs::metadata(&config_path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
 }
