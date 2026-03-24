@@ -707,10 +707,11 @@ fn render_summary(
             (
                 "󱂬 Marked",
                 format!(
-                    "value {:.2} | pnl {:+.2}",
-                    row.current_value, row.pnl_amount,
+                    "value {:.2} | pnl {}",
+                    row.current_value,
+                    historical_pnl_label(row),
                 ),
-                pnl_color(row.pnl_amount),
+                historical_pnl_style(row),
             ),
         ]
     } else {
@@ -945,13 +946,13 @@ fn open_position_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'static>> {
                 trade_label(row),
             )));
             rows.push(Line::raw(format!(
-                "status {} | pnl {:+.2} | buy {} | {}",
+                "status {} | pnl {} | buy {} | {}",
                 if row.status.is_empty() {
                     String::from("-")
                 } else {
                     row.status.clone()
                 },
-                row.pnl_amount,
+                historical_pnl_label(row),
                 format_optional_back_odds(primary_market_buy_odds(row)),
                 format_optional_probability(primary_market_implied_probability(row)),
             )));
@@ -997,7 +998,7 @@ fn historical_position_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static
                 Cell::from(score_label(row)),
                 Cell::from(phase_label(row)),
                 trade_cell(row),
-                pnl_cell(row.pnl_amount),
+                historical_pnl_cell(row),
                 Cell::from(market_price_label(row)),
             ])
         })
@@ -2721,6 +2722,29 @@ fn pnl_cell(value: f64) -> Cell<'static> {
     Cell::from(format!("{value:+.2}")).style(Style::default().fg(color))
 }
 
+fn historical_pnl_cell(row: &OpenPositionRow) -> Cell<'static> {
+    if !row.overall_pnl_known {
+        return Cell::from("-").style(Style::default().fg(muted_text()));
+    }
+    pnl_cell(row.pnl_amount)
+}
+
+fn historical_pnl_label(row: &OpenPositionRow) -> String {
+    if row.overall_pnl_known {
+        format!("{:+.2}", row.pnl_amount)
+    } else {
+        String::from("-")
+    }
+}
+
+fn historical_pnl_style(row: &OpenPositionRow) -> Color {
+    if row.overall_pnl_known {
+        pnl_color(row.pnl_amount)
+    } else {
+        muted_text()
+    }
+}
+
 fn trade_cell(row: &crate::domain::OpenPositionRow) -> Cell<'static> {
     Cell::from(trade_code(row)).style(Style::default().fg(trade_color(row)))
 }
@@ -3002,6 +3026,7 @@ fn positions_pnl_summary(snapshot: &ExchangePanelSnapshot) -> (f64, f64, f64, f6
         snapshot
             .historical_positions
             .iter()
+            .filter(|row| row.overall_pnl_known)
             .map(|row| row.pnl_amount)
             .sum::<f64>()
     } else {
@@ -3026,6 +3051,11 @@ fn positions_pnl_summary(snapshot: &ExchangePanelSnapshot) -> (f64, f64, f64, f6
 }
 
 fn tracked_bet_funding_label(tracked_bet: &crate::domain::TrackedBetRow) -> &'static str {
+    let funding_kind = tracked_bet.funding_kind.trim().to_ascii_lowercase();
+    if matches!(funding_kind.as_str(), "free_bet" | "risk_free" | "bonus") {
+        return "Promo";
+    }
+
     let notes = tracked_bet.notes.to_lowercase();
     let bet_type = tracked_bet.bet_type.to_lowercase();
     let status = tracked_bet.status.to_lowercase();
@@ -3047,6 +3077,10 @@ fn tracked_bet_funding_label(tracked_bet: &crate::domain::TrackedBetRow) -> &'st
     .any(|keyword| haystack.contains(keyword))
     {
         return "Promo";
+    }
+
+    if funding_kind == "cash" {
+        return "Std";
     }
 
     if ["qualifying", "cash", "normal"]
@@ -3379,16 +3413,19 @@ mod tests {
         let mut snapshot = sample_snapshot();
         snapshot.open_positions = vec![OpenPositionRow {
             pnl_amount: -1.6,
+            overall_pnl_known: true,
             ..sample_open_row()
         }];
         snapshot.historical_positions = vec![
             OpenPositionRow {
                 pnl_amount: 4.0,
+                overall_pnl_known: true,
                 live_clock: String::from("2026-03-01T10:00:00"),
                 ..sample_open_row()
             },
             OpenPositionRow {
                 pnl_amount: -0.5,
+                overall_pnl_known: true,
                 live_clock: String::from("2026-03-02T10:00:00"),
                 ..sample_open_row()
             },
@@ -3410,16 +3447,19 @@ mod tests {
         snapshot.tracked_bets.clear();
         snapshot.open_positions = vec![OpenPositionRow {
             pnl_amount: -1.6,
+            overall_pnl_known: true,
             ..sample_open_row()
         }];
         snapshot.historical_positions = vec![
             OpenPositionRow {
                 pnl_amount: 4.0,
+                overall_pnl_known: true,
                 live_clock: String::from("2026-03-01T10:00:00"),
                 ..sample_open_row()
             },
             OpenPositionRow {
                 pnl_amount: -0.5,
+                overall_pnl_known: true,
                 live_clock: String::from("2026-03-02T10:00:00"),
                 ..sample_open_row()
             },
@@ -3434,15 +3474,49 @@ mod tests {
     }
 
     #[test]
+    fn positions_pnl_summary_ignores_historical_rows_without_overall_pnl() {
+        let mut snapshot = sample_snapshot();
+        snapshot.tracked_bets.clear();
+        snapshot.open_positions = vec![OpenPositionRow {
+            pnl_amount: -1.6,
+            overall_pnl_known: true,
+            ..sample_open_row()
+        }];
+        snapshot.historical_positions = vec![
+            OpenPositionRow {
+                pnl_amount: 4.0,
+                overall_pnl_known: true,
+                live_clock: String::from("2026-03-01T10:00:00"),
+                ..sample_open_row()
+            },
+            OpenPositionRow {
+                pnl_amount: 7.03,
+                overall_pnl_known: false,
+                live_clock: String::from("2026-03-02T10:00:00"),
+                ..sample_open_row()
+            },
+        ];
+
+        let (realised, live, net, promo) = positions_pnl_summary(&snapshot);
+
+        assert_eq!(realised, 4.0);
+        assert_eq!(live, -1.6);
+        assert!((net - 2.4).abs() < 1e-9);
+        assert_eq!(promo, 0.0);
+    }
+
+    #[test]
     fn positions_pnl_summary_prefers_ledger_totals_when_available() {
         let mut snapshot = sample_snapshot();
         snapshot.tracked_bets.clear();
         snapshot.open_positions = vec![OpenPositionRow {
             pnl_amount: -1.6,
+            overall_pnl_known: true,
             ..sample_open_row()
         }];
         snapshot.historical_positions = vec![OpenPositionRow {
             pnl_amount: 4.0,
+            overall_pnl_known: true,
             live_clock: String::from("2026-03-01T10:00:00"),
             ..sample_open_row()
         }];
@@ -3507,6 +3581,7 @@ mod tests {
             liability: 14.0,
             current_value: 8.4,
             pnl_amount: -1.6,
+            overall_pnl_known: true,
             current_back_odds: Some(1.91),
             current_implied_probability: Some(1.0 / 1.91),
             current_implied_percentage: Some(100.0 / 1.91),
@@ -3550,6 +3625,7 @@ mod tests {
             liability: 2.0,
             current_value: 0.0,
             pnl_amount: -2.0,
+            overall_pnl_known: true,
             current_back_odds: Some(4.5),
             current_implied_probability: Some(1.0 / 4.5),
             current_implied_percentage: Some(100.0 / 4.5),
@@ -3594,6 +3670,7 @@ mod tests {
                 liability: 5.0,
                 current_value: 0.0,
                 pnl_amount: index as f64,
+                overall_pnl_known: true,
                 current_back_odds: Some(2.0),
                 current_implied_probability: Some(0.5),
                 current_implied_percentage: Some(50.0),
@@ -3615,6 +3692,44 @@ mod tests {
     }
 
     #[test]
+    fn historical_position_rows_render_dash_when_overall_pnl_is_unknown() {
+        let mut snapshot = sample_snapshot();
+        snapshot.historical_positions = vec![OpenPositionRow {
+            event: String::from("Tottenham vs Atletico Madrid"),
+            event_status: String::from("Event ended|UEFA Champions League"),
+            event_url: String::new(),
+            contract: String::from("Tottenham"),
+            market: String::from("Full-time result"),
+            status: String::from("Won"),
+            market_status: String::from("settled"),
+            is_in_play: false,
+            price: 1.40,
+            stake: 17.57,
+            liability: 17.57,
+            current_value: 24.60,
+            pnl_amount: 7.03,
+            overall_pnl_known: false,
+            current_back_odds: Some(1.40),
+            current_implied_probability: Some(1.0 / 1.40),
+            current_implied_percentage: Some(100.0 / 1.40),
+            current_buy_odds: Some(1.40),
+            current_buy_implied_probability: Some(1.0 / 1.40),
+            current_sell_odds: None,
+            current_sell_implied_probability: None,
+            current_score: String::new(),
+            current_score_home: None,
+            current_score_away: None,
+            live_clock: String::from("2026-03-22T16:10:26Z"),
+            can_trade_out: false,
+        }];
+
+        let rows = historical_position_rows(&snapshot);
+        let rendered = format!("{:?}", rows[0]);
+
+        assert!(rendered.contains("\"-\""));
+    }
+
+    #[test]
     fn event_date_and_time_can_be_derived_from_smarkets_url() {
         let row = OpenPositionRow {
             event: String::from("West Ham vs Man City"),
@@ -3632,6 +3747,7 @@ mod tests {
             liability: 14.0,
             current_value: 8.4,
             pnl_amount: -1.6,
+            overall_pnl_known: true,
             current_back_odds: Some(1.91),
             current_implied_probability: Some(1.0 / 1.91),
             current_implied_percentage: Some(100.0 / 1.91),
@@ -3666,6 +3782,7 @@ mod tests {
             liability: 2.0,
             current_value: 0.0,
             pnl_amount: -2.0,
+            overall_pnl_known: true,
             current_back_odds: Some(4.5),
             current_implied_probability: Some(1.0 / 4.5),
             current_implied_percentage: Some(100.0 / 4.5),
@@ -3701,6 +3818,7 @@ mod tests {
             liability: 14.0,
             current_value: 8.4,
             pnl_amount: -1.6,
+            overall_pnl_known: true,
             current_back_odds: Some(1.91),
             current_implied_probability: Some(1.0 / 1.91),
             current_implied_percentage: Some(100.0 / 1.91),
@@ -3748,6 +3866,7 @@ mod tests {
             liability: 23.29,
             current_value: 6.64,
             pnl_amount: 3.27,
+            overall_pnl_known: true,
             current_back_odds: Some(5.0),
             current_implied_probability: Some(0.2),
             current_implied_percentage: Some(20.0),
@@ -3830,6 +3949,7 @@ mod tests {
             liability: 23.29,
             current_value: 6.64,
             pnl_amount: 3.27,
+            overall_pnl_known: true,
             current_back_odds: Some(5.0),
             current_implied_probability: Some(0.2),
             current_implied_percentage: Some(20.0),
@@ -3911,6 +4031,7 @@ mod tests {
                 sport_name: String::from("Premier League"),
                 bet_type: String::from("single"),
                 market_family: String::from("match_odds"),
+                funding_kind: String::from("cash"),
                 selection_line: None,
                 currency: String::from("GBP"),
                 stake_gbp: Some(2.0),
@@ -3998,6 +4119,7 @@ mod tests {
             liability: 14.0,
             current_value: 8.4,
             pnl_amount: -1.6,
+            overall_pnl_known: true,
             current_back_odds: Some(1.91),
             current_implied_probability: Some(1.0 / 1.91),
             current_implied_percentage: Some(100.0 / 1.91),

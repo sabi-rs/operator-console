@@ -42,13 +42,25 @@ fn stats_panel_renders_operating_ratios_and_mix_tables() {
 }
 
 #[test]
-fn recorder_panel_renders_capture_pipeline_and_runbook() {
+fn markets_panel_renders_api_surface_board() {
+    let rendered = render_section(TradingSection::Markets);
+
+    assert!(rendered.contains("Owls Surface"));
+    assert!(rendered.contains("Endpoint Board"));
+    assert!(rendered.contains("Endpoint Detail"));
+    assert!(rendered.contains("/api/v1/nba/odds"));
+    assert!(rendered.contains("Realtime"));
+}
+
+#[test]
+fn recorder_panel_renders_capture_pipeline_and_evidence() {
     let rendered = render_section(TradingSection::Recorder);
 
     assert!(rendered.contains("Capture Pipeline"));
     assert!(rendered.contains("Recorder Config"));
     assert!(rendered.contains("Field Detail"));
-    assert!(rendered.contains("Recorder Runbook"));
+    assert!(rendered.contains("Recorder Evidence"));
+    assert!(rendered.contains("history sync success"));
 }
 
 #[test]
@@ -63,6 +75,7 @@ fn positions_live_view_overlay_renders_cashout_and_matrix() {
         odds: 2.375,
         stake: 10.0,
         status: String::from("cash_out"),
+        funding_kind: String::from("cash"),
         current_cashout_value: Some(16.16),
         supports_cash_out: true,
     }];
@@ -264,6 +277,7 @@ fn sample_snapshot() -> ExchangePanelSnapshot {
             liability: 36.0,
             current_value: 22.5,
             pnl_amount: 2.5,
+            overall_pnl_known: true,
             current_back_odds: Some(2.4),
             current_implied_probability: Some(0.416),
             current_implied_percentage: Some(41.6),
@@ -288,6 +302,7 @@ fn sample_snapshot() -> ExchangePanelSnapshot {
             odds: 3.10,
             stake: 10.0,
             status: String::from("cash_out"),
+            funding_kind: String::from("cash"),
             current_cashout_value: Some(16.16),
             supports_cash_out: true,
         }],
@@ -336,8 +351,41 @@ fn sample_snapshot() -> ExchangePanelSnapshot {
                 stop_loss_implied_probability: 0.333,
             }],
         }),
-        recorder_bundle: None,
-        recorder_events: Vec::new(),
+        recorder_bundle: Some(operator_console::domain::RecorderBundleSummary {
+            run_dir: String::from("/tmp/sabi-smarkets-watcher"),
+            event_count: 12,
+            latest_event_at: String::from("2026-03-18T12:34:56Z"),
+            latest_event_kind: String::from("bookmaker_history_sync"),
+            latest_event_summary: String::from("bet365 history sync success (3 row(s))"),
+            latest_positions_at: String::from("2026-03-18T12:34:55Z"),
+            latest_watch_plan_at: String::from("2026-03-18T12:34:54Z"),
+        }),
+        recorder_events: vec![
+            RecorderEventSummary {
+                captured_at: String::from("2026-03-18T12:34:56Z"),
+                kind: String::from("bookmaker_history_sync"),
+                source: String::from("bet365"),
+                page: String::from("my_bets"),
+                action: String::from("bet365"),
+                status: String::from("success"),
+                request_id: String::new(),
+                reference_id: String::new(),
+                summary: String::from("bet365 history sync success (3 row(s))"),
+                detail: String::from("https://www.bet365.com/#/MB/SB"),
+            },
+            RecorderEventSummary {
+                captured_at: String::from("2026-03-18T12:34:57Z"),
+                kind: String::from("action_snapshot"),
+                source: String::from("smarkets_exchange"),
+                page: String::from("watcher_state"),
+                action: String::new(),
+                status: String::new(),
+                request_id: String::new(),
+                reference_id: String::new(),
+                summary: String::from("watcher iteration captured"),
+                detail: String::from("0 watch groups from 0 positions"),
+            },
+        ],
         transport_summary: None,
         transport_events: Vec::new(),
         tracked_bets: vec![TrackedBetRow {

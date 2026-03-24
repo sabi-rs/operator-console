@@ -7,15 +7,28 @@ pub enum VenueId {
     Smarkets,
     Bet365,
     Betfair,
+    Betano,
+    Bet10,
+    Betmgm,
     Betfred,
+    Betvictor,
+    Boylesports,
     Coral,
+    Fanteam,
     Ladbrokes,
     Kwik,
     Bet600,
+    Leovegas,
     Matchbook,
     Betdaq,
     Betway,
     Betuk,
+    Midnite,
+    Paddypower,
+    Skybet,
+    Sportingindex,
+    Talksportbet,
+    Williamhill,
 }
 
 impl VenueId {
@@ -24,15 +37,28 @@ impl VenueId {
             Self::Smarkets => "smarkets",
             Self::Bet365 => "bet365",
             Self::Betfair => "betfair",
+            Self::Betano => "betano",
+            Self::Bet10 => "bet10",
+            Self::Betmgm => "betmgm",
             Self::Betfred => "betfred",
+            Self::Betvictor => "betvictor",
+            Self::Boylesports => "boylesports",
             Self::Coral => "coral",
+            Self::Fanteam => "fanteam",
             Self::Ladbrokes => "ladbrokes",
             Self::Kwik => "kwik",
             Self::Bet600 => "bet600",
+            Self::Leovegas => "leovegas",
             Self::Matchbook => "matchbook",
             Self::Betdaq => "betdaq",
             Self::Betway => "betway",
             Self::Betuk => "betuk",
+            Self::Midnite => "midnite",
+            Self::Paddypower => "paddypower",
+            Self::Skybet => "skybet",
+            Self::Sportingindex => "sportingindex",
+            Self::Talksportbet => "talksportbet",
+            Self::Williamhill => "williamhill",
         }
     }
 }
@@ -149,6 +175,8 @@ pub struct OpenPositionRow {
     pub liability: f64,
     pub current_value: f64,
     pub pnl_amount: f64,
+    #[serde(default = "default_true")]
+    pub overall_pnl_known: bool,
     pub current_back_odds: Option<f64>,
     pub current_implied_probability: Option<f64>,
     pub current_implied_percentage: Option<f64>,
@@ -177,6 +205,8 @@ pub struct OtherOpenBetRow {
     pub odds: f64,
     pub stake: f64,
     pub status: String,
+    #[serde(default)]
+    pub funding_kind: String,
     #[serde(default)]
     pub current_cashout_value: Option<f64>,
     #[serde(default)]
@@ -256,6 +286,8 @@ pub struct TrackedBetRow {
     pub bet_type: String,
     #[serde(default)]
     pub market_family: String,
+    #[serde(default)]
+    pub funding_kind: String,
     pub selection_line: Option<f64>,
     #[serde(default = "default_currency")]
     pub currency: String,
@@ -576,6 +608,10 @@ pub struct WatchRow {
 
 fn default_currency() -> String {
     String::from("GBP")
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn null_string_as_default<'de, D>(deserializer: D) -> Result<String, D::Error>

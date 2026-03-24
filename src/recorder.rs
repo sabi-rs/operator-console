@@ -76,7 +76,10 @@ fn default_profile_path() -> Option<PathBuf> {
 }
 
 fn default_run_dir() -> PathBuf {
-    config_root().join("sabi").join("runs").join("smarkets-watcher")
+    config_root()
+        .join("sabi")
+        .join("runs")
+        .join("smarkets-watcher")
 }
 
 pub fn default_bet_recorder_root() -> PathBuf {
@@ -401,17 +404,29 @@ pub trait RecorderSupervisor {
 
 pub struct ProcessRecorderSupervisor {
     child: Option<Child>,
+    attached_pid: Option<u32>,
+    attached_run_dir: Option<PathBuf>,
 }
 
 impl Default for ProcessRecorderSupervisor {
     fn default() -> Self {
-        Self { child: None }
+        Self {
+            child: None,
+            attached_pid: None,
+            attached_run_dir: None,
+        }
     }
 }
 
 impl RecorderSupervisor for ProcessRecorderSupervisor {
     fn start(&mut self, config: &RecorderConfig) -> Result<()> {
         if matches!(self.poll_status(), RecorderStatus::Running) {
+            return Ok(());
+        }
+        if let Some(pid) = detect_external_watcher(&config.run_dir) {
+            self.child = None;
+            self.attached_pid = Some(pid);
+            self.attached_run_dir = Some(config.run_dir.clone());
             return Ok(());
         }
 
@@ -422,6 +437,8 @@ impl RecorderSupervisor for ProcessRecorderSupervisor {
             Ok(child) => {
                 backup.discard()?;
                 self.child = Some(child);
+                self.attached_pid = None;
+                self.attached_run_dir = None;
                 Ok(())
             }
             Err(error) => {
@@ -441,26 +458,59 @@ impl RecorderSupervisor for ProcessRecorderSupervisor {
             child.kill()?;
             let _ = child.wait();
         }
+        self.attached_pid = None;
+        self.attached_run_dir = None;
         Ok(())
     }
 
     fn poll_status(&mut self) -> RecorderStatus {
-        let Some(child) = self.child.as_mut() else {
-            return RecorderStatus::Disabled;
-        };
+        if let Some(child) = self.child.as_mut() {
+            return match child.try_wait() {
+                Ok(None) => RecorderStatus::Running,
+                Ok(Some(_)) => {
+                    self.child = None;
+                    RecorderStatus::Stopped
+                }
+                Err(_) => {
+                    self.child = None;
+                    RecorderStatus::Error
+                }
+            };
+        }
 
-        match child.try_wait() {
-            Ok(None) => RecorderStatus::Running,
-            Ok(Some(_)) => {
-                self.child = None;
-                RecorderStatus::Stopped
+        match (&self.attached_run_dir, self.attached_pid) {
+            (Some(run_dir), Some(pid)) if external_watcher_matches(run_dir, pid) => {
+                RecorderStatus::Running
             }
-            Err(_) => {
-                self.child = None;
-                RecorderStatus::Error
+            _ => {
+                self.attached_pid = None;
+                self.attached_run_dir = None;
+                RecorderStatus::Disabled
             }
         }
     }
+}
+
+fn detect_external_watcher(run_dir: &Path) -> Option<u32> {
+    let pid_path = run_dir.join("watcher.pid");
+    let recorded_pid = fs::read_to_string(pid_path)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    external_watcher_matches(run_dir, recorded_pid).then_some(recorded_pid)
+}
+
+fn external_watcher_matches(run_dir: &Path, pid: u32) -> bool {
+    if !Path::new(&format!("/proc/{pid}")).exists() {
+        return false;
+    }
+    let cmdline_path = format!("/proc/{pid}/cmdline");
+    let Ok(cmdline) = fs::read(cmdline_path) else {
+        return false;
+    };
+    let command = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+    command.contains("watch-smarkets-session") && command.contains(&run_dir.display().to_string())
 }
 
 fn spawn_recorder_watcher(config: &RecorderConfig, log_path: &Path) -> Result<Child> {

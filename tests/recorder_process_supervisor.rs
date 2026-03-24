@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
@@ -220,14 +221,69 @@ fn process_supervisor_restores_stale_run_dir_if_watcher_exits_immediately() {
     assert!(screenshots_dir.join("stale.png").exists());
 }
 
+#[test]
+fn process_supervisor_attaches_to_existing_watcher_for_run_dir() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let run_dir = temp_dir.path().join("run");
+    fs::create_dir_all(&run_dir).expect("create run dir");
+
+    let mut external_watcher = Command::new("python3")
+        .arg("-c")
+        .arg("import time; time.sleep(30)")
+        .arg("watch-smarkets-session")
+        .arg("--run-dir")
+        .arg(&run_dir)
+        .spawn()
+        .expect("spawn external watcher");
+    fs::write(
+        run_dir.join("watcher.pid"),
+        format!("{}\n", external_watcher.id()),
+    )
+    .expect("write watcher pid");
+
+    let mut supervisor = ProcessRecorderSupervisor::default();
+    supervisor
+        .start(&RecorderConfig {
+            command: temp_dir.path().join("missing-recorder.sh"),
+            run_dir: run_dir.clone(),
+            session: String::from("helium-copy"),
+            companion_legs_path: None,
+            profile_path: Some(std::path::PathBuf::from("/tmp/owned-profile")),
+            autostart: false,
+            interval_seconds: 5,
+            commission_rate: String::from("0"),
+            target_profit: String::from("1"),
+            stop_loss: String::from("1"),
+            hard_margin_call_profit_floor: String::new(),
+            warn_only_default: true,
+        })
+        .expect("attach to external watcher");
+
+    assert_eq!(
+        supervisor.poll_status(),
+        operator_console::recorder::RecorderStatus::Running
+    );
+
+    supervisor.stop().expect("detach supervisor");
+    assert!(external_watcher
+        .try_wait()
+        .expect("poll external")
+        .is_none());
+
+    external_watcher.kill().expect("kill external watcher");
+    let _ = external_watcher.wait();
+}
+
 fn write_executable_script(path: &std::path::Path, body: &str) -> std::io::Result<()> {
-    let mut file = fs::File::create(path)?;
+    let temp_path = path.with_extension("tmp");
+    let mut file = fs::File::create(&temp_path)?;
     file.write_all(body.as_bytes())?;
     file.sync_all()?;
     drop(file);
 
-    let mut permissions = fs::metadata(path)?.permissions();
+    let mut permissions = fs::metadata(&temp_path)?.permissions();
     permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions)?;
+    fs::set_permissions(&temp_path, permissions)?;
+    fs::rename(temp_path, path)?;
     Ok(())
 }

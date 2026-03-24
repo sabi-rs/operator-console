@@ -513,6 +513,55 @@ fn recorder_start_is_global_and_switches_into_trading_positions() {
 }
 
 #[test]
+fn quitting_app_stops_a_running_recorder() {
+    let started = Rc::new(RefCell::new(Vec::new()));
+    let stopped = Rc::new(RefCell::new(0));
+    let stub_snapshot = sample_snapshot("Stub dashboard");
+    let recorder_snapshot = sample_snapshot("Recorder dashboard");
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let mut app = App::with_dependencies_and_storage(
+        Box::new(StaticProvider {
+            snapshot: stub_snapshot.clone(),
+        }),
+        Box::new({
+            let stub_snapshot = stub_snapshot.clone();
+            move || {
+                Box::new(StaticProvider {
+                    snapshot: stub_snapshot.clone(),
+                }) as Box<dyn ExchangeProvider>
+            }
+        }),
+        Box::new({
+            let recorder_snapshot = recorder_snapshot.clone();
+            move |_| {
+                Box::new(StaticProvider {
+                    snapshot: recorder_snapshot.clone(),
+                }) as Box<dyn ExchangeProvider>
+            }
+        }),
+        Box::new(FakeSupervisor {
+            started: started.clone(),
+            stopped: stopped.clone(),
+            running: false,
+        }),
+        RecorderConfig::default(),
+        temp_dir.path().join("recorder.json"),
+        String::from("test"),
+    )
+    .expect("app");
+
+    app.start_recorder().expect("start recorder");
+    assert_eq!(app.recorder_status(), &RecorderStatus::Running);
+
+    app.handle_key(KeyCode::Char('q'));
+
+    assert_eq!(*stopped.borrow(), 1);
+    assert_eq!(app.recorder_status(), &RecorderStatus::Disabled);
+    assert!(!app.is_running());
+}
+
+#[test]
 fn recorder_autostart_field_is_editable_and_persisted() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let config_path = temp_dir.path().join("recorder.json");

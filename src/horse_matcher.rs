@@ -723,17 +723,30 @@ fn bookmaker_summary(venue: VenueId, label: &str) -> BookmakerSummary {
     let display_name = if label.trim().is_empty() {
         match venue {
             VenueId::Smarkets => "Smarkets",
+            VenueId::Bet10 => "Bet10",
             VenueId::Betdaq => "Betdaq",
+            VenueId::Betano => "Betano",
+            VenueId::Betfair => "Betfair",
             VenueId::Betfred => "Betfred",
+            VenueId::Betmgm => "BetMGM",
+            VenueId::Betvictor => "BetVictor",
+            VenueId::Boylesports => "BoyleSports",
             VenueId::Coral => "Coral",
+            VenueId::Fanteam => "FanTeam",
             VenueId::Ladbrokes => "Ladbrokes",
             VenueId::Kwik => "Kwik",
             VenueId::Bet600 => "Bet600",
             VenueId::Bet365 => "bet365",
             VenueId::Betuk => "BetUK",
             VenueId::Betway => "Betway",
-            VenueId::Betfair => "Betfair",
+            VenueId::Leovegas => "LeoVegas",
             VenueId::Matchbook => "Matchbook",
+            VenueId::Midnite => "Midnite",
+            VenueId::Paddypower => "Paddy Power",
+            VenueId::Skybet => "Sky Bet",
+            VenueId::Sportingindex => "Sporting Index",
+            VenueId::Talksportbet => "talkSPORT BET",
+            VenueId::Williamhill => "William Hill",
         }
         .to_string()
     } else {

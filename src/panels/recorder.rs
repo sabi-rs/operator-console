@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table, Wra
 use ratatui::Frame;
 
 use crate::app::App;
-use crate::domain::VenueStatus;
+use crate::domain::{RecorderEventSummary, VenueStatus};
 use crate::recorder::RecorderField;
 
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -28,7 +28,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     render_config_table(frame, middle[0], app);
     render_field_detail(frame, right[0], app);
     render_storage(frame, right[1], app);
-    render_runbook(frame, bottom[0], app);
+    render_evidence(frame, bottom[0], app);
     render_policy(frame, bottom[1], app);
 }
 
@@ -38,6 +38,8 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .selected_venue
         .map(|venue| venue.as_str().to_string())
         .unwrap_or_else(|| String::from("none"));
+    let latest_sync = latest_bookmaker_history_sync_summary(app);
+    let latest_event = latest_recorder_event_summary(app);
     let rows = vec![
         key_value_row(
             "󰑓 Recorder",
@@ -64,27 +66,9 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             app.recorder_snapshot_mode().to_string(),
             accent_gold(),
         ),
-        key_value_row(
-            "󰅐 Updated",
-            app.last_successful_snapshot_at()
-                .unwrap_or("none")
-                .to_string(),
-            text_color(),
-        ),
+        key_value_row("󱙺 Sync", latest_sync.0, latest_sync.1),
         key_value_row("󰀵 Venue", selected_venue, accent_cyan()),
-        key_value_row(
-            "󱂬 Failure",
-            if let Some(detail) = app.last_recorder_start_failure() {
-                detail.to_string()
-            } else {
-                String::from("<none>")
-            },
-            if app.last_recorder_start_failure().is_some() {
-                accent_red()
-            } else {
-                muted_text()
-            },
-        ),
+        key_value_row("󰁨 Event", latest_event.0, latest_event.1),
     ];
     let table = Table::new(rows, [Constraint::Length(18), Constraint::Min(10)])
         .block(section_block("󰑓 Recorder Status", accent_blue()))
@@ -193,10 +177,6 @@ fn render_config_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn render_field_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let field = app.recorder_selected_field();
     let snapshot = app.snapshot();
-    let mut suggestions = field.suggestions();
-    if suggestions.is_empty() {
-        suggestions.push(String::from("<none>"));
-    }
     let current_value = if app.recorder_is_editing() {
         app.recorder_edit_buffer()
             .map(String::from)
@@ -230,28 +210,34 @@ fn render_field_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 current_value.as_str()
             }),
         ]),
-        Line::styled("󰘵 suggestions", Style::default().fg(accent_gold())),
-        Line::raw(format!(
-            "• {}",
-            suggestions.first().map(String::as_str).unwrap_or("<none>")
-        )),
-        Line::raw(format!(
-            "• {}",
-            suggestions.get(1).map(String::as_str).unwrap_or("<none>")
-        )),
-        Line::raw(format!(
-            "• {}",
-            suggestions.get(2).map(String::as_str).unwrap_or("<none>")
-        )),
         Line::styled("󱂬 status", Style::default().fg(accent_blue())),
-        Line::raw(app.status_message().to_string()),
+        Line::raw(truncate_line(app.status_message(), 76)),
     ];
     if snapshot.worker.detail != app.status_message() {
         lines.push(Line::styled(
             "󰒋 worker",
             Style::default().fg(accent_green()),
         ));
-        lines.push(Line::raw(snapshot.worker.detail.clone()));
+        lines.push(Line::raw(truncate_line(&snapshot.worker.detail, 76)));
+    }
+    if let Some(event) = bookmaker_history_sync_events(app).first() {
+        lines.push(Line::styled(
+            "󱙺 latest sync",
+            Style::default().fg(accent_green()),
+        ));
+        lines.push(Line::raw(format_bookmaker_history_sync_event(event)));
+    }
+    if let Some(event) = snapshot
+        .recorder_events
+        .iter()
+        .rev()
+        .find(|event| event.kind != "bookmaker_history_sync")
+    {
+        lines.push(Line::styled(
+            "󰁨 latest event",
+            Style::default().fg(accent_red()),
+        ));
+        lines.push(Line::raw(format_recorder_evidence_event(event)));
     }
     lines.push(Line::raw("PgUp/PgDn scroll this pane"));
 
@@ -264,24 +250,19 @@ fn render_field_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn render_storage(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let config = app.recorder_config();
-    let rows = vec![
-        key_value_row(
-            "󰈔 Config file",
-            app.recorder_config_path().display().to_string(),
-            text_color(),
-        ),
-        key_value_row(
+    let mut lines = vec![
+        key_value_line(
             "󰉋 Run dir",
             config.run_dir.display().to_string(),
             text_color(),
         ),
-        key_value_row(
+        key_value_line(
             "󰆍 Command",
             config.command.display().to_string(),
             text_color(),
         ),
-        key_value_row("󰌘 Session", config.session.clone(), accent_cyan()),
-        key_value_row(
+        key_value_line("󰌘 Session", config.session.clone(), accent_cyan()),
+        key_value_line(
             "󰙩 Profile",
             config
                 .profile_path
@@ -290,7 +271,7 @@ fn render_storage(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .unwrap_or_else(|| String::from("<none>")),
             muted_text(),
         ),
-        key_value_row(
+        key_value_line(
             "󰎟 Companion",
             config
                 .companion_legs_path
@@ -300,26 +281,69 @@ fn render_storage(frame: &mut Frame<'_>, area: Rect, app: &App) {
             muted_text(),
         ),
     ];
-    let table = Table::new(rows, [Constraint::Length(18), Constraint::Min(10)])
-        .block(section_block("󰒓 Storage & Inputs", accent_pink()))
-        .column_spacing(1);
-    frame.render_widget(table, area);
+    let history_events = bookmaker_history_sync_events(app);
+    if history_events.is_empty() {
+        lines.push(key_value_line(
+            "󱙺 Sync",
+            String::from("No bookmaker history sync attempts captured yet."),
+            muted_text(),
+        ));
+    } else {
+        for event in history_events {
+            lines.push(key_value_line(
+                "󱙺 Sync",
+                format_bookmaker_history_sync_event(event),
+                accent_green(),
+            ));
+        }
+    }
+
+    let body = Paragraph::new(lines)
+        .block(section_block("󰒓 Storage, Inputs & Sync", accent_pink()))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(body, area);
 }
 
-fn render_runbook(frame: &mut Frame<'_>, area: Rect, _app: &App) {
-    let rows = vec![
-        action_row("󰮳 Navigate", "j/k move field"),
-        action_row("󰌑 Edit", "Enter apply • Esc cancel • [/] cycle suggestions"),
-        action_row("󰑓 Control", "s start recorder • x stop recorder"),
-        action_row(
-            "󰑓 Config",
-            "u reload config • D defaults • r cache • R live",
-        ),
-    ];
-    let table = Table::new(rows, [Constraint::Length(14), Constraint::Min(10)])
-        .block(section_block("󰌑 Recorder Runbook", accent_red()))
-        .column_spacing(1);
-    frame.render_widget(table, area);
+fn render_evidence(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let snapshot = app.snapshot();
+    let mut lines = Vec::new();
+    if let Some(bundle) = snapshot.recorder_bundle.as_ref() {
+        lines.push(Line::raw(format!(
+            "Bundle: {} | Events: {}",
+            bundle.run_dir, bundle.event_count
+        )));
+        if !bundle.latest_event_at.trim().is_empty() || !bundle.latest_event_kind.trim().is_empty()
+        {
+            lines.push(Line::raw(format!(
+                "Latest: {} {}",
+                bundle.latest_event_kind, bundle.latest_event_at
+            )));
+        }
+        if !bundle.latest_event_summary.trim().is_empty() {
+            lines.push(Line::raw(format!(
+                "Summary: {}",
+                truncate_line(bundle.latest_event_summary.trim(), 96)
+            )));
+        }
+    } else {
+        lines.push(Line::raw(
+            "No recorder bundle is attached to this snapshot.",
+        ));
+    }
+
+    let recent_events: Vec<_> = snapshot.recorder_events.iter().rev().take(2).collect();
+    if recent_events.is_empty() {
+        lines.push(Line::raw("No normalized recorder events are available."));
+    } else {
+        for event in recent_events {
+            lines.push(Line::raw(format_recorder_evidence_event(event)));
+        }
+    }
+
+    let body = Paragraph::new(lines)
+        .block(section_block("󰁨 Recorder Evidence", accent_red()))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(body, area);
 }
 
 fn render_policy(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -387,18 +411,6 @@ fn pipeline_row(label: &'static str, value: String) -> Row<'static> {
     ])
 }
 
-fn action_row(label: &'static str, value: &'static str) -> Row<'static> {
-    Row::new(vec![
-        Cell::from(Span::styled(
-            label,
-            Style::default()
-                .fg(muted_text())
-                .add_modifier(Modifier::BOLD),
-        )),
-        Cell::from(Span::styled(value, Style::default().fg(text_color()))),
-    ])
-}
-
 fn key_value_row(label: &'static str, value: String, color: Color) -> Row<'static> {
     Row::new(vec![
         Cell::from(Span::styled(
@@ -409,6 +421,116 @@ fn key_value_row(label: &'static str, value: String, color: Color) -> Row<'stati
         )),
         Cell::from(Span::styled(value, Style::default().fg(color))),
     ])
+}
+
+fn key_value_line(label: &'static str, value: String, color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{label} "),
+            Style::default()
+                .fg(muted_text())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(value, Style::default().fg(color)),
+    ])
+}
+
+fn bookmaker_history_sync_events(app: &App) -> Vec<&RecorderEventSummary> {
+    app.snapshot()
+        .recorder_events
+        .iter()
+        .rev()
+        .filter(|event| event.kind == "bookmaker_history_sync")
+        .take(3)
+        .collect()
+}
+
+fn format_bookmaker_history_sync_event(event: &RecorderEventSummary) -> String {
+    let venue = first_non_empty(&[event.action.as_str(), event.source.as_str(), "unknown"]);
+    let status = first_non_empty(&[event.status.as_str(), "unknown"]);
+    let headline = if event.summary.trim().is_empty() {
+        format!("{venue} [{status}]")
+    } else {
+        format!("{venue} [{status}] {}", event.summary.trim())
+    };
+    if event.detail.trim().is_empty() {
+        truncate_line(&headline, 120)
+    } else {
+        truncate_line(&format!("{headline} | {}", event.detail.trim()), 120)
+    }
+}
+
+fn latest_bookmaker_history_sync_summary(app: &App) -> (String, Color) {
+    if let Some(event) = bookmaker_history_sync_events(app).first() {
+        let color = match event.status.as_str() {
+            "success" => accent_green(),
+            "error" | "failed" => accent_red(),
+            _ => accent_gold(),
+        };
+        (
+            truncate_line(&format_bookmaker_history_sync_event(event), 48),
+            color,
+        )
+    } else {
+        (String::from("<none>"), muted_text())
+    }
+}
+
+fn latest_recorder_event_summary(app: &App) -> (String, Color) {
+    if let Some(event) = app
+        .snapshot()
+        .recorder_events
+        .iter()
+        .rev()
+        .find(|event| event.kind != "bookmaker_history_sync")
+    {
+        (
+            truncate_line(&format_recorder_evidence_event(event), 48),
+            accent_red(),
+        )
+    } else if let Some(detail) = app.last_recorder_start_failure() {
+        (truncate_line(detail, 48), accent_red())
+    } else {
+        (String::from("<none>"), muted_text())
+    }
+}
+
+fn format_recorder_evidence_event(event: &RecorderEventSummary) -> String {
+    let prefix = if event.captured_at.trim().is_empty() {
+        event.kind.trim().to_string()
+    } else {
+        format!("{} {}", event.captured_at.trim(), event.kind.trim())
+    };
+    let mut line = if event.summary.trim().is_empty() {
+        prefix
+    } else {
+        format!("{prefix} | {}", event.summary.trim())
+    };
+    if !event.detail.trim().is_empty() {
+        line.push_str(&format!(" | {}", event.detail.trim()));
+    }
+    truncate_line(&line, 120)
+}
+
+fn first_non_empty<'a>(values: &[&'a str]) -> &'a str {
+    values
+        .iter()
+        .copied()
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or("")
+}
+
+fn truncate_line(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() && max_chars >= 3 {
+        format!(
+            "{}...",
+            truncated.chars().take(max_chars - 3).collect::<String>()
+        )
+    } else {
+        truncated
+    }
 }
 
 fn bool_color(value: bool) -> Color {

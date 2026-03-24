@@ -1,453 +1,374 @@
-use std::collections::BTreeMap;
-
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
-use crate::domain::ExchangePanelSnapshot;
+use crate::app::App;
+use crate::owls::{OwlsEndpointGroup, OwlsEndpointSummary, OwlsGroupSummary};
 
-pub fn render(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    snapshot: &ExchangePanelSnapshot,
-    table_state: &mut TableState,
-) {
-    let selected_position = selected_position(snapshot, table_state);
+pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let layout = Layout::vertical([
-        Constraint::Length(8),
-        Constraint::Min(10),
-        Constraint::Length(10),
+        Constraint::Length(5),
+        Constraint::Min(13),
+        Constraint::Length(7),
     ])
     .split(area);
-    let lower = Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
-        .split(layout[2]);
+    let top = Layout::horizontal([
+        Constraint::Percentage(34),
+        Constraint::Percentage(36),
+        Constraint::Percentage(30),
+    ])
+    .split(layout[0]);
+    let body = Layout::horizontal([Constraint::Percentage(61), Constraint::Percentage(39)])
+        .split(layout[1]);
+    let detail = Layout::vertical([Constraint::Length(9), Constraint::Min(4)]).split(body[1]);
 
-    render_summary(frame, layout[0], snapshot, selected_position);
-    render_stateful_table(
-        frame,
-        layout[1],
-        &format!("Open Market Positions ({})", snapshot.open_positions.len()),
-        vec![
-            Constraint::Percentage(28),
-            Constraint::Percentage(24),
-            Constraint::Length(14),
-            Constraint::Length(11),
-            Constraint::Length(8),
-        ],
-        position_rows(snapshot),
-        empty_row("No open positions are loaded.", 5),
-        table_state,
-    );
-    render_table(
-        frame,
-        lower[0],
-        &format!(
-            "Watch Groups ({})",
-            snapshot
-                .watch
-                .as_ref()
-                .map(|watch| watch.watch_count)
-                .unwrap_or(0)
-        ),
-        vec![
-            Constraint::Percentage(28),
-            Constraint::Percentage(24),
-            Constraint::Length(8),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Length(8),
-        ],
-        watch_rows(snapshot),
-        empty_row("No grouped watch rows are loaded.", 6),
-    );
-    render_table(
-        frame,
-        lower[1],
-        &format!("Market Coverage ({})", market_group_count(snapshot)),
-        vec![
-            Constraint::Percentage(38),
-            Constraint::Length(10),
-            Constraint::Length(9),
-            Constraint::Length(8),
-        ],
-        market_rows(snapshot),
-        empty_row("No market coverage is loaded.", 4),
-    );
+    let selected = app.selected_owls_endpoint().cloned();
+    render_overview(frame, top[0], app);
+    render_group_strip(frame, top[1], app);
+    render_selection_brief(frame, top[2], selected.as_ref());
+    render_endpoint_table(frame, body[0], app);
+    render_selection_detail(frame, detail[0], selected.as_ref());
+    render_preview(frame, detail[1], selected.as_ref());
+    render_runbook(frame, layout[2], app, selected.as_ref());
 }
 
-fn render_summary(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    snapshot: &ExchangePanelSnapshot,
-    selected_position: Option<&crate::domain::OpenPositionRow>,
-) {
-    let mut lines = vec![
-        Line::from(vec![
-            metric_span("Positions", accent_cyan()),
-            Span::raw(snapshot.open_positions.len().to_string()),
-            Span::raw("   "),
-            metric_span("Watch groups", accent_blue()),
-            Span::raw(
-                snapshot
-                    .watch
-                    .as_ref()
-                    .map(|watch| watch.watch_count.to_string())
-                    .unwrap_or_else(|| String::from("0")),
-            ),
-            Span::raw("   "),
-            metric_span("In-play", accent_red()),
-            Span::raw(
-                snapshot
-                    .open_positions
-                    .iter()
-                    .filter(|row| row.is_in_play)
-                    .count()
-                    .to_string(),
-            ),
-            Span::raw("   "),
-            metric_span("Tradable", accent_green()),
-            Span::raw(
-                snapshot
-                    .open_positions
-                    .iter()
-                    .filter(|row| row.can_trade_out)
-                    .count()
-                    .to_string(),
-            ),
-        ]),
-        Line::from(vec![
-            metric_span("Suspended", accent_gold()),
-            Span::raw(
-                snapshot
-                    .open_positions
-                    .iter()
-                    .filter(|row| effective_market_status(row) == "suspended")
-                    .count()
-                    .to_string(),
-            ),
-            Span::raw("   "),
-            metric_span("Total P/L", accent_pink()),
-            pnl_span(
-                snapshot
-                    .open_positions
-                    .iter()
-                    .map(|row| row.pnl_amount)
-                    .sum(),
-            ),
-            Span::raw("   "),
-            metric_span("Source", accent_gold()),
-            Span::raw(
-                snapshot
-                    .runtime
-                    .as_ref()
-                    .map(|runtime| runtime.source.clone())
-                    .unwrap_or_else(|| String::from("snapshot")),
-            ),
-        ]),
-    ];
+fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let owls = app.owls_dashboard();
+    let ready = owls
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.status == "ready")
+        .count();
+    let waiting = owls
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.status == "waiting")
+        .count();
+    let errors = owls
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.status == "error")
+        .count();
 
-    if let Some(row) = selected_position {
-        lines.push(Line::from(vec![
-            metric_span("Selected", accent_blue()),
-            Span::raw(format!("{} | {}", event_label(row), row.contract)),
-            Span::raw("   "),
-            metric_span("Phase", accent_gold()),
-            Span::raw(phase_label(row)),
-            Span::raw("   "),
-            metric_span("Trade", accent_green()),
-            Span::raw(trade_label_text(row)),
-        ]));
-        lines.push(Line::from(vec![
-            metric_span("Marked", accent_pink()),
-            Span::raw(format!(
-                "current {:.2} | pnl {:+.2} | liability {:.2}",
-                row.current_value, row.pnl_amount, row.liability
-            )),
-        ]));
+    let body = Paragraph::new(vec![
+        Line::from(vec![
+            badge("Sport", owls.sport.as_str(), accent_blue()),
+            Span::raw("  "),
+            badge(
+                "Ready",
+                &format!("{ready}/{}", owls.endpoints.len()),
+                accent_green(),
+            ),
+            Span::raw("  "),
+            badge("Wait", &waiting.to_string(), accent_gold()),
+            Span::raw("  "),
+            badge("Err", &errors.to_string(), accent_red()),
+        ]),
+        Line::raw(truncate(&owls.status_line, 80)),
+    ])
+    .block(section_block("Owls Surface", accent_blue()))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(body, area);
+}
+
+fn render_group_strip(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let mut lines = Vec::new();
+    let mut current = Vec::new();
+
+    for (index, group) in app.owls_dashboard().groups.iter().enumerate() {
+        current.push(group_chip(group));
+        if index == 2 {
+            lines.push(Line::from(current));
+            current = Vec::new();
+        } else {
+            current.push(Span::raw(" "));
+        }
+    }
+    if !current.is_empty() {
+        lines.push(Line::from(current));
     }
 
     let body = Paragraph::new(lines)
-        .block(section_block("Market Summary", accent_blue()))
+        .block(section_block("Coverage", accent_cyan()))
         .wrap(Wrap { trim: true });
     frame.render_widget(body, area);
 }
 
-fn position_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
-    snapshot
-        .open_positions
-        .iter()
-        .take(10)
-        .map(|row| {
-            Row::new(vec![
-                Cell::from(event_label(row)),
-                Cell::from(row.contract.clone()),
-                Cell::from(phase_label(row)),
-                trade_cell(row),
-                pnl_cell(row.pnl_amount),
-            ])
-        })
-        .collect()
-}
-
-fn watch_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
-    let Some(watch) = &snapshot.watch else {
-        return Vec::new();
-    };
-
-    watch
-        .watches
-        .iter()
-        .take(10)
-        .map(|row| {
-            Row::new(vec![
-                Cell::from(row.contract.clone()),
-                Cell::from(row.market.clone()),
-                pnl_cell(row.current_pnl_amount),
-                Cell::from(
-                    row.current_back_odds
-                        .map(|value| format!("{value:.2}"))
-                        .unwrap_or_else(|| String::from("-")),
-                ),
-                Cell::from(format!("{:.2}", row.profit_take_back_odds)),
-                Cell::from(format!("{:.2}", row.stop_loss_back_odds)),
-            ])
-        })
-        .collect()
-}
-
-fn market_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
-    let mut groups: BTreeMap<String, (usize, usize, f64)> = BTreeMap::new();
-    for row in &snapshot.open_positions {
-        let entry = groups.entry(row.market.clone()).or_insert((0, 0, 0.0));
-        entry.0 += 1;
-        if row.is_in_play {
-            entry.1 += 1;
-        }
-        entry.2 += row.pnl_amount;
-    }
-
-    groups
-        .into_iter()
-        .take(10)
-        .map(|(market, (positions, in_play, pnl))| {
-            Row::new(vec![
-                Cell::from(market),
-                Cell::from(positions.to_string()),
-                Cell::from(in_play.to_string()),
-                pnl_cell(pnl),
-            ])
-        })
-        .collect()
-}
-
-fn market_group_count(snapshot: &ExchangePanelSnapshot) -> usize {
-    snapshot
-        .open_positions
-        .iter()
-        .map(|row| row.market.as_str())
-        .collect::<std::collections::BTreeSet<_>>()
-        .len()
-}
-
-fn event_label(row: &crate::domain::OpenPositionRow) -> String {
-    if row.event.is_empty() {
-        String::from("-")
-    } else {
-        row.event.clone()
-    }
-}
-
-fn phase_label(row: &crate::domain::OpenPositionRow) -> String {
-    if row.event_status.is_empty() {
-        if row.is_in_play {
-            return String::from("Live");
-        }
-        return String::from("-");
-    }
-    row.event_status
-        .split('|')
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("-")
-        .to_string()
-}
-
-fn effective_market_status(row: &crate::domain::OpenPositionRow) -> &'static str {
-    match row.market_status.as_str() {
-        "tradable" => "tradable",
-        "suspended" => "suspended",
-        "pre_event" => "pre_event",
-        "settled" => "settled",
-        _ if row.can_trade_out => "tradable",
-        _ if row.is_in_play => "suspended",
-        _ => "unavailable",
-    }
-}
-
-fn trade_cell(row: &crate::domain::OpenPositionRow) -> Cell<'static> {
-    let label = trade_label_text(row);
-    let color = match effective_market_status(row) {
-        "tradable" => accent_green(),
-        "suspended" => accent_red(),
-        "pre_event" => accent_gold(),
-        "settled" => accent_pink(),
-        _ => muted_text(),
-    };
-    Cell::from(label).style(Style::default().fg(color))
-}
-
-fn trade_label_text(row: &crate::domain::OpenPositionRow) -> &'static str {
-    match effective_market_status(row) {
-        "tradable" => "tradable",
-        "suspended" => "suspended",
-        "pre_event" => "pre-match",
-        "settled" => "settled",
-        _ if row.status == "Order filled" => "active",
-        _ => "unknown",
-    }
-}
-
-fn render_table(
+fn render_selection_brief(
     frame: &mut Frame<'_>,
     area: Rect,
-    title: &str,
-    widths: Vec<Constraint>,
-    rows: Vec<Row<'static>>,
-    empty: Row<'static>,
+    selected: Option<&OwlsEndpointSummary>,
 ) {
-    let rows = if rows.is_empty() { vec![empty] } else { rows };
-    let table = Table::new(rows, widths)
-        .header(
-            Row::new(table_header(title))
-                .style(
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(accent_cyan())
-                        .add_modifier(Modifier::BOLD),
-                )
-                .bottom_margin(1),
-        )
-        .block(section_block(title, accent_blue()))
-        .column_spacing(1);
-    frame.render_widget(table, area);
-}
+    let (title, path, status) = match selected {
+        Some(endpoint) => (
+            endpoint.label.as_str(),
+            endpoint.path.as_str(),
+            endpoint.status.as_str(),
+        ),
+        None => ("No endpoint", "-", "idle"),
+    };
 
-fn render_stateful_table(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    title: &str,
-    widths: Vec<Constraint>,
-    rows: Vec<Row<'static>>,
-    empty: Row<'static>,
-    table_state: &mut TableState,
-) {
-    let rows = if rows.is_empty() { vec![empty] } else { rows };
-    let table = Table::new(rows, widths)
-        .header(
-            Row::new(table_header(title))
-                .style(
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(accent_cyan())
-                        .add_modifier(Modifier::BOLD),
-                )
-                .bottom_margin(1),
-        )
-        .block(section_block(title, accent_blue()))
-        .column_spacing(1)
-        .row_highlight_style(
+    let body = Paragraph::new(vec![
+        Line::styled(
+            truncate(title, 30),
             Style::default()
-                .bg(Color::Rgb(28, 39, 52))
-                .fg(Color::Rgb(255, 255, 255))
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("● ");
-    frame.render_stateful_widget(table, area, table_state);
+        ),
+        Line::from(vec![
+            badge("State", status, status_color(status)),
+            Span::raw("  "),
+            Span::styled(truncate(path, 42), Style::default().fg(muted_text())),
+        ]),
+    ])
+    .block(section_block("Selection", accent_gold()))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(body, area);
 }
 
-fn table_header(title: &str) -> Vec<&'static str> {
-    match title {
-        heading if heading.starts_with("Open Market Positions") => {
-            vec!["Event", "Position", "Phase", "Trade", "P/L"]
-        }
-        heading if heading.starts_with("Watch Groups") => {
-            vec!["Contract", "Market", "P/L", "Back", "Profit", "Stop"]
-        }
-        heading if heading.starts_with("Market Coverage") => {
-            vec!["Market", "Positions", "In-play", "P/L"]
-        }
-        _ => vec!["Data"],
-    }
+fn render_endpoint_table(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let rows = app
+        .owls_dashboard()
+        .endpoints
+        .iter()
+        .map(|endpoint| {
+            Row::new(vec![
+                Cell::from(endpoint.group.short()),
+                Cell::from(endpoint.label.clone()),
+                Cell::from(endpoint.status.clone()).style(
+                    Style::default()
+                        .fg(status_color(&endpoint.status))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Cell::from(endpoint.count.to_string()),
+                Cell::from(truncate(&endpoint.path, 32)).style(Style::default().fg(muted_text())),
+                Cell::from(truncate(&endpoint.detail, 22)),
+            ])
+        })
+        .collect::<Vec<_>>();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(3),
+            Constraint::Length(18),
+            Constraint::Length(8),
+            Constraint::Length(6),
+            Constraint::Length(34),
+            Constraint::Min(12),
+        ],
+    )
+    .header(
+        Row::new(vec!["G", "Endpoint", "State", "Rows", "Route", "Detail"]).style(
+            Style::default()
+                .fg(accent_cyan())
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .row_highlight_style(
+        Style::default()
+            .fg(Color::Black)
+            .bg(accent_cyan())
+            .add_modifier(Modifier::BOLD),
+    )
+    .column_spacing(1)
+    .block(section_block("Endpoint Board", accent_cyan()));
+    frame.render_stateful_widget(table, area, app.owls_endpoint_table_state());
 }
 
-fn empty_row(message: &str, columns: usize) -> Row<'static> {
-    let mut cells = vec![Cell::from(message.to_string())];
-    for _ in 1..columns {
-        cells.push(Cell::from(String::new()));
-    }
-    Row::new(cells).style(Style::default().fg(muted_text()))
-}
-
-fn pnl_cell(value: f64) -> Cell<'static> {
-    let color = if value > 0.0 {
-        accent_green()
-    } else if value < 0.0 {
-        accent_red()
-    } else {
-        accent_gold()
+fn render_selection_detail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    selected: Option<&OwlsEndpointSummary>,
+) {
+    let Some(endpoint) = selected else {
+        let body = Paragraph::new("Select an endpoint to inspect the route and filters.")
+            .block(section_block("Endpoint Detail", accent_gold()))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(body, area);
+        return;
     };
-    Cell::from(format!("{value:+.2}")).style(Style::default().fg(color))
+
+    let lines = vec![
+        Line::from(vec![
+            badge("Group", endpoint.group.label(), group_color(endpoint.group)),
+            Span::raw("  "),
+            badge("Rows", &endpoint.count.to_string(), accent_green()),
+            Span::raw("  "),
+            badge(
+                "Updated",
+                &endpoint.updated_at.as_str().if_empty("-"),
+                accent_gold(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Route ", Style::default().fg(accent_cyan())),
+            Span::raw(format!("{} {}", endpoint.method, endpoint.path)),
+        ]),
+        Line::from(vec![
+            Span::styled("About ", Style::default().fg(accent_cyan())),
+            Span::raw(endpoint.description.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("Filters ", Style::default().fg(accent_cyan())),
+            Span::raw(endpoint.query_hint.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("Detail ", Style::default().fg(accent_cyan())),
+            Span::raw(endpoint.detail.clone()),
+        ]),
+    ];
+
+    let body = Paragraph::new(lines)
+        .block(section_block("Endpoint Detail", accent_gold()))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(body, area);
 }
 
-fn pnl_span(value: f64) -> Span<'static> {
-    let color = if value > 0.0 {
-        accent_green()
-    } else if value < 0.0 {
-        accent_red()
-    } else {
-        accent_gold()
-    };
+fn render_preview(frame: &mut Frame<'_>, area: Rect, selected: Option<&OwlsEndpointSummary>) {
+    let mut lines = Vec::new();
+
+    match selected {
+        Some(endpoint) if !endpoint.preview.is_empty() => {
+            for row in endpoint.preview.iter().take(6) {
+                lines.push(Line::styled(
+                    truncate(&row.label, 34),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                lines.push(Line::raw(format!(
+                    "{} | {}",
+                    truncate(&row.detail, 28),
+                    truncate(&row.metric, 22)
+                )));
+            }
+        }
+        Some(endpoint) => lines.push(Line::raw(format!(
+            "No preview rows returned for {}.",
+            endpoint.label
+        ))),
+        None => lines.push(Line::raw("No endpoint selected.")),
+    }
+
+    let body = Paragraph::new(lines)
+        .block(section_block("Preview", accent_pink()))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(body, area);
+}
+
+fn render_runbook(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    selected: Option<&OwlsEndpointSummary>,
+) {
+    let snapshot = app.snapshot();
+    let selected_label = selected
+        .map(|endpoint| endpoint.label.as_str())
+        .unwrap_or("none");
+    let body = Paragraph::new(vec![
+        Line::from(vec![
+            metric("Route", accent_blue()),
+            Span::raw(selected_label),
+            Span::raw("  "),
+            metric("Provider", accent_cyan()),
+            Span::raw(truncate(&snapshot.status_line, 34)),
+            Span::raw("  "),
+            metric("Venue", accent_green()),
+            Span::raw(
+                snapshot
+                    .selected_venue
+                    .map(|venue| venue.as_str())
+                    .unwrap_or("-"),
+            ),
+        ]),
+        Line::from(vec![
+            metric("Use", accent_gold()),
+            Span::raw("j/k select  enter inspect  r/R hydrate"),
+            Span::raw("  "),
+            metric("Goal", accent_pink()),
+            Span::raw("API-first board"),
+        ]),
+    ])
+    .block(section_block("Runbook", accent_pink()))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(body, area);
+}
+
+fn group_chip(group: &OwlsGroupSummary) -> Span<'static> {
     Span::styled(
-        format!("{value:+.2}"),
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
+        format!(
+            "{} {} {}/{} !{} ?{}",
+            group.group.short(),
+            group.label,
+            group.ready,
+            group.total,
+            group.error,
+            group.waiting
+        ),
+        Style::default()
+            .fg(group_color(group.group))
+            .add_modifier(Modifier::BOLD),
     )
 }
 
-fn metric_span(label: &'static str, color: Color) -> Span<'static> {
-    Span::styled(
-        format!("{label}: "),
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
-    )
-}
-
-fn section_block(title: &str, accent: Color) -> Block<'_> {
+fn section_block(title: &'static str, color: Color) -> Block<'static> {
     Block::default()
         .title(Span::styled(
-            title.to_string(),
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            title,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
-        .style(
-            Style::default()
-                .bg(Color::Rgb(16, 22, 30))
-                .fg(Color::Rgb(234, 240, 246)),
-        )
-        .border_style(Style::default().fg(Color::Rgb(74, 88, 104)))
 }
 
-fn muted_text() -> Color {
-    Color::Rgb(152, 166, 181)
+fn badge(label: &str, value: &str, color: Color) -> Span<'static> {
+    Span::styled(
+        format!("{label}:{value}"),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn metric(label: &str, color: Color) -> Span<'static> {
+    Span::styled(format!("{label} "), Style::default().fg(color))
+}
+
+fn status_color(status: &str) -> Color {
+    match status {
+        "ready" => accent_green(),
+        "waiting" => accent_gold(),
+        "error" => accent_red(),
+        _ => muted_text(),
+    }
+}
+
+fn group_color(group: OwlsEndpointGroup) -> Color {
+    match group {
+        OwlsEndpointGroup::Odds => accent_blue(),
+        OwlsEndpointGroup::Props => accent_pink(),
+        OwlsEndpointGroup::Scores => accent_green(),
+        OwlsEndpointGroup::Stats => accent_cyan(),
+        OwlsEndpointGroup::Prediction => accent_gold(),
+        OwlsEndpointGroup::History => Color::Rgb(255, 171, 145),
+        OwlsEndpointGroup::Realtime => Color::Rgb(196, 181, 253),
+    }
+}
+
+fn truncate(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_string();
+    }
+    format!("{}...", &value[..limit.saturating_sub(3)])
 }
 
 fn accent_blue() -> Color {
-    Color::Rgb(109, 180, 255)
+    Color::Rgb(90, 169, 255)
 }
 
 fn accent_cyan() -> Color {
-    Color::Rgb(94, 234, 212)
+    Color::Rgb(78, 201, 176)
 }
 
 fn accent_green() -> Color {
@@ -455,7 +376,7 @@ fn accent_green() -> Color {
 }
 
 fn accent_gold() -> Color {
-    Color::Rgb(248, 208, 119)
+    Color::Rgb(250, 204, 21)
 }
 
 fn accent_pink() -> Color {
@@ -466,12 +387,19 @@ fn accent_red() -> Color {
     Color::Rgb(248, 113, 113)
 }
 
-fn selected_position<'a>(
-    snapshot: &'a ExchangePanelSnapshot,
-    table_state: &TableState,
-) -> Option<&'a crate::domain::OpenPositionRow> {
-    table_state
-        .selected()
-        .and_then(|index| snapshot.open_positions.get(index))
-        .or_else(|| snapshot.open_positions.first())
+fn muted_text() -> Color {
+    Color::Rgb(152, 166, 181)
+}
+
+trait EmptyFallback {
+    fn if_empty(self, fallback: &str) -> String;
+}
+
+impl EmptyFallback for &str {
+    fn if_empty(self, fallback: &str) -> String {
+        if self.trim().is_empty() {
+            return String::from(fallback);
+        }
+        self.to_string()
+    }
 }

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use color_eyre::eyre::Result;
 use operator_console::app::App;
+use operator_console::native_provider::{HybridExchangeProvider, NativeExchangeProvider};
 use operator_console::recorder::{
     default_bet_recorder_command, default_bet_recorder_python, default_bet_recorder_root,
 };
@@ -36,13 +37,8 @@ fn main() -> Result<()> {
             commission_rate,
             target_profit,
             stop_loss,
-        } => Box::new(WorkerClientExchangeProvider::new(
-            if bet_recorder_command.exists() {
-                BetRecorderWorkerClient::new_command(bet_recorder_command)
-            } else {
-                BetRecorderWorkerClient::new(python_executable, bet_recorder_root)
-            },
-            WorkerConfig {
+        } => {
+            let worker_config = WorkerConfig {
                 positions_payload_path,
                 run_dir,
                 account_payload_path,
@@ -54,8 +50,19 @@ fn main() -> Result<()> {
                 stop_loss,
                 hard_margin_call_profit_floor: None,
                 warn_only_default: true,
-            },
-        )),
+            };
+            Box::new(HybridExchangeProvider::new(
+                Box::new(NativeExchangeProvider::new(worker_config.clone())),
+                Box::new(WorkerClientExchangeProvider::new(
+                    if bet_recorder_command.exists() {
+                        BetRecorderWorkerClient::new_command(bet_recorder_command)
+                    } else {
+                        BetRecorderWorkerClient::new(python_executable, bet_recorder_root)
+                    },
+                    worker_config,
+                )),
+            ))
+        }
     };
 
     let mut app = App::from_provider(provider)?;

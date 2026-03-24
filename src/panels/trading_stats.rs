@@ -951,6 +951,12 @@ fn looks_like_iso_timestamp(value: &str) -> bool {
 }
 
 fn classify_funding(bet: &TrackedBetRow) -> FundingKind {
+    match bet.funding_kind.trim().to_ascii_lowercase().as_str() {
+        "cash" => return FundingKind::Standard,
+        "free_bet" | "risk_free" | "bonus" => return FundingKind::Promo,
+        _ => {}
+    }
+
     let notes = bet.notes.to_lowercase();
     let bet_type = bet.bet_type.to_lowercase();
     let status = bet.status.to_lowercase();
@@ -1128,6 +1134,15 @@ mod tests {
     }
 
     #[test]
+    fn classifies_explicit_funding_kind_before_note_heuristics() {
+        let mut bet = TrackedBetRow::default();
+        bet.funding_kind = String::from("cash");
+        bet.notes = String::from("Free Bet SNR");
+
+        assert_eq!(classify_funding(&bet), FundingKind::Standard);
+    }
+
+    #[test]
     fn running_pnl_summary_prefers_tracked_bet_history() {
         let mut snapshot = ExchangePanelSnapshot::default();
         let mut open_row = sample_history_row();
@@ -1169,11 +1184,13 @@ mod tests {
             OpenPositionRow {
                 event_status: String::from("2026-03-10T12:00:00|Football"),
                 pnl_amount: -1.0,
+                overall_pnl_known: true,
                 ..sample_history_row()
             },
             OpenPositionRow {
                 event_status: String::from("2026-03-11T12:00:00|Football"),
                 pnl_amount: 3.5,
+                overall_pnl_known: true,
                 ..sample_history_row()
             },
         ];
@@ -1242,6 +1259,7 @@ mod tests {
             liability: 0.0,
             current_value: 0.0,
             pnl_amount: 0.0,
+            overall_pnl_known: true,
             current_back_odds: None,
             current_implied_probability: None,
             current_implied_percentage: None,

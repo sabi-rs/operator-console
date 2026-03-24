@@ -1,9 +1,13 @@
+pub mod agent_browser;
 pub mod app;
 mod app_state;
 pub mod calculator;
 pub mod domain;
 pub mod horse_matcher;
+pub mod native_provider;
+pub mod native_trading;
 pub mod oddsmatcher;
+pub mod owls;
 pub mod panels;
 pub mod provider;
 pub mod recorder;

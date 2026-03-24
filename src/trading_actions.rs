@@ -743,6 +743,7 @@ mod tests {
                 liability: 23.5,
                 current_value: 8.0,
                 pnl_amount: 1.2,
+                overall_pnl_known: true,
                 current_back_odds: Some(5.0),
                 current_implied_probability: Some(0.2),
                 current_implied_percentage: Some(20.0),

@@ -20,12 +20,12 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         (Panel::Trading, TradingSection::Positions)
     );
     let shell = if positions_owns_footer {
-        Layout::vertical([Constraint::Length(6), Constraint::Min(10)]).split(frame.area())
+        Layout::vertical([Constraint::Length(4), Constraint::Min(10)]).split(frame.area())
     } else {
         Layout::vertical([
-            Constraint::Length(6),
+            Constraint::Length(4),
             Constraint::Min(10),
-            Constraint::Length(5),
+            Constraint::Length(4),
         ])
         .split(frame.area())
     };
@@ -83,15 +83,7 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                         status_scroll,
                     )
                 }
-                TradingSection::Markets => {
-                    let snapshot = app.snapshot().clone();
-                    panels::trading_markets::render(
-                        frame,
-                        layout[1],
-                        &snapshot,
-                        app.open_position_table_state(),
-                    )
-                }
+                TradingSection::Markets => panels::trading_markets::render(frame, layout[1], app),
                 TradingSection::OddsMatcher => panels::oddsmatcher::render(frame, layout[1], app),
                 TradingSection::HorseMatcher => {
                     panels::horse_matcher::render(frame, layout[1], app)
@@ -125,10 +117,9 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let footer = Paragraph::new(vec![
         Line::from(vec![
             Span::styled("󱂬 ", Style::default().fg(accent_blue())),
-            Span::raw(app.status_message()),
+            Span::raw(truncate_line(app.status_message(), 120)),
         ]),
-        Line::raw("q quit • o observability • r refresh cache • R recapture live"),
-        Line::raw("s start recorder • x stop recorder • v live view • enter edit • esc cancel"),
+        Line::raw("q quit • o obs • r cache • R live • s start • x stop • v overlay • enter • esc"),
     ])
     .block(shell_block("󰘳 Keymap", accent_gold()).padding(Padding::horizontal(1)))
     .wrap(Wrap { trim: true });
@@ -157,96 +148,79 @@ fn render_subnav(frame: &mut Frame<'_>, area: Rect, titles: &[&str], selected: u
 }
 
 fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let layout = Layout::horizontal([
-        Constraint::Percentage(42),
-        Constraint::Percentage(28),
-        Constraint::Percentage(30),
-    ])
-    .split(area);
     let runtime = app.snapshot().runtime.as_ref();
+    let owls_ready = app
+        .owls_dashboard()
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.status == "ready")
+        .count();
+    let owls_total = app.owls_dashboard().endpoints.len();
 
-    let focus = Paragraph::new(vec![
-        Line::from(vec![Span::styled(
-            active_context_label(app),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )]),
+    let body = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("󰥔 View ", Style::default().fg(muted_text())),
-            Span::raw(panel_subtitle(app)),
-        ]),
-        Line::from(vec![
-            Span::styled("󰅐 Updated ", Style::default().fg(muted_text())),
-            Span::styled(last_refresh_label(app), Style::default().fg(accent_green())),
-            Span::raw("   "),
-            Span::styled("󰞇 Pos ", Style::default().fg(muted_text())),
             Span::styled(
-                app.snapshot().open_positions.len().to_string(),
+                active_context_label(app),
                 Style::default()
-                    .fg(accent_cyan())
+                    .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("   "),
-            Span::styled("󰍵 Dec ", Style::default().fg(muted_text())),
-            Span::styled(
-                app.snapshot().decisions.len().to_string(),
-                Style::default()
-                    .fg(accent_pink())
-                    .add_modifier(Modifier::BOLD),
+            Span::raw("  "),
+            badge_line(
+                "󰒋 Worker",
+                &worker_status_label(app),
+                worker_status_color(app),
             ),
+            Span::raw("  "),
+            badge_line(
+                "󰑓 Recorder",
+                &format!("{:?}", app.recorder_status()),
+                recorder_status_color(app.recorder_status()),
+            ),
+            Span::raw("  "),
+            badge_line("󰆼 Source", source_mode(app), accent_gold()),
         ]),
         Line::from(vec![
-            Span::styled("󰕮 Panel ", Style::default().fg(muted_text())),
-            Span::raw(panel_cycle_label(app)),
+            badge_line("󰅐 Updated", &last_refresh_label(app), accent_green()),
+            Span::raw("  "),
+            badge_line(
+                "󰞇 Pos",
+                &app.snapshot().open_positions.len().to_string(),
+                accent_cyan(),
+            ),
+            Span::raw("  "),
+            badge_line(
+                "󰍵 Dec",
+                &app.snapshot().decisions.len().to_string(),
+                accent_pink(),
+            ),
+            Span::raw("  "),
+            badge_line("󰑐 Mode", &refresh_kind_label(app), accent_gold()),
+            Span::raw("  "),
+            badge_line(
+                "󰄬 Fresh",
+                if runtime.map(|summary| summary.stale).unwrap_or(false) {
+                    "stale"
+                } else {
+                    "fresh"
+                },
+                if runtime.map(|summary| summary.stale).unwrap_or(false) {
+                    accent_red()
+                } else {
+                    accent_green()
+                },
+            ),
+            Span::raw("  "),
+            badge_line(
+                "󰇚 Owls",
+                &format!("{owls_ready}/{owls_total}"),
+                accent_blue(),
+            ),
         ]),
     ])
-    .block(shell_block("󰘳 Focus", accent_blue()).padding(Padding::horizontal(1)));
-    frame.render_widget(focus, layout[0]);
-
-    let runtime_summary = Paragraph::new(vec![
-        badge_line(
-            "󰒋 Worker",
-            &worker_status_label(app),
-            worker_status_color(app),
-        ),
-        badge_line(
-            "󰑓 Recorder",
-            &format!("{:?}", app.recorder_status()),
-            recorder_status_color(app.recorder_status()),
-        ),
-        badge_line("󰆼 Source", source_mode(app), accent_gold()),
-    ])
-    .block(shell_block("󱎆 Runtime", accent_pink()).padding(Padding::horizontal(1)));
-    frame.render_widget(runtime_summary, layout[1]);
-
-    let refresh = Paragraph::new(vec![
-        badge_line("󰅐 Last refresh", &last_refresh_label(app), accent_green()),
-        badge_line("󰑐 Mode", &refresh_kind_label(app), accent_gold()),
-        badge_line(
-            "󰑮 Iteration",
-            &runtime
-                .and_then(|summary| summary.watcher_iteration)
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| String::from("-")),
-            accent_cyan(),
-        ),
-        badge_line(
-            "󰄬 Freshness",
-            if runtime.map(|summary| summary.stale).unwrap_or(false) {
-                "stale"
-            } else {
-                "fresh"
-            },
-            if runtime.map(|summary| summary.stale).unwrap_or(false) {
-                accent_red()
-            } else {
-                accent_green()
-            },
-        ),
-    ])
-    .block(shell_block("󰐹 Snapshot", accent_green()).padding(Padding::horizontal(1)));
-    frame.render_widget(refresh, layout[2]);
+    .block(shell_block("Status", accent_blue()).padding(Padding::horizontal(1)))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(body, area);
 }
 
 fn shell_block(title: &'static str, color: Color) -> Block<'static> {
@@ -304,50 +278,21 @@ fn accent_red() -> Color {
     Color::Rgb(248, 113, 113)
 }
 
-fn badge_line(label: &'static str, value: &str, accent: Color) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{label}: "), Style::default().fg(muted_text())),
-        Span::styled(
-            value.to_string(),
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        ),
-    ])
+fn badge_line(label: &'static str, value: &str, accent: Color) -> Span<'static> {
+    Span::styled(
+        format!("{label}:{value}"),
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+    )
 }
 
-fn panel_subtitle(app: &App) -> &'static str {
-    match app.active_panel() {
-        Panel::Trading => match app.active_trading_section() {
-            TradingSection::Accounts => "Venue state, exchange coverage, and selection context.",
-            TradingSection::Positions => "Live positions, exit readiness, and watch thresholds.",
-            TradingSection::Markets => "Markets and watch candidates from the current provider.",
-            TradingSection::OddsMatcher => {
-                "Live bookmaker/exchange opportunities from OddsMatcher."
-            }
-            TradingSection::HorseMatcher => {
-                "Internal horse-racing matches built from live bookmaker and exchange tabs."
-            }
-            TradingSection::Stats => "Trading account and performance rollups.",
-            TradingSection::Calculator => {
-                "Native matched-betting calculator and scenario analysis."
-            }
-            TradingSection::Recorder => "Recorder controls and live capture configuration.",
-        },
-        Panel::Observability => "Workers, watcher freshness, and operator diagnostics.",
+fn truncate_line(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
     }
-}
-
-fn panel_cycle_label(app: &App) -> String {
-    Panel::ALL
-        .iter()
-        .map(|panel| {
-            if *panel == app.active_panel() {
-                format!("[{}]", panel.label())
-            } else {
-                panel.label().to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" / ")
 }
 
 fn active_context_label(app: &App) -> String {

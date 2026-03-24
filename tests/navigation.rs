@@ -150,6 +150,30 @@ fn enter_opens_trading_action_overlay_for_active_position() {
     assert_eq!(overlay.seed.venue, VenueId::Smarkets);
 }
 
+#[test]
+fn markets_navigation_uses_owls_endpoint_selection() {
+    let mut app = App::from_provider(StaticProvider {
+        snapshot: positions_snapshot(),
+    })
+    .expect("app");
+    app.set_active_panel(Panel::Trading);
+    app.set_trading_section(TradingSection::Markets);
+
+    let first_label = app
+        .selected_owls_endpoint()
+        .map(|endpoint| endpoint.label.clone())
+        .expect("markets should seed the first Owls endpoint");
+
+    app.handle_key(KeyCode::Down);
+    let second_label = app
+        .selected_owls_endpoint()
+        .map(|endpoint| endpoint.label.clone())
+        .expect("markets should keep an Owls selection");
+
+    assert_ne!(first_label, second_label);
+    assert_eq!(app.selected_open_position_row(), Some(0));
+}
+
 fn positions_snapshot() -> ExchangePanelSnapshot {
     ExchangePanelSnapshot {
         worker: WorkerSummary {
@@ -184,6 +208,7 @@ fn positions_snapshot() -> ExchangePanelSnapshot {
             odds: 2.375,
             stake: 10.0,
             status: String::from("cash_out"),
+            funding_kind: String::from("cash"),
             current_cashout_value: Some(16.16),
             supports_cash_out: true,
         }],
@@ -215,6 +240,7 @@ fn sample_row(event: &str) -> OpenPositionRow {
         liability: 5.0,
         current_value: 0.0,
         pnl_amount: 0.0,
+        overall_pnl_known: true,
         current_back_odds: Some(2.0),
         current_implied_probability: Some(0.5),
         current_implied_percentage: Some(50.0),

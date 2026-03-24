@@ -11,19 +11,21 @@ use ratatui::widgets::{ListState, TableState};
 use ratatui::{Frame, Terminal};
 use reqwest::blocking::Client;
 
-use crate::calculator::{self, BetType, Mode as CalculatorMode};
 pub use crate::app_state::{
     CalculatorEditorState, CalculatorField, CalculatorSourceContext, CalculatorState,
     ObservabilitySection, OddsMatcherFocus, Panel, PositionsFocus, TradingActionField,
     TradingActionOverlayState, TradingSection,
 };
+use crate::calculator::{self, BetType, Mode as CalculatorMode};
 use crate::domain::{
     ExchangePanelSnapshot, OpenPositionRow, TrackedBetRow, TrackedLeg, VenueId, WorkerStatus,
 };
 use crate::horse_matcher::{self, HorseMatcherEditorState, HorseMatcherField, HorseMatcherQuery};
+use crate::native_provider::{HybridExchangeProvider, NativeExchangeProvider};
 use crate::oddsmatcher::{
     self, GetBestMatchesVariables, OddsMatcherEditorState, OddsMatcherField, OddsMatcherRow,
 };
+use crate::owls::{self, OwlsDashboard, OwlsEndpointSummary};
 use crate::panels::trading_positions::{
     active_position_row_count, next_actionable_cash_out_bet_id, selected_active_position_seed,
 };
@@ -57,6 +59,9 @@ pub struct App {
     recorder_status: RecorderStatus,
     calculator: CalculatorState,
     oddsmatcher_client: Client,
+    owls_client: Client,
+    owls_dashboard: OwlsDashboard,
+    owls_endpoint_table_state: TableState,
     oddsmatcher_query_path: PathBuf,
     oddsmatcher_query_note: String,
     oddsmatcher_query: GetBestMatchesVariables,
@@ -92,6 +97,9 @@ pub struct App {
 }
 
 const MAX_EVENT_HISTORY: usize = 25;
+const RECORDER_REFRESH_INTERVAL_IDLE: Duration = Duration::from_secs(5);
+const RECORDER_REFRESH_INTERVAL_ACTIVE: Duration = Duration::from_secs(2);
+const RECORDER_REFRESH_INTERVAL_BOOTSTRAP: Duration = Duration::from_secs(1);
 
 impl Default for App {
     fn default() -> Self {
@@ -263,6 +271,22 @@ impl App {
                     .build()
                     .unwrap_or_else(|_| Client::new())
             }),
+            owls_client: owls::build_client().unwrap_or_else(|_| {
+                Client::builder()
+                    .connect_timeout(Duration::from_secs(5))
+                    .timeout(Duration::from_secs(15))
+                    .build()
+                    .unwrap_or_else(|_| Client::new())
+            }),
+            owls_dashboard: {
+                let dashboard = OwlsDashboard::default();
+                dashboard
+            },
+            owls_endpoint_table_state: {
+                let mut state = TableState::default();
+                state.select(Some(0));
+                state
+            },
             oddsmatcher_query_path,
             oddsmatcher_query_note,
             oddsmatcher_query,
@@ -312,6 +336,20 @@ impl App {
         &self.snapshot
     }
 
+    pub fn owls_dashboard(&self) -> &OwlsDashboard {
+        &self.owls_dashboard
+    }
+
+    pub fn selected_owls_endpoint(&self) -> Option<&OwlsEndpointSummary> {
+        self.owls_endpoint_table_state
+            .selected()
+            .and_then(|index| self.owls_dashboard.endpoints.get(index))
+    }
+
+    pub fn owls_endpoint_table_state(&mut self) -> &mut TableState {
+        &mut self.owls_endpoint_table_state
+    }
+
     pub fn is_running(&self) -> bool {
         self.running
     }
@@ -342,6 +380,9 @@ impl App {
             && section != TradingSection::HorseMatcher
         {
             self.trading_action_overlay = None;
+        }
+        if section == TradingSection::Markets {
+            self.clamp_selected_owls_endpoint();
         }
     }
 
@@ -779,6 +820,9 @@ impl App {
     }
 
     pub fn refresh(&mut self) -> Result<()> {
+        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Markets {
+            return self.refresh_owls_dashboard();
+        }
         if self.active_panel == Panel::Trading
             && self.trading_section == TradingSection::OddsMatcher
         {
@@ -798,6 +842,9 @@ impl App {
     }
 
     pub fn refresh_live(&mut self) -> Result<()> {
+        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Markets {
+            return self.refresh_owls_dashboard();
+        }
         if self.active_panel == Panel::Trading
             && self.trading_section == TradingSection::OddsMatcher
         {
@@ -851,6 +898,18 @@ impl App {
                 Err(error)
             }
         }
+    }
+
+    fn refresh_owls_dashboard(&mut self) -> Result<()> {
+        self.owls_dashboard = owls::fetch_dashboard(&self.owls_client);
+        self.clamp_selected_owls_endpoint();
+        self.status_message = self.owls_dashboard.status_line.clone();
+        self.status_scroll = 0;
+        self.record_event(format!(
+            "Owls markets refresh completed for {}.",
+            self.owls_dashboard.sport
+        ));
+        Ok(())
     }
 
     pub fn cash_out_next_actionable_bet(&mut self) -> Result<()> {
@@ -914,8 +973,13 @@ impl App {
         self.record_event("Recorder process started.");
         match self.provider.handle(ProviderRequest::LoadDashboard) {
             Ok(snapshot) => {
+                let waiting_for_snapshot = snapshot.worker.status == WorkerStatus::Busy;
                 self.replace_snapshot(snapshot);
-                self.last_recorder_refresh_at = Some(Instant::now());
+                self.last_recorder_refresh_at = if waiting_for_snapshot {
+                    None
+                } else {
+                    Some(Instant::now())
+                };
                 self.status_message = self.snapshot.status_line.clone();
                 self.record_event(format!(
                     "Recorder dashboard loaded with {} refresh.",
@@ -953,6 +1017,20 @@ impl App {
         self.replace_snapshot(snapshot);
         self.record_event("Recorder stopped; restored stub dashboard.");
         Ok(())
+    }
+
+    fn request_quit(&mut self) {
+        self.recorder_status = self.recorder_supervisor.poll_status();
+        if self.recorder_status == RecorderStatus::Running {
+            if let Err(error) = self.stop_recorder() {
+                self.status_message = format!("Recorder stop failed: {error}");
+                self.recorder_status = RecorderStatus::Error;
+                self.record_event(format!("Recorder stop failed during quit: {error}"));
+                return;
+            }
+        }
+        self.record_event("Quit requested.");
+        self.running = false;
     }
 
     pub fn reload_recorder_config(&mut self) -> Result<()> {
@@ -1301,12 +1379,12 @@ impl App {
         }
 
         match key_code {
-            KeyCode::Char('q') => self.running = false,
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Esc => {
                 if self.live_view_overlay_visible {
                     self.live_view_overlay_visible = false;
                 } else {
-                    self.running = false;
+                    self.request_quit();
                 }
             }
             KeyCode::Char('o') => self.toggle_observability_panel(),
@@ -1321,6 +1399,15 @@ impl App {
                     self.begin_horse_matcher_edit();
                 } else if self.is_horse_matcher_results_context() {
                     self.load_calculator_from_selected_horse_matcher();
+                } else if self.active_panel == Panel::Trading
+                    && self.trading_section == TradingSection::Markets
+                {
+                    if let Some(endpoint) = self.selected_owls_endpoint() {
+                        self.status_message = format!(
+                            "{} {} [{}] {}",
+                            endpoint.method, endpoint.path, endpoint.status, endpoint.description
+                        );
+                    }
                 } else if self.active_panel == Panel::Trading
                     && self.trading_section == TradingSection::Positions
                     && self.positions_focus == PositionsFocus::Active
@@ -1475,7 +1562,7 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => match (self.active_panel, self.trading_section) {
                 (Panel::Trading, TradingSection::Accounts) => self.select_next_exchange_row(),
                 (Panel::Trading, TradingSection::Positions) => self.select_next_positions_row(),
-                (Panel::Trading, TradingSection::Markets) => self.select_next_open_position_row(),
+                (Panel::Trading, TradingSection::Markets) => self.select_next_owls_endpoint(),
                 (Panel::Trading, TradingSection::OddsMatcher) => {
                     if self.oddsmatcher_focus == OddsMatcherFocus::Filters {
                         self.oddsmatcher_editor.select_next_field();
@@ -1501,9 +1588,7 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => match (self.active_panel, self.trading_section) {
                 (Panel::Trading, TradingSection::Accounts) => self.select_previous_exchange_row(),
                 (Panel::Trading, TradingSection::Positions) => self.select_previous_positions_row(),
-                (Panel::Trading, TradingSection::Markets) => {
-                    self.select_previous_open_position_row()
-                }
+                (Panel::Trading, TradingSection::Markets) => self.select_previous_owls_endpoint(),
                 (Panel::Trading, TradingSection::OddsMatcher) => {
                     if self.oddsmatcher_focus == OddsMatcherFocus::Filters {
                         self.oddsmatcher_editor.select_previous_field();
@@ -1730,6 +1815,36 @@ impl App {
         self.open_position_table_state.select(Some(previous_index));
     }
 
+    pub fn select_next_owls_endpoint(&mut self) {
+        if self.owls_dashboard.endpoints.is_empty() {
+            self.owls_endpoint_table_state.select(None);
+            return;
+        }
+
+        let next_index = match self.owls_endpoint_table_state.selected() {
+            Some(index) if index + 1 < self.owls_dashboard.endpoints.len() => index + 1,
+            Some(index) => index,
+            None => 0,
+        };
+
+        self.owls_endpoint_table_state.select(Some(next_index));
+    }
+
+    pub fn select_previous_owls_endpoint(&mut self) {
+        if self.owls_dashboard.endpoints.is_empty() {
+            self.owls_endpoint_table_state.select(None);
+            return;
+        }
+
+        let previous_index = match self.owls_endpoint_table_state.selected() {
+            Some(index) if index > 0 => index - 1,
+            Some(index) => index,
+            None => 0,
+        };
+
+        self.owls_endpoint_table_state.select(Some(previous_index));
+    }
+
     pub fn select_next_positions_row(&mut self) {
         match self.positions_focus {
             PositionsFocus::Active => self.select_next_open_position_row(),
@@ -1865,6 +1980,18 @@ impl App {
         self.horse_matcher_table_state.select(Some(previous_index));
     }
 
+    fn clamp_selected_owls_endpoint(&mut self) {
+        if self.owls_dashboard.endpoints.is_empty() {
+            self.owls_endpoint_table_state.select(None);
+            return;
+        }
+
+        match self.owls_endpoint_table_state.selected() {
+            Some(index) if index < self.owls_dashboard.endpoints.len() => {}
+            _ => self.owls_endpoint_table_state.select(Some(0)),
+        }
+    }
+
     fn sync_selected_venue(&mut self) {
         let Some(selected_index) = self.exchange_list_state.selected() else {
             return;
@@ -1979,9 +2106,19 @@ impl App {
     }
 
     fn recorder_refresh_due(&self) -> bool {
-        let refresh_interval = Duration::from_secs(1);
+        let refresh_interval = self.recorder_refresh_interval();
         self.last_recorder_refresh_at
             .is_none_or(|last| last.elapsed() >= refresh_interval)
+    }
+
+    fn recorder_refresh_interval(&self) -> Duration {
+        if self.waiting_for_first_snapshot() {
+            return RECORDER_REFRESH_INTERVAL_BOOTSTRAP;
+        }
+        if active_position_row_count(&self.snapshot) > 0 {
+            return RECORDER_REFRESH_INTERVAL_ACTIVE;
+        }
+        RECORDER_REFRESH_INTERVAL_IDLE
     }
 
     fn waiting_for_first_snapshot(&self) -> bool {
@@ -2720,6 +2857,16 @@ fn merge_historical_positions(snapshot: &ExchangePanelSnapshot) -> Vec<OpenPosit
         .filter(|tracked_bet| tracked_bet_is_closed(tracked_bet))
     {
         let row = historical_position_from_tracked_bet(tracked_bet);
+        if let Some(existing_index) = rows.iter().position(|existing_row| {
+            !existing_row.overall_pnl_known
+                && historical_position_matches_smarkets_fallback(existing_row, &row)
+        }) {
+            let previous_key = historical_position_key(&rows[existing_index]);
+            seen.remove(&previous_key);
+            rows[existing_index] = row.clone();
+            seen.insert(historical_position_key(&row));
+            continue;
+        }
         let row_key = historical_position_key(&row);
         if seen.insert(row_key) {
             rows.push(row);
@@ -2735,23 +2882,57 @@ fn merge_historical_positions(snapshot: &ExchangePanelSnapshot) -> Vec<OpenPosit
 
 fn historical_position_key(row: &OpenPositionRow) -> String {
     format!(
-        "{}|{}|{}|{}|{:.2}|{:.2}|{:.2}",
+        "{}|{}|{}|{}|{:.2}|{:.2}|{:.2}|{}",
         canonical_history_text(&row.event),
         canonical_history_text(&row.market),
         canonical_history_text(&row.contract),
         row.live_clock.trim(),
         row.stake,
         row.price,
-        row.pnl_amount
+        row.pnl_amount,
+        row.overall_pnl_known
     )
+}
+
+fn historical_position_matches_smarkets_fallback(
+    existing_row: &OpenPositionRow,
+    tracked_row: &OpenPositionRow,
+) -> bool {
+    canonical_history_text(&existing_row.event) == canonical_history_text(&tracked_row.event)
+        && canonical_history_market(&existing_row.market)
+            == canonical_history_market(&tracked_row.market)
+        && canonical_history_text(&existing_row.contract)
+            == canonical_history_text(&tracked_row.contract)
+        && existing_row.live_clock.trim() == tracked_row.live_clock.trim()
+}
+
+fn canonical_history_market(value: &str) -> String {
+    let normalized = canonical_history_text(value);
+    if matches!(
+        normalized.as_str(),
+        "full time result" | "match odds" | "to win" | "winner"
+    ) {
+        return String::from("match odds");
+    }
+    normalized
 }
 
 fn canonical_history_text(value: &str) -> String {
     value
+        .to_lowercase()
+        .replace("vs", "v")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .to_lowercase()
 }
 
 fn tracked_bet_is_closed(tracked_bet: &TrackedBetRow) -> bool {
@@ -2813,6 +2994,7 @@ fn historical_position_from_tracked_bet(tracked_bet: &TrackedBetRow) -> OpenPosi
         liability,
         current_value,
         pnl_amount,
+        overall_pnl_known: true,
         current_back_odds: if price > 0.0 { Some(price) } else { None },
         current_implied_probability: if price > 0.0 { Some(1.0 / price) } else { None },
         current_implied_percentage: if price > 0.0 {
@@ -2931,23 +3113,27 @@ fn previous_from<T: Copy + PartialEq>(value: T, all: &[T]) -> T {
 
 fn default_recorder_provider_factory() -> Box<ProviderFactory> {
     Box::new(|config: &RecorderConfig| {
-        Box::new(WorkerClientExchangeProvider::new(
-            BetRecorderWorkerClient::new_command(config.command.clone()),
-            WorkerConfig {
-                positions_payload_path: None,
-                run_dir: Some(config.run_dir.clone()),
-                account_payload_path: None,
-                open_bets_payload_path: None,
-                companion_legs_path: config.companion_legs_path.clone(),
-                agent_browser_session: Some(config.session.clone()),
-                commission_rate: config.commission_rate.parse::<f64>().unwrap_or(0.0),
-                target_profit: config.target_profit.parse::<f64>().unwrap_or(1.0),
-                stop_loss: config.stop_loss.parse::<f64>().unwrap_or(1.0),
-                hard_margin_call_profit_floor: parse_optional_f64(
-                    &config.hard_margin_call_profit_floor,
-                ),
-                warn_only_default: config.warn_only_default,
-            },
+        let worker_config = WorkerConfig {
+            positions_payload_path: None,
+            run_dir: Some(config.run_dir.clone()),
+            account_payload_path: None,
+            open_bets_payload_path: None,
+            companion_legs_path: config.companion_legs_path.clone(),
+            agent_browser_session: Some(config.session.clone()),
+            commission_rate: config.commission_rate.parse::<f64>().unwrap_or(0.0),
+            target_profit: config.target_profit.parse::<f64>().unwrap_or(1.0),
+            stop_loss: config.stop_loss.parse::<f64>().unwrap_or(1.0),
+            hard_margin_call_profit_floor: parse_optional_f64(
+                &config.hard_margin_call_profit_floor,
+            ),
+            warn_only_default: config.warn_only_default,
+        };
+        Box::new(HybridExchangeProvider::new(
+            Box::new(NativeExchangeProvider::new(worker_config.clone())),
+            Box::new(WorkerClientExchangeProvider::new(
+                BetRecorderWorkerClient::new_command(config.command.clone()),
+                worker_config,
+            )),
         )) as Box<dyn ExchangeProvider>
     })
 }
@@ -2976,8 +3162,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::domain::{
-        ExchangePanelSnapshot, RuntimeSummary, TrackedBetRow, VenueId, VenueStatus, VenueSummary,
-        WorkerStatus, WorkerSummary,
+        ExchangePanelSnapshot, OpenPositionRow, RuntimeSummary, TrackedBetRow, VenueId,
+        VenueStatus, VenueSummary, WorkerStatus, WorkerSummary,
     };
     use crate::provider::{ExchangeProvider, ProviderRequest};
     use crate::recorder::{RecorderConfig, RecorderStatus, RecorderSupervisor};
@@ -3106,7 +3292,7 @@ mod tests {
         .expect("app");
 
         app.recorder_status = RecorderStatus::Running;
-        app.last_recorder_refresh_at = Some(Instant::now() - Duration::from_secs(2));
+        app.last_recorder_refresh_at = Some(Instant::now() - Duration::from_secs(6));
 
         app.poll_recorder();
 
@@ -3154,7 +3340,7 @@ mod tests {
         .expect("app");
 
         app.recorder_status = RecorderStatus::Disabled;
-        app.last_recorder_refresh_at = Some(Instant::now() - Duration::from_secs(2));
+        app.last_recorder_refresh_at = Some(Instant::now() - Duration::from_secs(6));
 
         app.poll_recorder();
 
@@ -3252,12 +3438,69 @@ mod tests {
         app.set_active_panel(Panel::Trading);
         app.set_trading_section(TradingSection::OddsMatcher);
         app.recorder_status = RecorderStatus::Running;
-        app.last_recorder_refresh_at = Some(Instant::now() - Duration::from_secs(2));
+        app.last_recorder_refresh_at = Some(Instant::now() - Duration::from_secs(6));
 
         app.poll_recorder();
 
         assert_eq!(app.snapshot().status_line, "Auto refreshed dashboard");
         assert!(app.oddsmatcher_rows().is_empty());
+        assert_eq!(*cached_refresh_count.borrow(), 1);
+        assert_eq!(*live_refresh_count.borrow(), 0);
+    }
+
+    #[test]
+    fn start_recorder_with_busy_bootstrap_snapshot_triggers_immediate_auto_refresh() {
+        let cached_refresh_count = Rc::new(RefCell::new(0));
+        let live_refresh_count = Rc::new(RefCell::new(0));
+        let provider_cached_refresh_count = cached_refresh_count.clone();
+        let provider_live_refresh_count = live_refresh_count.clone();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut busy_snapshot = sample_snapshot("Recorder started; waiting for first snapshot.");
+        busy_snapshot.worker.status = WorkerStatus::Busy;
+        busy_snapshot.worker.detail = String::from("Recorder started; waiting for first snapshot.");
+
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(RefreshingProvider {
+                cached_refresh_count: cached_refresh_count.clone(),
+                live_refresh_count: live_refresh_count.clone(),
+                load_snapshot: sample_snapshot("Initial dashboard"),
+                cached_refresh_snapshot: sample_snapshot("Auto refreshed dashboard"),
+                live_refresh_snapshot: sample_snapshot("Live refreshed dashboard"),
+            }),
+            Box::new(|| {
+                Box::new(RefreshingProvider {
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: sample_snapshot("Stub dashboard"),
+                    cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                }) as Box<dyn ExchangeProvider>
+            }),
+            Box::new(move |_| {
+                Box::new(RefreshingProvider {
+                    cached_refresh_count: provider_cached_refresh_count.clone(),
+                    live_refresh_count: provider_live_refresh_count.clone(),
+                    load_snapshot: busy_snapshot.clone(),
+                    cached_refresh_snapshot: sample_snapshot("Auto refreshed dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Live refreshed dashboard"),
+                }) as Box<dyn ExchangeProvider>
+            }),
+            Box::new(RunningSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        app.start_recorder().expect("start recorder");
+
+        assert_eq!(app.snapshot().worker.status, WorkerStatus::Busy);
+        assert_eq!(app.last_recorder_refresh_at, None);
+
+        app.poll_recorder();
+
+        assert_eq!(app.snapshot().status_line, "Auto refreshed dashboard");
+        assert_eq!(app.snapshot().worker.status, WorkerStatus::Ready);
         assert_eq!(*cached_refresh_count.borrow(), 1);
         assert_eq!(*live_refresh_count.borrow(), 0);
     }
@@ -3600,6 +3843,84 @@ mod tests {
             app.snapshot().historical_positions[0].live_clock,
             "2026-03-20T15:57:00Z"
         );
+    }
+
+    #[test]
+    fn tracked_bet_history_replaces_smarkets_only_fallback_row() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut snapshot = sample_snapshot("Initial dashboard");
+        snapshot.historical_positions = vec![OpenPositionRow {
+            event: String::from("Arsenal vs Everton"),
+            event_status: String::from("Settled"),
+            event_url: String::new(),
+            contract: String::from("Draw"),
+            market: String::from("Full-time result"),
+            status: String::from("lost"),
+            market_status: String::from("settled"),
+            is_in_play: false,
+            price: 3.35,
+            stake: 9.91,
+            liability: 23.29,
+            current_value: -23.29,
+            pnl_amount: -23.29,
+            overall_pnl_known: false,
+            current_back_odds: Some(3.35),
+            current_implied_probability: Some(1.0 / 3.35),
+            current_implied_percentage: Some(100.0 / 3.35),
+            current_buy_odds: Some(3.35),
+            current_buy_implied_probability: Some(1.0 / 3.35),
+            current_sell_odds: None,
+            current_sell_implied_probability: None,
+            current_score: String::new(),
+            current_score_home: None,
+            current_score_away: None,
+            live_clock: String::from("2026-03-22T16:10:26Z"),
+            can_trade_out: false,
+        }];
+        snapshot.tracked_bets = vec![TrackedBetRow {
+            bet_id: String::from("bet-arsenal-everton-draw"),
+            group_id: String::from("group-arsenal-everton-draw"),
+            event: String::from("Arsenal vs Everton"),
+            market: String::from("Match Odds"),
+            selection: String::from("Draw"),
+            status: String::from("lost"),
+            placed_at: String::from("2026-03-22T15:05:00Z"),
+            settled_at: String::from("2026-03-22T16:10:26Z"),
+            stake_gbp: Some(10.0),
+            realised_pnl_gbp: Some(8.71),
+            back_price: Some(4.2),
+            lay_price: Some(3.35),
+            ..TrackedBetRow::default()
+        }];
+        let replacement_row =
+            super::historical_position_from_tracked_bet(&snapshot.tracked_bets[0]);
+        assert!(super::historical_position_matches_smarkets_fallback(
+            &snapshot.historical_positions[0],
+            &replacement_row
+        ));
+
+        let app = App::with_dependencies_and_storage(
+            Box::new(RefreshingProvider {
+                cached_refresh_count: Rc::new(RefCell::new(0)),
+                live_refresh_count: Rc::new(RefCell::new(0)),
+                load_snapshot: snapshot,
+                cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                live_refresh_snapshot: sample_snapshot("Stub dashboard"),
+            }),
+            Box::new(|| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
+            Box::new(|_| Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider>),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        assert_eq!(app.snapshot().historical_positions.len(), 1);
+        assert!(app.snapshot().historical_positions[0].overall_pnl_known);
+        assert_eq!(app.snapshot().historical_positions[0].pnl_amount, 8.71);
+        assert_eq!(app.snapshot().historical_positions[0].stake, 10.0);
+        assert_eq!(app.snapshot().historical_positions[0].price, 4.2);
     }
 
     fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {
