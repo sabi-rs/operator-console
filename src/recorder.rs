@@ -66,6 +66,8 @@ const RECORDER_TRANSIENT_FILES: [&str; 5] = [
 ];
 const RECORDER_SCREENSHOTS_DIR: &str = "screenshots";
 const WATCHER_STARTUP_GRACE_PERIOD: Duration = Duration::from_millis(50);
+const WATCHER_SPAWN_RETRY_DELAY: Duration = Duration::from_millis(25);
+const WATCHER_SPAWN_MAX_ATTEMPTS: usize = 5;
 
 fn config_root() -> PathBuf {
     env::var_os("XDG_CONFIG_HOME")
@@ -546,7 +548,8 @@ fn spawn_recorder_watcher(config: &RecorderConfig, log_path: &Path) -> Result<Ch
         .try_clone()
         .map_err(|error| eyre!("failed to clone recorder watcher log handle: {error}"))?;
 
-    let mut child = Command::new(&config.command)
+    let mut command = Command::new(&config.command);
+    command
         .arg("watch-smarkets-session")
         .arg("--run-dir")
         .arg(&config.run_dir)
@@ -568,9 +571,9 @@ fn spawn_recorder_watcher(config: &RecorderConfig, log_path: &Path) -> Result<Ch
         .arg("--stop-loss")
         .arg(&config.stop_loss)
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(log_file))
-        .spawn()
-        .map_err(|error| eyre!("failed to start recorder watcher: {error}"))?;
+        .stderr(Stdio::from(log_file));
+
+    let mut child = spawn_recorder_command_with_retry(&mut command)?;
 
     thread::sleep(WATCHER_STARTUP_GRACE_PERIOD);
     match child
@@ -589,6 +592,24 @@ fn spawn_recorder_watcher(config: &RecorderConfig, log_path: &Path) -> Result<Ch
             ))
         }
     }
+}
+
+fn spawn_recorder_command_with_retry(command: &mut Command) -> Result<Child> {
+    let mut attempts = 0;
+    loop {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if is_text_file_busy_error(&error) && attempts + 1 < WATCHER_SPAWN_MAX_ATTEMPTS => {
+                attempts += 1;
+                thread::sleep(WATCHER_SPAWN_RETRY_DELAY);
+            }
+            Err(error) => return Err(eyre!("failed to start recorder watcher: {error}")),
+        }
+    }
+}
+
+fn is_text_file_busy_error(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(26))
 }
 
 fn stage_run_dir_for_startup(run_dir: &Path) -> Result<RunDirBackup> {
