@@ -148,6 +148,21 @@ fn enter_opens_markets_overlay_and_escape_closes_it() {
 }
 
 #[test]
+fn q_closes_markets_overlay_before_quitting() {
+    let mut app = App::default();
+    app.set_active_panel(Panel::Trading);
+    app.set_trading_section(TradingSection::Markets);
+
+    app.handle_key(KeyCode::Enter);
+    assert!(app.markets_overlay_visible());
+
+    app.handle_key(KeyCode::Char('q'));
+
+    assert!(!app.markets_overlay_visible());
+    assert!(app.is_running());
+}
+
+#[test]
 fn enter_opens_trading_action_overlay_for_active_position() {
     let mut app = App::from_provider(StaticProvider {
         snapshot: positions_snapshot(),
@@ -163,6 +178,24 @@ fn enter_opens_trading_action_overlay_for_active_position() {
         .expect("positions enter should open trading action overlay");
     assert_eq!(overlay.seed.selection_name, "Selection");
     assert_eq!(overlay.seed.venue, VenueId::Smarkets);
+}
+
+#[test]
+fn q_closes_trading_action_overlay_before_quitting() {
+    let mut app = App::from_provider(StaticProvider {
+        snapshot: positions_snapshot(),
+    })
+    .expect("app");
+    app.set_active_panel(Panel::Trading);
+    app.set_trading_section(TradingSection::Positions);
+
+    app.handle_key(KeyCode::Enter);
+    assert!(app.trading_action_overlay().is_some());
+
+    app.handle_key(KeyCode::Char('q'));
+
+    assert!(app.trading_action_overlay().is_none());
+    assert!(app.is_running());
 }
 
 #[test]
@@ -236,6 +269,8 @@ fn positions_snapshot() -> ExchangePanelSnapshot {
         tracked_bets: Vec::new(),
         exit_policy: Default::default(),
         exit_recommendations: Vec::new(),
+        external_quotes: Vec::new(),
+        external_live_events: Vec::new(),
         horse_matcher: None,
     }
 }

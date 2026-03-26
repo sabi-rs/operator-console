@@ -554,6 +554,21 @@ fn render_matchbook_table(
     matchbook: Option<&MatchbookAccountState>,
 ) {
     if let Some(matchbook) = matchbook {
+        let open_offer_stake: f64 = matchbook
+            .current_offers
+            .iter()
+            .filter_map(|offer| offer.remaining_stake.or(offer.stake))
+            .sum();
+        let current_bet_stake: f64 = matchbook
+            .current_bets
+            .iter()
+            .filter_map(|bet| bet.stake)
+            .sum();
+        let net_exposure: f64 = matchbook
+            .positions
+            .iter()
+            .filter_map(|position| position.exposure)
+            .sum();
         let layout = Layout::vertical([Constraint::Length(5), Constraint::Min(4)]).split(area);
         let summary = Paragraph::new(vec![
             Line::styled("󰍹 account", Style::default().fg(muted_text())),
@@ -569,6 +584,10 @@ fn render_matchbook_table(
                 matchbook.summary.current_bet_count,
                 matchbook.summary.matched_bet_count,
                 matchbook.summary.position_count
+            )),
+            Line::raw(format!(
+                "offer stake {:.2} • bet stake {:.2} • net exposure {:+.2}",
+                open_offer_stake, current_bet_stake, net_exposure
             )),
         ])
         .block(section_block("󰇚 Matchbook API", accent_blue()))
@@ -600,37 +619,131 @@ fn render_matchbook_table(
                 ])
             })
             .collect::<Vec<_>>();
-        if rows.is_empty() {
-            let body = Paragraph::new(vec![
-                Line::raw("No current Matchbook offers."),
-                Line::raw("Open exchange orders will appear here when the API sees them."),
-            ])
+        if !rows.is_empty() {
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Percentage(42),
+                    Constraint::Length(7),
+                    Constraint::Length(6),
+                    Constraint::Length(7),
+                    Constraint::Length(10),
+                ],
+            )
+            .header(
+                Row::new(vec!["Selection", "Side", "Odds", "Stake", "Status"]).style(
+                    Style::default()
+                        .fg(accent_green())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            )
             .block(section_block("󰋼 Matchbook Orders", accent_green()))
-            .wrap(Wrap { trim: true });
-            frame.render_widget(body, layout[1]);
+            .column_spacing(1);
+            frame.render_widget(table, layout[1]);
             return;
         }
 
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Percentage(42),
-                Constraint::Length(7),
-                Constraint::Length(6),
-                Constraint::Length(7),
-                Constraint::Length(10),
-            ],
-        )
-        .header(
-            Row::new(vec!["Selection", "Side", "Odds", "Stake", "Status"]).style(
-                Style::default()
-                    .fg(accent_green())
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
+        let bet_rows = matchbook
+            .current_bets
+            .iter()
+            .take(5)
+            .map(|bet| {
+                Row::new(vec![
+                    Cell::from(bet.selection_name.clone()),
+                    Cell::from(bet.side.clone()),
+                    Cell::from(
+                        bet.odds
+                            .map(|value| format!("{value:.2}"))
+                            .unwrap_or_else(|| String::from("-")),
+                    ),
+                    Cell::from(
+                        bet.stake
+                            .map(|value| format!("{value:.2}"))
+                            .unwrap_or_else(|| String::from("-")),
+                    ),
+                    Cell::from(
+                        bet.profit_loss
+                            .map(|value| format!("{value:+.2}"))
+                            .unwrap_or_else(|| bet.status.clone()),
+                    ),
+                ])
+            })
+            .collect::<Vec<_>>();
+        if !bet_rows.is_empty() {
+            let table = Table::new(
+                bet_rows,
+                [
+                    Constraint::Percentage(42),
+                    Constraint::Length(7),
+                    Constraint::Length(6),
+                    Constraint::Length(7),
+                    Constraint::Length(10),
+                ],
+            )
+            .header(
+                Row::new(vec!["Selection", "Side", "Odds", "Stake", "P/L"]).style(
+                    Style::default()
+                        .fg(accent_green())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            )
+            .block(section_block("󱂬 Matchbook Bets", accent_green()))
+            .column_spacing(1);
+            frame.render_widget(table, layout[1]);
+            return;
+        }
+
+        let position_rows = matchbook
+            .positions
+            .iter()
+            .take(5)
+            .map(|position| {
+                Row::new(vec![
+                    Cell::from(position.selection_name.clone()),
+                    Cell::from(
+                        position
+                            .exposure
+                            .map(|value| format!("{value:+.2}"))
+                            .unwrap_or_else(|| String::from("-")),
+                    ),
+                    Cell::from(
+                        position
+                            .profit_loss
+                            .map(|value| format!("{value:+.2}"))
+                            .unwrap_or_else(|| String::from("-")),
+                    ),
+                ])
+            })
+            .collect::<Vec<_>>();
+        if !position_rows.is_empty() {
+            let table = Table::new(
+                position_rows,
+                [
+                    Constraint::Percentage(54),
+                    Constraint::Length(10),
+                    Constraint::Length(10),
+                ],
+            )
+            .header(
+                Row::new(vec!["Selection", "Exposure", "P/L"]).style(
+                    Style::default()
+                        .fg(accent_green())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            )
+            .block(section_block("󰬍 Matchbook Positions", accent_green()))
+            .column_spacing(1);
+            frame.render_widget(table, layout[1]);
+            return;
+        }
+
+        let body = Paragraph::new(vec![
+            Line::raw("No current Matchbook offers, bets, or positions."),
+            Line::raw("Exchange inventory will appear here when the API sees it."),
+        ])
         .block(section_block("󰋼 Matchbook Orders", accent_green()))
-        .column_spacing(1);
-        frame.render_widget(table, layout[1]);
+        .wrap(Wrap { trim: true });
+        frame.render_widget(body, layout[1]);
         return;
     }
 

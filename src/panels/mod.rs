@@ -1,3 +1,4 @@
+pub mod alerts;
 pub mod calculator;
 pub mod exchanges;
 pub mod horse_matcher;

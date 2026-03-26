@@ -4,18 +4,21 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Padding, Paragraph, Row, Table,
-    TableState, Wrap,
+    Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap,
 };
 use ratatui::Frame;
 
 use crate::app::PositionsFocus;
 use crate::domain::VenueId;
 use crate::domain::{
-    ExchangePanelSnapshot, OpenPositionRow, OtherOpenBetRow, RecorderEventSummary, TrackedBetRow,
-    TrackedLeg, TransportMarkerSummary,
+    ExchangePanelSnapshot, ExternalLiveEventRow, ExternalQuoteRow, OpenPositionRow,
+    OtherOpenBetRow, RecorderEventSummary, TrackedBetRow, TrackedLeg, TransportMarkerSummary,
 };
-use crate::owls::{OwlsDashboard, OwlsEndpointId, OwlsPreviewRow};
+use crate::exchange_api::MatchbookAccountState;
+use crate::market_normalization::{
+    event_matches, market_matches, normalize_key, selection_matches_with_context, text_matches,
+};
+use crate::owls::OwlsDashboard;
 use crate::trading_actions::{
     TradingActionSeed, TradingActionSide, TradingActionSource, TradingActionSourceContext,
 };
@@ -25,6 +28,7 @@ pub fn render(
     area: Rect,
     snapshot: &ExchangePanelSnapshot,
     owls_dashboard: &OwlsDashboard,
+    matchbook_account_state: Option<&MatchbookAccountState>,
     active_table_state: &mut TableState,
     historical_table_state: &mut TableState,
     positions_focus: PositionsFocus,
@@ -36,6 +40,24 @@ pub fn render(
     let exit_recommendations = derived_exit_recommendations(snapshot);
     let selected_active = selected_active_position(&active_views, active_table_state);
     let selected_historical = selected_historical_position(snapshot, historical_table_state);
+    let selected_active_quotes = selected_active
+        .map(|view| active_matching_external_quotes(snapshot, view))
+        .unwrap_or_default();
+    let selected_signal_sharp = selected_active
+        .map(|view| {
+            active_sharp_quote_label_from_quotes(
+                &selected_active_quotes,
+                view,
+                &owls_dashboard.sport,
+            )
+        })
+        .unwrap_or_else(|| String::from("-"));
+    let selected_active_rows_cache = selected_active
+        .map(|view| selected_active_rows(snapshot, view, &selected_signal_sharp))
+        .unwrap_or_else(empty_selected_rows);
+    let selected_signal_action = selected_active
+        .map(active_action_label)
+        .unwrap_or_else(|| String::from("-"));
     let layout = Layout::vertical([Constraint::Length(6), Constraint::Min(18)]).split(area);
     let body = Layout::horizontal([Constraint::Percentage(71), Constraint::Percentage(29)])
         .split(layout[1]);
@@ -57,7 +79,8 @@ pub fn render(
         frame,
         layout[0],
         snapshot,
-        selected_active,
+        &exit_recommendations,
+        selected_active_rows_cache,
         selected_historical,
         positions_focus,
     );
@@ -122,9 +145,9 @@ pub fn render(
         frame,
         right[0],
         snapshot,
-        owls_dashboard,
         &exit_recommendations,
-        selected_active,
+        &selected_signal_action,
+        &selected_signal_sharp,
     );
     render_table(
         frame,
@@ -163,7 +186,14 @@ pub fn render(
         if positions_focus == PositionsFocus::Historical {
             render_historical_view_overlay(frame, area, snapshot, selected_historical);
         } else {
-            render_live_view_overlay(frame, area, snapshot, selected_active);
+            render_live_view_overlay(
+                frame,
+                area,
+                snapshot,
+                owls_dashboard,
+                matchbook_account_state,
+                selected_active,
+            );
         }
     }
 }
@@ -188,6 +218,21 @@ struct DerivedExitRecommendation {
     worst_case_pnl: f64,
 }
 
+#[derive(Clone, Debug)]
+struct ExchangeQuote {
+    venue: String,
+    side: String,
+    price: f64,
+    liquidity: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct SharpQuote {
+    source: String,
+    selection: String,
+    price: f64,
+}
+
 pub(crate) fn active_position_row_count(snapshot: &ExchangePanelSnapshot) -> usize {
     active_position_views(snapshot).len()
 }
@@ -206,6 +251,39 @@ pub(crate) fn selected_active_position_seed(
         .open_position
         .map(|open_position| open_position.event_url.trim().to_string())
         .filter(|value| !value.is_empty());
+    let buy_price = view
+        .open_position
+        .and_then(|open_position| open_position.current_buy_odds);
+    let sell_price = view
+        .open_position
+        .and_then(|open_position| open_position.current_sell_odds);
+    let should_consult_external_quote =
+        event_url.is_none() || (buy_price.is_none() && sell_price.is_none());
+    let external_quote = snapshot
+        .external_quotes
+        .iter()
+        .filter(|_| should_consult_external_quote)
+        .filter(|quote| {
+            event_matches(&quote.event, &event_name)
+                && market_matches(&quote.market, &market_name)
+                && selection_matches_with_context(
+                    &quote.selection,
+                    &quote.event,
+                    &quote.market,
+                    &selection_name,
+                    &event_name,
+                    &market_name,
+                )
+        })
+        .min_by(|left, right| {
+            let left_rank = usize::from(normalize_key(&left.venue) != "matchbook");
+            let right_rank = usize::from(normalize_key(&right.venue) != "matchbook");
+            left_rank.cmp(&right_rank).then_with(|| {
+                left.price
+                    .unwrap_or(f64::INFINITY)
+                    .total_cmp(&right.price.unwrap_or(f64::INFINITY))
+            })
+        });
     let tracked_bet_id = view
         .tracked_bet
         .map(|tracked_bet| tracked_bet.bet_id.clone())
@@ -221,12 +299,6 @@ pub(crate) fn selected_active_position_seed(
             view.sportsbook_bet
                 .map(|sportsbook_bet| sportsbook_bet.stake)
         });
-    let buy_price = view
-        .open_position
-        .and_then(|open_position| open_position.current_buy_odds);
-    let sell_price = view
-        .open_position
-        .and_then(|open_position| open_position.current_sell_odds);
     let default_side = if buy_price.is_some() {
         TradingActionSide::Buy
     } else {
@@ -240,10 +312,23 @@ pub(crate) fn selected_active_position_seed(
         event_name,
         market_name,
         selection_name,
-        event_url,
-        deep_link_url: None,
-        betslip_market_id: None,
-        betslip_selection_id: None,
+        event_url: event_url.or_else(|| {
+            external_quote
+                .map(|quote| quote.event_url.trim().to_string())
+                .filter(|value| !value.is_empty())
+        }),
+        deep_link_url: external_quote
+            .map(|quote| quote.deep_link_url.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        betslip_event_id: external_quote
+            .map(|quote| quote.event_id.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        betslip_market_id: external_quote
+            .map(|quote| quote.market_id.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        betslip_selection_id: external_quote
+            .map(|quote| quote.selection_id.trim().to_string())
+            .filter(|value| !value.is_empty()),
         buy_price,
         sell_price,
         default_side,
@@ -307,14 +392,27 @@ fn active_position_views(snapshot: &ExchangePanelSnapshot) -> Vec<ActivePosition
         let tracked_bet = snapshot
             .tracked_bets
             .iter()
-            .find(|tracked_bet| tracked_bet_matches_open_position(tracked_bet, open_position));
+            .find(|tracked_bet| tracked_bet_matches_open_position(tracked_bet, open_position))
+            .or_else(|| {
+                snapshot.tracked_bets.iter().find(|tracked_bet| {
+                    fallback_tracked_bet_matches_open_position(tracked_bet, open_position)
+                })
+            });
         if let Some(tracked_bet) = tracked_bet {
             used_tracked.insert(tracked_bet.bet_id.clone());
         }
 
-        let sportsbook_bet = snapshot.other_open_bets.iter().find(|sportsbook_bet| {
-            sportsbook_bet_matches_open_position(sportsbook_bet, open_position)
-        });
+        let sportsbook_bet = snapshot
+            .other_open_bets
+            .iter()
+            .find(|sportsbook_bet| {
+                sportsbook_bet_matches_open_position(sportsbook_bet, open_position)
+            })
+            .or_else(|| {
+                snapshot.other_open_bets.iter().find(|sportsbook_bet| {
+                    fallback_sportsbook_bet_matches_open_position(sportsbook_bet, open_position)
+                })
+            });
         if let Some(sportsbook_bet) = sportsbook_bet {
             used_sportsbook.insert(sportsbook_bet_identity(sportsbook_bet));
         }
@@ -481,14 +579,14 @@ fn render_summary(
     frame: &mut Frame<'_>,
     area: Rect,
     snapshot: &ExchangePanelSnapshot,
-    selected_active: Option<ActivePositionView<'_>>,
+    exit_recommendations: &[DerivedExitRecommendation],
+    selected_active_rows: Vec<(&'static str, String, Color)>,
     selected_historical: Option<&OpenPositionRow>,
     positions_focus: PositionsFocus,
 ) {
     let summary =
         Layout::horizontal([Constraint::Percentage(44), Constraint::Percentage(56)]).split(area);
     let runtime = snapshot.runtime.as_ref();
-    let exit_recommendations = derived_exit_recommendations(snapshot);
     let (_, promo_funding_count, _) = tracked_bet_funding_counts(snapshot);
     let (realised_pnl, live_pnl, net_pnl, promo_pnl) = positions_pnl_summary(snapshot);
     let (recent_interactions, pending_interactions, issue_interactions) =
@@ -588,9 +686,7 @@ fn render_summary(
     );
 
     let selected_rows = if positions_focus == PositionsFocus::Active {
-        selected_active
-            .map(selected_active_rows)
-            .unwrap_or_else(empty_selected_rows)
+        selected_active_rows
     } else if let Some(row) = selected_historical {
         vec![
             ("󰕮 Pane", positions_focus.label().to_string(), accent_cyan()),
@@ -675,9 +771,9 @@ fn render_signal_board(
     frame: &mut Frame<'_>,
     area: Rect,
     snapshot: &ExchangePanelSnapshot,
-    owls_dashboard: &OwlsDashboard,
     exit_recommendations: &[DerivedExitRecommendation],
-    selected_active: Option<ActivePositionView<'_>>,
+    selected_action: &str,
+    selected_sharp: &str,
 ) {
     let next_action = exit_recommendations
         .first()
@@ -692,20 +788,8 @@ fn render_signal_board(
         active_interaction_summary(snapshot);
     let rows = vec![
         ("󰘳 Next", next_action, accent_gold()),
-        (
-            "󱂬 Selected",
-            selected_active
-                .map(active_action_label)
-                .unwrap_or_else(|| String::from("-")),
-            accent_green(),
-        ),
-        (
-            "󰇚 Sharp",
-            selected_active
-                .map(|view| active_sharp_quote_label(owls_dashboard, view))
-                .unwrap_or_else(|| String::from("-")),
-            accent_blue(),
-        ),
+        ("󱂬 Selected", selected_action.to_string(), accent_green()),
+        ("󰇚 Sharp", selected_sharp.to_string(), accent_blue()),
         (
             "󰐊 I/O",
             format!(
@@ -1269,13 +1353,6 @@ fn active_hold_label(view: ActivePositionView<'_>) -> String {
     }
 }
 
-fn active_half_exit_label(view: ActivePositionView<'_>) -> String {
-    match active_half_cashout_outcomes(view) {
-        Some((win, lose)) => format!("{win:+.2}/{lose:+.2}"),
-        None => String::from("-"),
-    }
-}
-
 fn active_lock_label(view: ActivePositionView<'_>) -> String {
     match active_total_cashout_outcomes(view) {
         Some((win, lose)) => format!("{win:+.2}/{lose:+.2}"),
@@ -1382,6 +1459,79 @@ fn active_action_cell(view: ActivePositionView<'_>) -> Cell<'static> {
         muted_text()
     };
     Cell::from(truncate_text(&label, 3)).style(Style::default().fg(color))
+}
+
+fn overlay_action_label(
+    view: ActivePositionView<'_>,
+    overlay_best_exit: Option<&ExchangeQuote>,
+    overlay_sharp_quote: Option<&SharpQuote>,
+    overlay_lock: Option<(f64, f64)>,
+) -> String {
+    let lock_worst = overlay_lock.map(|(win, lose)| win.min(lose));
+    if let Some(lock_worst) = lock_worst {
+        if lock_worst >= view.target_profit {
+            return String::from("lock");
+        }
+        if lock_worst <= -view.stop_loss {
+            return String::from("cut");
+        }
+    }
+    if let Some((_, _, book_odds, _)) = active_sportsbook_leg(view) {
+        if let Some(best_exit) = overlay_best_exit {
+            if book_odds > best_exit.price {
+                return String::from("lay_more");
+            }
+        }
+    }
+    if let Some((_, _, book_odds, _)) = active_sportsbook_leg(view) {
+        if let Some(sharp_quote) = overlay_sharp_quote {
+            if book_odds > sharp_quote.price {
+                return String::from("lay_more");
+            }
+        }
+    }
+    active_action_label(view)
+}
+
+fn overlay_action_reason(
+    view: ActivePositionView<'_>,
+    overlay_best_exit: Option<&ExchangeQuote>,
+    overlay_sharp_quote: Option<&SharpQuote>,
+    overlay_lock: Option<(f64, f64)>,
+) -> String {
+    let lock_worst = overlay_lock.map(|(win, lose)| win.min(lose));
+    if let Some(lock_worst) = lock_worst {
+        if lock_worst >= view.target_profit {
+            return String::from("target_profit_locked");
+        }
+        if lock_worst <= -view.stop_loss {
+            return String::from("stop_loss_locked");
+        }
+    }
+    if let Some((_, _, book_odds, _)) = active_sportsbook_leg(view) {
+        if let Some(best_exit) = overlay_best_exit {
+            if book_odds > best_exit.price {
+                return String::from("book_edge_over_best_exit");
+            }
+        }
+    }
+    if let Some((_, _, book_odds, _)) = active_sportsbook_leg(view) {
+        if let Some(sharp_quote) = overlay_sharp_quote {
+            if book_odds > sharp_quote.price {
+                return String::from("book_edge_over_sharp");
+            }
+        }
+    }
+    String::from("within_thresholds")
+}
+
+fn overlay_action_color(action: &str) -> Color {
+    match action {
+        "lock" | "target" => accent_green(),
+        "cut" | "stop" => accent_red(),
+        "lay_more" | "watch" => accent_gold(),
+        _ => muted_text(),
+    }
 }
 
 fn active_marked_pnl(view: ActivePositionView<'_>) -> f64 {
@@ -1499,9 +1649,54 @@ fn active_total_cashout_outcomes(view: ActivePositionView<'_>) -> Option<(f64, f
     active_cashout_outcomes(view).or_else(|| active_bookie_cashout_outcomes(view))
 }
 
+fn overlay_cashout_outcomes(
+    snapshot: &ExchangePanelSnapshot,
+    view: ActivePositionView<'_>,
+) -> Option<(f64, f64)> {
+    let (_, entry_odds, stake, commission_rate) = active_live_exchange_leg(view)?;
+    let current_back_odds = active_best_exit_quote(snapshot, view)?.price;
+    let locked_profit =
+        lay_trade_out_locked_profit(entry_odds, stake, current_back_odds, commission_rate);
+    let (other_wins, other_loses) = active_non_exchange_outcomes(view)?;
+    Some((locked_profit + other_wins, locked_profit + other_loses))
+}
+
+fn overlay_fractional_cashout_outcomes(
+    snapshot: &ExchangePanelSnapshot,
+    view: ActivePositionView<'_>,
+    fraction: f64,
+) -> Option<(f64, f64)> {
+    let (_, entry_odds, lay_stake, commission_rate) = active_live_exchange_leg(view)?;
+    let current_back_odds = active_best_exit_quote(snapshot, view)?.price;
+    let hedge_stake = overlay_full_hedge_back_stake(snapshot, view)? * fraction.clamp(0.0, 1.0);
+    let exchange_win = settled_leg_pnl("lay", entry_odds, lay_stake, commission_rate, true)
+        + settled_leg_pnl("back", current_back_odds, hedge_stake, 0.0, true);
+    let exchange_lose = settled_leg_pnl("lay", entry_odds, lay_stake, commission_rate, false)
+        + settled_leg_pnl("back", current_back_odds, hedge_stake, 0.0, false);
+    let (other_wins, other_loses) = active_non_exchange_outcomes(view)?;
+    Some((exchange_win + other_wins, exchange_lose + other_loses))
+}
+
+fn overlay_total_cashout_outcomes(
+    snapshot: &ExchangePanelSnapshot,
+    view: ActivePositionView<'_>,
+) -> Option<(f64, f64)> {
+    overlay_cashout_outcomes(snapshot, view).or_else(|| active_bookie_cashout_outcomes(view))
+}
+
 fn active_full_hedge_back_stake(view: ActivePositionView<'_>) -> Option<f64> {
     let (_, entry_lay_odds, lay_stake, commission_rate) = active_live_exchange_leg(view)?;
     let current_back_odds = active_current_back_odds(view)?;
+    let effective_commission = normalize_commission_rate(commission_rate);
+    Some((lay_stake * (entry_lay_odds - effective_commission)) / current_back_odds)
+}
+
+fn overlay_full_hedge_back_stake(
+    snapshot: &ExchangePanelSnapshot,
+    view: ActivePositionView<'_>,
+) -> Option<f64> {
+    let (_, entry_lay_odds, lay_stake, commission_rate) = active_live_exchange_leg(view)?;
+    let current_back_odds = active_best_exit_quote(snapshot, view)?.price;
     let effective_commission = normalize_commission_rate(commission_rate);
     Some((lay_stake * (entry_lay_odds - effective_commission)) / current_back_odds)
 }
@@ -1591,30 +1786,286 @@ fn active_sportsbook_leg(view: ActivePositionView<'_>) -> Option<(String, String
     })
 }
 
+fn active_sportsbook_leg_label(view: ActivePositionView<'_>) -> String {
+    active_sportsbook_leg(view)
+        .map(|(venue, outcome, odds, stake)| {
+            let returns = stake * odds;
+            format!("{venue} {outcome} @ {odds:.2} stake {stake:.2} ret {returns:.2}")
+        })
+        .unwrap_or_else(|| String::from("-"))
+}
+
+fn active_matching_external_quotes<'a>(
+    snapshot: &'a ExchangePanelSnapshot,
+    view: ActivePositionView<'_>,
+) -> Vec<&'a ExternalQuoteRow> {
+    snapshot
+        .external_quotes
+        .iter()
+        .filter(|quote| quote_matches_view(quote, view))
+        .collect()
+}
+
+fn active_external_quote_for_venue_from_quotes(
+    matching_quotes: &[&ExternalQuoteRow],
+    venue: &str,
+) -> Option<ExchangeQuote> {
+    let normalized_venue = normalize_key(venue);
+    let mut candidates = matching_quotes
+        .iter()
+        .copied()
+        .filter(|quote| normalize_key(&quote.venue) == normalized_venue)
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        external_quote_priority(left, venue)
+            .cmp(&external_quote_priority(right, venue))
+            .then_with(|| {
+                left.price
+                    .unwrap_or(f64::INFINITY)
+                    .total_cmp(&right.price.unwrap_or(f64::INFINITY))
+            })
+    });
+    candidates.into_iter().find_map(external_quote_to_exchange)
+}
+
+fn active_best_exit_quote_from_quotes(
+    matching_quotes: &[&ExternalQuoteRow],
+) -> Option<ExchangeQuote> {
+    matching_quotes
+        .iter()
+        .copied()
+        .filter(|quote| {
+            matches!(
+                normalize_key(&quote.venue).as_str(),
+                "smarkets" | "matchbook" | "betfair" | "betdaq"
+            )
+        })
+        .filter_map(external_quote_to_exchange)
+        .min_by(|left, right| left.price.total_cmp(&right.price))
+}
+
+fn active_sharp_quote_from_quotes(
+    matching_quotes: &[&ExternalQuoteRow],
+    view: ActivePositionView<'_>,
+) -> Option<SharpQuote> {
+    let quote = matching_quotes
+        .iter()
+        .copied()
+        .filter(|quote| quote.is_sharp || normalize_key(&quote.venue) == "pinnacle")
+        .filter_map(|quote| {
+            Some((
+                external_quote_priority(quote, "pinnacle"),
+                quote.price?,
+                quote.selection.clone(),
+                quote.venue.clone(),
+            ))
+        })
+        .min_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.total_cmp(&right.1))
+        })?;
+    let source = if quote.3.trim().is_empty() {
+        String::from("pinnacle")
+    } else {
+        quote.3
+    };
+    let matched_selection = if quote.2.trim().is_empty() {
+        active_selection_label(view)
+    } else {
+        quote.2
+    };
+    Some(SharpQuote {
+        source,
+        selection: matched_selection,
+        price: quote.1,
+    })
+}
+
+fn active_sharp_quote_label_from_quotes(
+    matching_quotes: &[&ExternalQuoteRow],
+    view: ActivePositionView<'_>,
+    sharp_sport: &str,
+) -> String {
+    active_sharp_quote_from_quotes(matching_quotes, view)
+        .map(|quote| format!("{} {} @ {:.2}", quote.source, quote.selection, quote.price))
+        .unwrap_or_else(|| format!("no Owls match ({sharp_sport})"))
+}
+
+fn quote_matches_view(quote: &ExternalQuoteRow, view: ActivePositionView<'_>) -> bool {
+    event_matches(&quote.event, &active_event_label(view))
+        && market_matches(&quote.market, &active_market_name(view))
+        && selection_matches_with_context(
+            &quote.selection,
+            &quote.event,
+            &quote.market,
+            &active_selection_label(view),
+            &active_event_label(view),
+            &active_market_name(view),
+        )
+}
+
+fn external_quote_priority(quote: &ExternalQuoteRow, venue: &str) -> usize {
+    match (
+        normalize_key(&quote.provider).as_str(),
+        normalize_key(venue).as_str(),
+    ) {
+        ("snapshot", "smarkets") => 0,
+        ("owls", "matchbook" | "betfair" | "betdaq" | "smarkets" | "pinnacle") => 0,
+        ("matchbook_api", "matchbook") => 1,
+        ("owls", _) => 2,
+        _ => 3,
+    }
+}
+
+fn external_quote_to_exchange(quote: &ExternalQuoteRow) -> Option<ExchangeQuote> {
+    let price = quote.price?;
+    if price <= 1.0 {
+        return None;
+    }
+    Some(ExchangeQuote {
+        venue: if quote.venue.trim().is_empty() {
+            String::from("-")
+        } else {
+            quote.venue.clone()
+        },
+        side: if quote.side.trim().is_empty() {
+            String::from("back")
+        } else {
+            quote.side.clone()
+        },
+        price,
+        liquidity: quote.liquidity,
+    })
+}
+
+#[cfg(test)]
+fn active_external_quote_for_venue(
+    snapshot: &ExchangePanelSnapshot,
+    view: ActivePositionView<'_>,
+    venue: &str,
+) -> Option<ExchangeQuote> {
+    let matching_quotes = active_matching_external_quotes(snapshot, view);
+    active_external_quote_for_venue_from_quotes(&matching_quotes, venue)
+}
+
+#[cfg(test)]
+fn active_matchbook_quote(
+    snapshot: &ExchangePanelSnapshot,
+    view: ActivePositionView<'_>,
+) -> Option<ExchangeQuote> {
+    active_external_quote_for_venue(snapshot, view, "matchbook")
+}
+
+fn active_best_exit_quote(
+    snapshot: &ExchangePanelSnapshot,
+    view: ActivePositionView<'_>,
+) -> Option<ExchangeQuote> {
+    let matching_quotes = active_matching_external_quotes(snapshot, view);
+    active_best_exit_quote_from_quotes(&matching_quotes)
+}
+
+#[cfg(test)]
+fn active_matchbook_quote_label(
+    snapshot: &ExchangePanelSnapshot,
+    view: ActivePositionView<'_>,
+) -> String {
+    active_matchbook_quote(snapshot, view)
+        .map(|quote| {
+            let liquidity = quote
+                .liquidity
+                .map(|value| format!(" liq {value:.2}"))
+                .unwrap_or_default();
+            format!(
+                "{} {} @ {:.2}{liquidity}",
+                quote.venue, quote.side, quote.price
+            )
+        })
+        .unwrap_or_else(|| String::from("-"))
+}
+
 fn tracked_bet_matches_open_position(
     tracked_bet: &TrackedBetRow,
     open_position: &OpenPositionRow,
 ) -> bool {
-    text_matches(&tracked_bet.selection, &open_position.contract)
-        && market_matches(&tracked_bet.market, &open_position.market)
+    selection_matches_with_context(
+        &tracked_bet.selection,
+        &tracked_bet.event,
+        &tracked_bet.market,
+        &open_position.contract,
+        &open_position.event,
+        &open_position.market,
+    ) && market_matches(&tracked_bet.market, &open_position.market)
         && event_matches(&tracked_bet.event, &open_position.event)
+}
+
+fn fallback_tracked_bet_matches_open_position(
+    tracked_bet: &TrackedBetRow,
+    open_position: &OpenPositionRow,
+) -> bool {
+    event_matches(&tracked_bet.event, &open_position.event)
+        && (selection_matches_with_context(
+            &tracked_bet.selection,
+            &tracked_bet.event,
+            &tracked_bet.market,
+            &open_position.contract,
+            &open_position.event,
+            &open_position.market,
+        ) || tracked_bet.legs.iter().any(|leg| {
+            selection_matches_with_context(
+                &leg.outcome,
+                &tracked_bet.event,
+                &leg.market,
+                &open_position.contract,
+                &open_position.event,
+                &open_position.market,
+            ) && (market_matches(&leg.market, &open_position.market)
+                || leg.market.trim().is_empty())
+        }))
 }
 
 fn sportsbook_bet_matches_open_position(
     sportsbook_bet: &OtherOpenBetRow,
     open_position: &OpenPositionRow,
 ) -> bool {
-    text_matches(&sportsbook_bet.label, &open_position.contract)
-        && market_matches(&sportsbook_bet.market, &open_position.market)
+    selection_matches_with_context(
+        &sportsbook_bet.label,
+        &sportsbook_bet.event,
+        &sportsbook_bet.market,
+        &open_position.contract,
+        &open_position.event,
+        &open_position.market,
+    ) && market_matches(&sportsbook_bet.market, &open_position.market)
         && event_matches(&sportsbook_bet.event, &open_position.event)
+}
+
+fn fallback_sportsbook_bet_matches_open_position(
+    sportsbook_bet: &OtherOpenBetRow,
+    open_position: &OpenPositionRow,
+) -> bool {
+    event_matches(&sportsbook_bet.event, &open_position.event)
+        && selection_matches_with_context(
+            &sportsbook_bet.label,
+            &sportsbook_bet.event,
+            &sportsbook_bet.market,
+            &open_position.contract,
+            &open_position.event,
+            &open_position.market,
+        )
 }
 
 fn sportsbook_bet_matches_tracked_bet(
     sportsbook_bet: &OtherOpenBetRow,
     tracked_bet: &TrackedBetRow,
 ) -> bool {
-    text_matches(&sportsbook_bet.label, &tracked_bet.selection)
-        && market_matches(&sportsbook_bet.market, &tracked_bet.market)
+    selection_matches_with_context(
+        &sportsbook_bet.label,
+        &sportsbook_bet.event,
+        &sportsbook_bet.market,
+        &tracked_bet.selection,
+        &tracked_bet.event,
+        &tracked_bet.market,
+    ) && market_matches(&sportsbook_bet.market, &tracked_bet.market)
         && event_matches(&sportsbook_bet.event, &tracked_bet.event)
 }
 
@@ -1717,40 +2168,34 @@ fn active_exit_edge_label(view: ActivePositionView<'_>) -> String {
     }
 }
 
-fn active_half_exit_stake_label(view: ActivePositionView<'_>) -> String {
-    match (
-        active_full_hedge_back_stake(view),
-        active_half_cashout_outcomes(view),
-    ) {
-        (Some(stake), Some((win, lose))) => {
-            format!("stake {:.2} | {:+.2}/{:+.2}", stake / 2.0, win, lose)
+fn active_entry_ev_label_from_sharp(
+    view: ActivePositionView<'_>,
+    overlay_sharp_quote: Option<&SharpQuote>,
+    sharp_sport: &str,
+) -> String {
+    if let Some(tracked_bet) = view.tracked_bet {
+        match (tracked_bet.expected_ev.gbp, tracked_bet.expected_ev.pct) {
+            (Some(gbp), Some(pct)) => return format!("{gbp:+.2} | {pct:+.2}%"),
+            (Some(gbp), None) => return format!("{gbp:+.2}"),
+            (None, Some(pct)) => return format!("{pct:+.2}%"),
+            (None, None) => {}
         }
-        _ => String::from("-"),
     }
-}
 
-fn active_full_exit_stake_label(view: ActivePositionView<'_>) -> String {
-    match (
-        active_full_hedge_back_stake(view),
-        active_total_cashout_outcomes(view),
-    ) {
-        (Some(stake), Some((win, lose))) => {
-            format!("stake {:.2} | {:+.2}/{:+.2}", stake, win, lose)
-        }
-        _ => String::from("-"),
-    }
-}
-
-fn active_entry_ev_label(view: ActivePositionView<'_>) -> String {
-    let Some(tracked_bet) = view.tracked_bet else {
+    let Some((_, _, odds, stake)) = active_sportsbook_leg(view) else {
         return String::from("-");
     };
-    match (tracked_bet.expected_ev.gbp, tracked_bet.expected_ev.pct) {
-        (Some(gbp), Some(pct)) => format!("{gbp:+.2} | {pct:+.2}%"),
-        (Some(gbp), None) => format!("{gbp:+.2}"),
-        (None, Some(pct)) => format!("{pct:+.2}%"),
-        (None, None) => String::from("-"),
-    }
+    let Some(sharp_quote) = overlay_sharp_quote else {
+        return format!("no sharp ({sharp_sport})");
+    };
+    let win_probability = implied_probability(sharp_quote.price);
+    let ev_gbp = (win_probability * stake * (odds - 1.0)) - ((1.0 - win_probability) * stake);
+    let ev_pct = if stake > 0.0 {
+        (ev_gbp / stake) * 100.0
+    } else {
+        0.0
+    };
+    format!("{ev_gbp:+.2} | {ev_pct:+.2}% sharp")
 }
 
 fn active_historical_summary_label(
@@ -1781,52 +2226,14 @@ fn active_historical_summary_label(
     format!("n {} | win {} | pnl {:+.2}", matches.len(), wins, realised)
 }
 
+#[cfg(test)]
 fn active_sharp_quote_label(
+    snapshot: &ExchangePanelSnapshot,
     owls_dashboard: &OwlsDashboard,
     view: ActivePositionView<'_>,
 ) -> String {
-    let event = active_event_label(view);
-    let selection = active_selection_label(view);
-    let preferred = [
-        OwlsEndpointId::Realtime,
-        OwlsEndpointId::Moneyline,
-        OwlsEndpointId::Odds,
-        OwlsEndpointId::Spreads,
-        OwlsEndpointId::Totals,
-    ];
-    for endpoint_id in preferred {
-        let Some(endpoint) = owls_dashboard
-            .endpoints
-            .iter()
-            .find(|endpoint| endpoint.id == endpoint_id)
-        else {
-            continue;
-        };
-        if let Some(row) = endpoint.preview.iter().find(|row| {
-            text_matches(&row.label, &event)
-                && (text_matches(&row.metric, &selection)
-                    || text_matches(&row.detail, "pinnacle")
-                    || normalize_key(&selection) == "draw")
-        }) {
-            return compact_sharp_quote(row);
-        }
-        if let Some(row) = endpoint
-            .preview
-            .iter()
-            .find(|row| text_matches(&row.label, &event))
-        {
-            return compact_sharp_quote(row);
-        }
-    }
-    String::from("no Owls match")
-}
-
-fn compact_sharp_quote(row: &OwlsPreviewRow) -> String {
-    format!(
-        "{} | {}",
-        truncate_text(&row.detail, 12),
-        truncate_text(&row.metric, 18)
-    )
+    let matching_quotes = active_matching_external_quotes(snapshot, view);
+    active_sharp_quote_label_from_quotes(&matching_quotes, view, &owls_dashboard.sport)
 }
 
 fn exit_odds_for_target_profit(
@@ -1852,59 +2259,11 @@ fn normalize_commission_rate(value: f64) -> f64 {
     }
 }
 
-fn normalize_key(value: &str) -> String {
-    value
-        .to_lowercase()
-        .replace("vs", "v")
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn text_matches(left: &str, right: &str) -> bool {
-    let left = normalize_key(left);
-    let right = normalize_key(right);
-    !left.is_empty()
-        && !right.is_empty()
-        && (left == right || left.contains(&right) || right.contains(&left))
-}
-
-fn market_matches(left: &str, right: &str) -> bool {
-    let left = normalize_market(left);
-    let right = normalize_market(right);
-    !left.is_empty() && !right.is_empty() && left == right
-}
-
-fn normalize_market(value: &str) -> String {
-    let normalized = normalize_key(value);
-    if matches!(
-        normalized.as_str(),
-        "full time result" | "match odds" | "to win" | "winner"
-    ) {
-        return String::from("match odds");
-    }
-    normalized
-}
-
-fn event_matches(left: &str, right: &str) -> bool {
-    if left.is_empty() || right.is_empty() {
-        return true;
-    }
-    let left = normalize_key(left);
-    let right = normalize_key(right);
-    left == right
-}
-
-fn selected_active_rows(view: ActivePositionView<'_>) -> Vec<(&'static str, String, Color)> {
+fn selected_active_rows(
+    _snapshot: &ExchangePanelSnapshot,
+    view: ActivePositionView<'_>,
+    selected_sharp: &str,
+) -> Vec<(&'static str, String, Color)> {
     let recommendation = derived_exit_recommendation(view)
         .map(|recommendation| format!("{} ({})", recommendation.action, recommendation.reason))
         .unwrap_or_else(|| active_action_label(view));
@@ -1939,8 +2298,9 @@ fn selected_active_rows(view: ActivePositionView<'_>) -> Vec<(&'static str, Stri
             active_bookie_cashout_label(view),
             accent_green(),
         ),
-        ("󱂬 Hold", active_hold_label(view), accent_green()),
-        ("󰔟 Lock", active_lock_label(view), accent_green()),
+        ("󰇚 Sharp", selected_sharp.to_string(), accent_blue()),
+        ("󱂬 Hold", active_hold_label(view), active_hold_color(view)),
+        ("󰔟 Lock", active_lock_label(view), active_lock_color(view)),
         ("󰄬 Trigger", active_trigger_label(view), accent_cyan()),
         ("󰖌 Exposure", exposure, accent_pink()),
         ("󰌑 Status", active_status_label(view), accent_green()),
@@ -1962,6 +2322,7 @@ fn empty_selected_rows() -> Vec<(&'static str, String, Color)> {
         ("󰇈 Market", String::from("-"), muted_text()),
         ("󰈀 Entry Prob", String::from("-"), muted_text()),
         ("󰐃 Book Cash", String::from("-"), muted_text()),
+        ("󰇚 Sharp", String::from("-"), muted_text()),
         ("󱂬 Hold", String::from("-"), muted_text()),
         ("󰔟 Lock", String::from("-"), muted_text()),
         ("󰄬 Trigger", String::from("-"), muted_text()),
@@ -2302,6 +2663,31 @@ fn format_probability(probability: f64) -> String {
     format!("{:.2}%", probability * 100.0)
 }
 
+fn overlay_pnl_color(value: f64) -> Color {
+    if value > 0.0 {
+        accent_green()
+    } else if value < 0.0 {
+        accent_red()
+    } else {
+        muted_text()
+    }
+}
+
+fn active_hold_color(view: ActivePositionView<'_>) -> Color {
+    active_hold_outcomes(view)
+        .map(|(win, lose)| win.min(lose))
+        .or_else(|| active_current_worst_case(view))
+        .map(overlay_pnl_color)
+        .unwrap_or_else(muted_text)
+}
+
+fn active_lock_color(view: ActivePositionView<'_>) -> Color {
+    active_total_cashout_outcomes(view)
+        .map(|(win, lose)| win.min(lose))
+        .map(overlay_pnl_color)
+        .unwrap_or_else(muted_text)
+}
+
 #[cfg(test)]
 fn format_optional_value(value: Option<f64>) -> String {
     value
@@ -2495,6 +2881,8 @@ fn render_live_view_overlay(
     frame: &mut Frame<'_>,
     area: Rect,
     snapshot: &ExchangePanelSnapshot,
+    owls_dashboard: &OwlsDashboard,
+    _matchbook_account_state: Option<&MatchbookAccountState>,
     selected_active: Option<ActivePositionView<'_>>,
 ) {
     let popup = popup_area(area, 90, 82);
@@ -2512,21 +2900,53 @@ fn render_live_view_overlay(
     };
 
     let layout = Layout::vertical([
-        Constraint::Length(5),
-        Constraint::Length(14),
-        Constraint::Min(12),
+        Constraint::Length(4),
+        Constraint::Length(10),
+        Constraint::Min(14),
     ])
     .split(inner);
-    let middle = Layout::horizontal([
-        Constraint::Percentage(38),
-        Constraint::Percentage(30),
-        Constraint::Percentage(32),
-    ])
-    .split(layout[1]);
-    let bottom = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
+    let top = Layout::horizontal([Constraint::Percentage(39), Constraint::Percentage(61)])
+        .split(layout[1]);
+    let bottom = Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)])
         .split(layout[2]);
+    let bottom_right = Layout::vertical([
+        Constraint::Length(8),
+        Constraint::Length(10),
+        Constraint::Min(7),
+    ])
+    .split(bottom[1]);
+    let overlay_quotes = active_matching_external_quotes(snapshot, view);
     let selected_transport = selected_transport_marker(snapshot, view);
     let selected_recorder = selected_recorder_event(snapshot, view, selected_transport);
+    let overlay_best_exit = active_best_exit_quote_from_quotes(&overlay_quotes);
+    let overlay_smarkets_quote =
+        active_external_quote_for_venue_from_quotes(&overlay_quotes, "smarkets");
+    let overlay_matchbook_quote =
+        active_external_quote_for_venue_from_quotes(&overlay_quotes, "matchbook");
+    let overlay_betfair_quote =
+        active_external_quote_for_venue_from_quotes(&overlay_quotes, "betfair");
+    let overlay_betdaq_quote =
+        active_external_quote_for_venue_from_quotes(&overlay_quotes, "betdaq");
+    let overlay_sharp_quote = active_sharp_quote_from_quotes(&overlay_quotes, view);
+    let overlay_live_event = active_live_event(snapshot, view);
+    let overlay_half = overlay_fractional_cashout_outcomes(snapshot, view, 0.5);
+    let overlay_lock = overlay_total_cashout_outcomes(snapshot, view);
+    let overlay_action = overlay_action_label(
+        view,
+        overlay_best_exit.as_ref(),
+        overlay_sharp_quote.as_ref(),
+        overlay_lock,
+    );
+    let overlay_action_reason = overlay_action_reason(
+        view,
+        overlay_best_exit.as_ref(),
+        overlay_sharp_quote.as_ref(),
+        overlay_lock,
+    );
+    let overlay_market_edge =
+        overlay_market_edge_label_from_best_exit(view, overlay_best_exit.as_ref());
+    let overlay_fair_ev =
+        active_entry_ev_label_from_sharp(view, overlay_sharp_quote.as_ref(), &owls_dashboard.sport);
 
     let header = Paragraph::new(vec![
         Line::from(vec![
@@ -2540,28 +2960,27 @@ fn render_live_view_overlay(
             Span::styled(active_market_name(view), Style::default().fg(accent_gold())),
         ]),
         Line::from(vec![
-            Span::styled("Hold ", Style::default().fg(muted_text())),
-            Span::styled(active_hold_label(view), Style::default().fg(accent_green())),
-            Span::raw("   "),
-            Span::styled("Lock ", Style::default().fg(muted_text())),
-            Span::styled(active_lock_label(view), Style::default().fg(accent_green())),
-            Span::raw("   "),
-            Span::styled("Half ", Style::default().fg(muted_text())),
+            Span::styled("Position ", Style::default().fg(muted_text())),
             Span::styled(
-                active_half_exit_label(view),
-                Style::default().fg(accent_pink()),
-            ),
-            Span::raw("   "),
-            Span::styled("Book cash ", Style::default().fg(muted_text())),
-            Span::styled(
-                active_bookie_cashout_label(view),
-                Style::default().fg(accent_cyan()),
+                active_position_label(view),
+                Style::default().fg(Color::White),
             ),
             Span::raw("   "),
             Span::styled("Action ", Style::default().fg(muted_text())),
             Span::styled(
-                active_action_label(view),
-                Style::default().fg(accent_gold()),
+                format!("{overlay_action} ({overlay_action_reason})"),
+                Style::default()
+                    .fg(overlay_action_color(&overlay_action))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled("Best exit ", Style::default().fg(muted_text())),
+            Span::styled(
+                overlay_best_exit
+                    .as_ref()
+                    .map(overlay_exchange_quote_label)
+                    .unwrap_or_else(|| String::from("-")),
+                Style::default().fg(accent_cyan()),
             ),
         ]),
     ])
@@ -2569,76 +2988,42 @@ fn render_live_view_overlay(
     .wrap(Wrap { trim: true });
     frame.render_widget(header, layout[0]);
 
-    render_live_odds_chart(frame, middle[0], view);
-    render_key_value_table(
+    render_live_position_board(
         frame,
-        middle[1],
-        "󰄬 Position Detail",
-        vec![
-            ("󰆼 Position", active_position_label(view), accent_gold()),
-            ("󰇈 Market", active_market_name(view), accent_blue()),
-            (
-                "󰈀 Prob",
-                format!(
-                    "entry {} | live {}",
-                    active_entry_probability_label(view),
-                    active_probability_label(view)
-                ),
-                accent_cyan(),
-            ),
-            (
-                "󰐃 Cash / Lay",
-                format!(
-                    "{} | {}",
-                    active_bookie_cashout_label(view),
-                    active_live_odds_label(view)
-                ),
-                accent_green(),
-            ),
-            (
-                "󰌑 Flow",
-                format!(
-                    "{} | {}",
-                    active_status_label(view),
-                    active_trigger_label(view)
-                ),
-                accent_green(),
-            ),
-            ("󰖌 Exposure", active_exposure_label(view), accent_pink()),
-        ],
-        Constraint::Length(12),
+        top[0],
+        view,
+        &overlay_action,
+        &overlay_action_reason,
+        overlay_best_exit.as_ref(),
     );
-    render_key_value_table(
+    render_live_best_odds_board(
         frame,
-        middle[2],
-        "󰆑 Opportunity Lens",
-        vec![
-            ("󰈀 Price Edge", active_price_edge_label(view), accent_cyan()),
-            ("󰔟 Exit Edge", active_exit_edge_label(view), accent_green()),
-            (
-                "󰐃 Half Exit",
-                active_half_exit_stake_label(view),
-                accent_gold(),
-            ),
-            (
-                "󰔠 Full Exit",
-                active_full_exit_stake_label(view),
-                accent_gold(),
-            ),
-            ("󰖟 Entry EV", active_entry_ev_label(view), accent_pink()),
-            (
-                "󰋪 History",
-                active_historical_summary_label(snapshot, view),
-                accent_blue(),
-            ),
-        ],
-        Constraint::Length(12),
+        top[1],
+        &overlay_smarkets_quote,
+        &overlay_matchbook_quote,
+        &overlay_betfair_quote,
+        &overlay_betdaq_quote,
+        &overlay_sharp_quote,
+        &overlay_market_edge,
+        &overlay_fair_ev,
+        overlay_best_exit.as_ref(),
     );
 
-    render_live_decision_matrix(frame, bottom[0], view);
+    render_live_decision_matrix(frame, bottom[0], view, overlay_half, overlay_lock);
+    render_live_opportunity_board(
+        frame,
+        bottom_right[0],
+        snapshot,
+        view,
+        owls_dashboard,
+        overlay_half,
+        overlay_lock,
+        overlay_best_exit.as_ref(),
+    );
+    render_live_context_board(frame, bottom_right[1], overlay_live_event);
     render_live_execution_feed(
         frame,
-        bottom[1],
+        bottom_right[2],
         snapshot,
         view,
         selected_transport,
@@ -2646,78 +3031,366 @@ fn render_live_view_overlay(
     );
 }
 
-fn render_live_odds_chart(frame: &mut Frame<'_>, area: Rect, view: ActivePositionView<'_>) {
-    let points = live_odds_points(view);
-    let (min_y, max_y) = chart_bounds(&points);
-    let datasets = vec![Dataset::default()
-        .name("odds")
-        .graph_type(GraphType::Line)
-        .style(Style::default().fg(accent_cyan()))
-        .data(&points)];
-    let chart = Chart::new(datasets)
-        .block(section_block("󰑭 Odds Ladder", accent_blue()))
-        .x_axis(Axis::default().bounds([0.0, 3.0]).labels(vec![
-            Line::raw("Entry"),
-            Line::raw("Live"),
-            Line::raw("Target"),
-            Line::raw("Stop"),
-        ]))
-        .y_axis(Axis::default().bounds([min_y, max_y]).labels(vec![
-            Line::raw(format!("{min_y:.2}")),
-            Line::raw(format!("{max_y:.2}")),
-        ]));
-    frame.render_widget(chart, area);
+fn render_live_position_board(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: ActivePositionView<'_>,
+    overlay_action: &str,
+    overlay_action_reason: &str,
+    overlay_best_exit: Option<&ExchangeQuote>,
+) {
+    render_key_value_table(
+        frame,
+        area,
+        "󰄬 Position Board",
+        vec![
+            (
+                "󱓞 Book Entry",
+                active_sportsbook_leg_label(view),
+                accent_gold(),
+            ),
+            (
+                "󰐃 Lay Entry",
+                active_live_exchange_leg(view)
+                    .map(|(venue, entry_odds, stake, commission_rate)| {
+                        format!(
+                            "{venue} lay @ {entry_odds:.2} stake {stake:.2} comm {:.2}%",
+                            normalize_commission_rate(commission_rate) * 100.0
+                        )
+                    })
+                    .unwrap_or_else(|| String::from("-")),
+                accent_cyan(),
+            ),
+            (
+                "󰘷 Best Exit",
+                overlay_best_exit
+                    .map(overlay_exchange_quote_label)
+                    .unwrap_or_else(|| String::from("-")),
+                accent_pink(),
+            ),
+            (
+                "󰘳 Action",
+                format!("{overlay_action} ({overlay_action_reason})"),
+                overlay_action_color(overlay_action),
+            ),
+            (
+                "󰐃 Book Cash",
+                active_bookie_cashout_label(view),
+                accent_green(),
+            ),
+            ("󰌑 Flow", active_status_label(view), accent_green()),
+            ("󰖌 Exposure", active_exposure_label(view), accent_pink()),
+        ],
+        Constraint::Length(13),
+    );
 }
 
-fn render_live_decision_matrix(frame: &mut Frame<'_>, area: Rect, view: ActivePositionView<'_>) {
+fn render_live_best_odds_board(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    overlay_smarkets_quote: &Option<ExchangeQuote>,
+    overlay_matchbook_quote: &Option<ExchangeQuote>,
+    overlay_betfair_quote: &Option<ExchangeQuote>,
+    overlay_betdaq_quote: &Option<ExchangeQuote>,
+    overlay_sharp_quote: &Option<SharpQuote>,
+    overlay_market_edge: &str,
+    overlay_fair_ev: &str,
+    overlay_best_exit: Option<&ExchangeQuote>,
+) {
+    render_key_value_table(
+        frame,
+        area,
+        "󰑭 Best Odds Board",
+        vec![
+            (
+                "󰘷 Current Best",
+                overlay_best_exit
+                    .map(|quote| overlay_exchange_quote_label(quote))
+                    .unwrap_or_else(|| String::from("-")),
+                accent_cyan(),
+            ),
+            (
+                "󰐃 Smarkets",
+                overlay_smarkets_quote
+                    .as_ref()
+                    .map(overlay_exchange_quote_label)
+                    .unwrap_or_else(|| String::from("-")),
+                accent_cyan(),
+            ),
+            (
+                "󱎣 Matchbook",
+                overlay_matchbook_quote
+                    .as_ref()
+                    .map(overlay_exchange_quote_label)
+                    .unwrap_or_else(|| String::from("-")),
+                accent_green(),
+            ),
+            (
+                "󰖬 Betfair",
+                overlay_betfair_quote
+                    .as_ref()
+                    .map(overlay_exchange_quote_label)
+                    .unwrap_or_else(|| String::from("-")),
+                accent_green(),
+            ),
+            (
+                "󰖬 Betdaq",
+                overlay_betdaq_quote
+                    .as_ref()
+                    .map(overlay_exchange_quote_label)
+                    .unwrap_or_else(|| String::from("-")),
+                accent_green(),
+            ),
+            (
+                "󰇚 Sharp",
+                overlay_sharp_quote
+                    .as_ref()
+                    .map(|quote| {
+                        format!("{} {} @ {:.2}", quote.source, quote.selection, quote.price)
+                    })
+                    .unwrap_or_else(|| String::from("-")),
+                accent_blue(),
+            ),
+            (
+                "󰆤 Liquidity",
+                overlay_best_exit
+                    .and_then(|quote| quote.liquidity.map(|value| format!("{value:.2}")))
+                    .unwrap_or_else(|| String::from("-")),
+                accent_green(),
+            ),
+            (
+                "󰈀 Book vs Best",
+                overlay_market_edge.to_string(),
+                accent_gold(),
+            ),
+            ("󰖟 Fair EV", overlay_fair_ev.to_string(), accent_pink()),
+        ],
+        Constraint::Length(16),
+    );
+}
+
+fn render_live_opportunity_board(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &ExchangePanelSnapshot,
+    view: ActivePositionView<'_>,
+    _owls_dashboard: &OwlsDashboard,
+    overlay_half: Option<(f64, f64)>,
+    overlay_lock: Option<(f64, f64)>,
+    overlay_best_exit: Option<&ExchangeQuote>,
+) {
+    let hold_worst = active_hold_outcomes(view)
+        .map(|(win, lose)| win.min(lose))
+        .or_else(|| active_current_worst_case(view));
+    let half_worst = overlay_half.map(|(win, lose)| win.min(lose));
+    let lock_worst = overlay_lock.map(|(win, lose)| win.min(lose));
+    render_key_value_table(
+        frame,
+        area,
+        "󰆑 Opportunity Lens",
+        vec![
+            ("󰈀 Price Edge", active_price_edge_label(view), accent_cyan()),
+            (
+                "󰔟 Exit Edge",
+                lock_worst
+                    .zip(hold_worst)
+                    .map(|(lock, hold)| format!("{:+.2}", lock - hold))
+                    .unwrap_or_else(|| active_exit_edge_label(view)),
+                accent_green(),
+            ),
+            (
+                "󱂬 Hold Worst",
+                hold_worst
+                    .map(|value| format!("{value:+.2}"))
+                    .unwrap_or_else(|| String::from("-")),
+                hold_worst.map(overlay_pnl_color).unwrap_or_else(muted_text),
+            ),
+            (
+                "󰐃 Half Exit",
+                half_worst
+                    .map(|value| format!("{value:+.2}"))
+                    .unwrap_or_else(|| String::from("-")),
+                half_worst.map(overlay_pnl_color).unwrap_or_else(muted_text),
+            ),
+            (
+                "󰔠 Best Exit",
+                lock_worst
+                    .map(|value| format!("{value:+.2}"))
+                    .unwrap_or_else(|| String::from("-")),
+                lock_worst.map(overlay_pnl_color).unwrap_or_else(muted_text),
+            ),
+            (
+                "󰈀 Prob",
+                format!(
+                    "entry {} | exit {}",
+                    active_entry_probability_label(view),
+                    overlay_best_exit
+                        .map(|quote| format_probability(implied_probability(quote.price)))
+                        .unwrap_or_else(|| active_probability_label(view))
+                ),
+                accent_cyan(),
+            ),
+            (
+                "󰋪 History",
+                active_historical_summary_label(snapshot, view),
+                accent_blue(),
+            ),
+        ],
+        Constraint::Length(13),
+    );
+}
+
+fn overlay_exchange_quote_label(quote: &ExchangeQuote) -> String {
+    let liquidity = quote
+        .liquidity
+        .map(|value| format!(" liq {value:.2}"))
+        .unwrap_or_default();
+    format!(
+        "{} {} @ {:.2}{liquidity}",
+        quote.venue, quote.side, quote.price
+    )
+}
+
+fn overlay_market_edge_label_from_best_exit(
+    view: ActivePositionView<'_>,
+    overlay_best_exit: Option<&ExchangeQuote>,
+) -> String {
+    let Some((_, _, book_odds, _)) = active_sportsbook_leg(view) else {
+        return String::from("-");
+    };
+    let Some(best_exit) = overlay_best_exit else {
+        return String::from("-");
+    };
+    let edge_pct = ((book_odds / best_exit.price) - 1.0) * 100.0;
+    format!("{:+.2} | {edge_pct:+.2}%", book_odds - best_exit.price)
+}
+
+fn active_live_event<'a>(
+    snapshot: &'a ExchangePanelSnapshot,
+    view: ActivePositionView<'_>,
+) -> Option<&'a ExternalLiveEventRow> {
+    snapshot
+        .external_live_events
+        .iter()
+        .find(|live_event| event_matches(&live_event.event, &active_event_label(view)))
+}
+
+fn render_live_context_board(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    live_event: Option<&ExternalLiveEventRow>,
+) {
+    let Some(live_event) = live_event else {
+        let paragraph = Paragraph::new("No Owls live match context is matched for this row.")
+            .block(section_block("󰖟 Live Context", accent_blue()))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(paragraph, area);
+        return;
+    };
+
+    let mut lines = vec![Line::raw(format!(
+        "{} {}-{} {}  {}",
+        if live_event.away_team.trim().is_empty() {
+            String::from("-")
+        } else {
+            live_event.away_team.clone()
+        },
+        live_event.away_score.unwrap_or_default(),
+        live_event.home_score.unwrap_or_default(),
+        if live_event.home_team.trim().is_empty() {
+            String::from("-")
+        } else {
+            live_event.home_team.clone()
+        },
+        if !live_event.status_detail.trim().is_empty() {
+            live_event.status_detail.clone()
+        } else {
+            live_event.display_clock.clone()
+        }
+    ))];
+
+    if !live_event.stats.is_empty() {
+        let stats = live_event
+            .stats
+            .iter()
+            .take(4)
+            .map(|stat| format!("{} {}-{}", stat.label, stat.away_value, stat.home_value))
+            .collect::<Vec<_>>()
+            .join(" • ");
+        lines.push(Line::raw(truncate_text(&stats, 64)));
+    }
+    if !live_event.incidents.is_empty() {
+        let incidents = live_event
+            .incidents
+            .iter()
+            .take(2)
+            .map(|incident| {
+                let minute = incident
+                    .minute
+                    .map(|minute| format!("{minute}' "))
+                    .unwrap_or_default();
+                let detail = if incident.detail.trim().is_empty() {
+                    incident.player_name.clone()
+                } else if incident.player_name.trim().is_empty() {
+                    incident.detail.clone()
+                } else {
+                    format!("{} {}", incident.player_name, incident.detail)
+                };
+                format!("{minute}{} {detail}", incident.incident_type)
+            })
+            .collect::<Vec<_>>()
+            .join(" • ");
+        lines.push(Line::raw(truncate_text(&incidents, 64)));
+    }
+    if !live_event.player_ratings.is_empty() {
+        let ratings = live_event
+            .player_ratings
+            .iter()
+            .take(3)
+            .filter_map(|player| {
+                player
+                    .rating
+                    .map(|rating| format!("{} {:.1}", player.player_name, rating))
+            })
+            .collect::<Vec<_>>()
+            .join(" • ");
+        if !ratings.is_empty() {
+            lines.push(Line::raw(truncate_text(&ratings, 64)));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .block(section_block("󰖟 Live Context", accent_blue()))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, area);
+}
+
+fn render_live_decision_matrix(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: ActivePositionView<'_>,
+    half: Option<(f64, f64)>,
+    lock: Option<(f64, f64)>,
+) {
     let hold = active_hold_outcomes(view);
-    let half = active_half_cashout_outcomes(view);
-    let lock = active_total_cashout_outcomes(view);
     let rows = vec![
         Row::new(vec![
             Cell::from("Selection wins"),
-            Cell::from(
-                hold.map(|(win, _)| format!("{win:+.2}"))
-                    .unwrap_or_else(|| String::from("-")),
-            ),
-            Cell::from(
-                half.map(|(win, _)| format!("{win:+.2}"))
-                    .unwrap_or_else(|| String::from("-")),
-            ),
-            Cell::from(
-                lock.map(|(win, _)| format!("{win:+.2}"))
-                    .unwrap_or_else(|| String::from("-")),
-            ),
+            overlay_pnl_cell(hold.map(|(win, _)| win)),
+            overlay_pnl_cell(half.map(|(win, _)| win)),
+            overlay_pnl_cell(lock.map(|(win, _)| win)),
         ]),
         Row::new(vec![
             Cell::from("Selection loses"),
-            Cell::from(
-                hold.map(|(_, lose)| format!("{lose:+.2}"))
-                    .unwrap_or_else(|| String::from("-")),
-            ),
-            Cell::from(
-                half.map(|(_, lose)| format!("{lose:+.2}"))
-                    .unwrap_or_else(|| String::from("-")),
-            ),
-            Cell::from(
-                lock.map(|(_, lose)| format!("{lose:+.2}"))
-                    .unwrap_or_else(|| String::from("-")),
-            ),
+            overlay_pnl_cell(hold.map(|(_, lose)| lose)),
+            overlay_pnl_cell(half.map(|(_, lose)| lose)),
+            overlay_pnl_cell(lock.map(|(_, lose)| lose)),
         ]),
         Row::new(vec![
             Cell::from("Worst case"),
-            Cell::from(
-                hold.map(|(win, lose)| format!("{:+.2}", win.min(lose)))
-                    .unwrap_or_else(|| String::from("-")),
-            ),
-            Cell::from(
-                half.map(|(win, lose)| format!("{:+.2}", win.min(lose)))
-                    .unwrap_or_else(|| String::from("-")),
-            ),
-            Cell::from(
-                lock.map(|(win, lose)| format!("{:+.2}", win.min(lose)))
-                    .unwrap_or_else(|| String::from("-")),
-            ),
+            overlay_pnl_cell(hold.map(|(win, lose)| win.min(lose))),
+            overlay_pnl_cell(half.map(|(win, lose)| win.min(lose))),
+            overlay_pnl_cell(lock.map(|(win, lose)| win.min(lose))),
         ]),
     ];
     let table = Table::new(
@@ -2730,7 +3403,7 @@ fn render_live_decision_matrix(frame: &mut Frame<'_>, area: Rect, view: ActivePo
         ],
     )
     .header(
-        Row::new(vec!["Scenario", "Hold", "Half", "Lock"])
+        Row::new(vec!["Scenario", "Hold", "Half", "Best Exit"])
             .style(
                 Style::default()
                     .fg(Color::Black)
@@ -2742,6 +3415,15 @@ fn render_live_decision_matrix(frame: &mut Frame<'_>, area: Rect, view: ActivePo
     .block(section_block("󰄵 Decision Matrix", accent_blue()))
     .column_spacing(1);
     frame.render_widget(table, area);
+}
+
+fn overlay_pnl_cell(value: Option<f64>) -> Cell<'static> {
+    match value {
+        Some(value) => {
+            Cell::from(format!("{value:+.2}")).style(Style::default().fg(overlay_pnl_color(value)))
+        }
+        None => Cell::from("-").style(Style::default().fg(muted_text())),
+    }
 }
 
 fn render_live_execution_feed(
@@ -2777,37 +3459,6 @@ fn render_live_execution_feed(
         .block(section_block("󰐊 Execution Trail", accent_blue()))
         .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
-}
-
-fn live_odds_points(view: ActivePositionView<'_>) -> Vec<(f64, f64)> {
-    let entry = active_exchange_leg(view)
-        .map(|(_, odds, _, _)| odds)
-        .unwrap_or(0.0);
-    let live = active_current_back_odds(view).unwrap_or(entry);
-    let target = active_profit_target_odds(view).unwrap_or(live);
-    let stop = active_stop_loss_odds(view).unwrap_or(live);
-    vec![(0.0, entry), (1.0, live), (2.0, target), (3.0, stop)]
-}
-
-fn chart_bounds(points: &[(f64, f64)]) -> (f64, f64) {
-    let mut min_y = points
-        .iter()
-        .map(|(_, y)| *y)
-        .filter(|value| *value > 0.0)
-        .fold(f64::INFINITY, f64::min);
-    let mut max_y = points
-        .iter()
-        .map(|(_, y)| *y)
-        .fold(f64::NEG_INFINITY, f64::max);
-    if !min_y.is_finite() || !max_y.is_finite() || (max_y - min_y).abs() < f64::EPSILON {
-        min_y = 0.0;
-        max_y = 1.0;
-    } else {
-        let padding = ((max_y - min_y) * 0.12).max(0.1);
-        min_y = (min_y - padding).max(0.0);
-        max_y += padding;
-    }
-    (min_y, max_y)
 }
 
 fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
@@ -3365,16 +4016,21 @@ fn accent_red() -> Color {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::widgets::TableState;
+
     use crate::domain::{
-        ExchangePanelSnapshot, ExitPolicySummary, ExitRecommendation, OpenPositionRow,
-        RecorderEventSummary, TrackedBetRow, TrackedLeg, TransportMarkerSummary, ValueMetric,
-        VenueId, VenueStatus, VenueSummary, WatchSnapshot, WorkerStatus, WorkerSummary,
+        ExchangePanelSnapshot, ExitPolicySummary, ExitRecommendation, ExternalQuoteRow,
+        OpenPositionRow, RecorderEventSummary, TrackedBetRow, TrackedLeg, TransportMarkerSummary,
+        ValueMetric, VenueId, VenueStatus, VenueSummary, WatchSnapshot, WorkerStatus,
+        WorkerSummary,
     };
+    use crate::owls::{self, OwlsEndpointId, OwlsMarketQuote};
 
     use super::{
-        active_interaction_label, active_interaction_summary, active_position_rows,
-        active_position_views, exit_recommendation_lines, historical_position_rows,
-        open_position_lines, positions_pnl_summary, selected_position_interaction_lines,
+        active_interaction_label, active_interaction_summary, active_matchbook_quote_label,
+        active_position_rows, active_position_views, active_sharp_quote_label,
+        exit_recommendation_lines, historical_position_rows, open_position_lines,
+        positions_pnl_summary, selected_active_position_seed, selected_position_interaction_lines,
         summary_lines, tracked_bet_funding_counts, tracked_bet_funding_label, tracked_bet_lines,
         watch_lines,
     };
@@ -3422,6 +4078,8 @@ mod tests {
             tracked_bets: Vec::new(),
             exit_policy: Default::default(),
             exit_recommendations: Vec::new(),
+            external_quotes: Vec::new(),
+            external_live_events: Vec::new(),
             horse_matcher: None,
         };
 
@@ -4225,6 +4883,74 @@ mod tests {
         assert!(half.1 > lock.1);
     }
 
+    #[test]
+    fn selected_active_position_seed_prefers_snapshot_native_execution_fields() {
+        let mut snapshot = sample_snapshot();
+        snapshot.open_positions = vec![OpenPositionRow {
+            event: String::from("Arsenal v Everton"),
+            event_status: String::from("27'|Premier League"),
+            event_url: String::from(
+                "https://smarkets.com/football/england-premier-league/arsenal-v-everton",
+            ),
+            contract: String::from("Draw"),
+            market: String::from("Full-time result"),
+            status: String::from("Order filled"),
+            market_status: String::from("tradable"),
+            is_in_play: true,
+            price: 3.35,
+            stake: 9.91,
+            liability: 23.29,
+            current_value: 6.64,
+            pnl_amount: 3.27,
+            overall_pnl_known: true,
+            current_back_odds: Some(3.3),
+            current_implied_probability: Some(1.0 / 3.3),
+            current_implied_percentage: Some(100.0 / 3.3),
+            current_buy_odds: Some(3.3),
+            current_buy_implied_probability: Some(1.0 / 3.3),
+            current_sell_odds: Some(3.4),
+            current_sell_implied_probability: Some(1.0 / 3.4),
+            current_score: String::from("0-0"),
+            current_score_home: Some(0),
+            current_score_away: Some(0),
+            live_clock: String::from("27'"),
+            can_trade_out: true,
+        }];
+        snapshot.external_quotes = vec![ExternalQuoteRow {
+            provider: String::from("owls"),
+            venue: String::from("matchbook"),
+            event: String::from("Arsenal v Everton"),
+            market: String::from("Full-time result"),
+            selection: String::from("Draw"),
+            side: String::from("back"),
+            event_url: String::from("https://elsewhere.example/event"),
+            deep_link_url: String::from("https://elsewhere.example/deep-link"),
+            event_id: String::from("evt-1"),
+            market_id: String::from("mkt-1"),
+            selection_id: String::from("sel-1"),
+            price: Some(3.4),
+            liquidity: Some(100.0),
+            is_sharp: false,
+            updated_at: String::from("2026-03-26T12:00:00Z"),
+            status: String::from("ready"),
+        }];
+
+        let seed = selected_active_position_seed(&snapshot, &TableState::default())
+            .expect("position seed");
+
+        assert_eq!(seed.venue, VenueId::Smarkets);
+        assert_eq!(
+            seed.event_url.as_deref(),
+            Some("https://smarkets.com/football/england-premier-league/arsenal-v-everton")
+        );
+        assert_eq!(seed.deep_link_url, None);
+        assert_eq!(seed.betslip_event_id, None);
+        assert_eq!(seed.betslip_market_id, None);
+        assert_eq!(seed.betslip_selection_id, None);
+        assert_eq!(seed.buy_price, Some(3.3));
+        assert_eq!(seed.sell_price, Some(3.4));
+    }
+
     fn sample_snapshot() -> ExchangePanelSnapshot {
         ExchangePanelSnapshot {
             worker: WorkerSummary {
@@ -4349,6 +5075,8 @@ mod tests {
                 worst_case_pnl: 1.27,
                 cash_out_venue: Some(String::from("smarkets")),
             }],
+            external_quotes: Vec::new(),
+            external_live_events: Vec::new(),
             horse_matcher: None,
         }
     }
@@ -4382,5 +5110,136 @@ mod tests {
             live_clock: String::from("27'"),
             can_trade_out: true,
         }
+    }
+
+    #[test]
+    fn fallback_matching_attaches_book_entry_on_event_and_selection_alias() {
+        let mut snapshot = sample_snapshot();
+        let mut open_position = sample_open_row();
+        open_position.event = String::from("Malta vs Luxembourg");
+        open_position.contract = String::from("Draw");
+        open_position.market = String::from("Full-time result");
+        open_position.price = 3.35;
+        open_position.stake = 25.0;
+        open_position.liability = 58.75;
+        open_position.current_value = 0.0;
+        open_position.pnl_amount = 0.0;
+        open_position.current_back_odds = None;
+        open_position.current_buy_odds = None;
+        open_position.current_sell_odds = None;
+        open_position.is_in_play = false;
+        open_position.can_trade_out = false;
+        snapshot.open_positions = vec![open_position];
+        snapshot.tracked_bets = vec![TrackedBetRow {
+            event: String::from("Malta v Luxembourg"),
+            market: String::from("Match Betting"),
+            selection: String::from("X"),
+            stake_gbp: Some(50.0),
+            potential_returns_gbp: Some(160.0),
+            legs: vec![TrackedLeg {
+                venue: String::from("betway"),
+                outcome: String::from("X"),
+                side: String::from("back"),
+                odds: 3.2,
+                stake: 50.0,
+                market: String::from("Match Betting"),
+                ..TrackedLeg::default()
+            }],
+            ..TrackedBetRow::default()
+        }];
+
+        let view = super::active_position_views(&snapshot)
+            .into_iter()
+            .next()
+            .expect("active view");
+
+        assert!(view.tracked_bet.is_some());
+        assert_eq!(
+            super::active_sportsbook_leg_label(view),
+            "betway X @ 3.20 stake 50.00 ret 160.00"
+        );
+    }
+
+    #[test]
+    fn live_view_matches_matchbook_and_sharp_quotes_across_source_aliases() {
+        let mut snapshot = sample_snapshot();
+        let mut open_position = sample_open_row();
+        open_position.event = String::from("Malta vs Luxembourg");
+        open_position.contract = String::from("Draw");
+        open_position.market = String::from("Full-time result");
+        open_position.current_back_odds = None;
+        open_position.current_buy_odds = None;
+        open_position.current_sell_odds = None;
+        snapshot.open_positions = vec![open_position];
+        snapshot.tracked_bets = vec![TrackedBetRow {
+            event: String::from("Malta v Luxembourg"),
+            market: String::from("Match Betting"),
+            selection: String::from("X"),
+            legs: vec![TrackedLeg {
+                venue: String::from("betway"),
+                outcome: String::from("X"),
+                side: String::from("back"),
+                odds: 3.2,
+                stake: 50.0,
+                market: String::from("Match Betting"),
+                ..TrackedLeg::default()
+            }],
+            ..TrackedBetRow::default()
+        }];
+
+        let mut owls_dashboard = owls::dashboard_for_sport("soccer");
+        let endpoint = owls_dashboard
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.id == OwlsEndpointId::Realtime)
+            .expect("realtime endpoint");
+        endpoint.quotes = vec![OwlsMarketQuote {
+            book: String::from("pinnacle"),
+            event: String::from("Luxembourg @ Malta"),
+            selection: String::from("Draw"),
+            market_key: String::from("h2h"),
+            decimal_price: Some(3.10),
+            ..OwlsMarketQuote::default()
+        }];
+        snapshot.external_quotes = vec![
+            ExternalQuoteRow {
+                provider: String::from("owls"),
+                venue: String::from("matchbook"),
+                event: String::from("Malta vs Luxembourg"),
+                market: String::from("Full-time result"),
+                selection: String::from("Draw"),
+                side: String::from("back"),
+                price: Some(3.25),
+                liquidity: Some(120.0),
+                status: String::from("ready"),
+                ..ExternalQuoteRow::default()
+            },
+            ExternalQuoteRow {
+                provider: String::from("owls"),
+                venue: String::from("pinnacle"),
+                event: String::from("Malta vs Luxembourg"),
+                market: String::from("Full-time result"),
+                selection: String::from("Draw"),
+                side: String::from("back"),
+                price: Some(3.10),
+                is_sharp: true,
+                status: String::from("ready"),
+                ..ExternalQuoteRow::default()
+            },
+        ];
+
+        let view = active_position_views(&snapshot)
+            .into_iter()
+            .next()
+            .expect("active view");
+
+        assert_eq!(
+            active_matchbook_quote_label(&snapshot, view),
+            "matchbook back @ 3.25 liq 120.00"
+        );
+        assert_eq!(
+            active_sharp_quote_label(&snapshot, &owls_dashboard, view),
+            "pinnacle Draw @ 3.10"
+        );
     }
 }

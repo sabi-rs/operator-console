@@ -6,6 +6,7 @@ use operator_console::domain::{
     TransportMarkerSummary, VenueId, VenueStatus, VenueSummary, WatchRow, WatchSnapshot,
     WorkerStatus, WorkerSummary,
 };
+use operator_console::owls::{self, OwlsEndpointId, OwlsPreviewRow};
 use operator_console::provider::{ExchangeProvider, ProviderRequest};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
@@ -62,6 +63,54 @@ fn live_and_props_panels_render_dedicated_owls_views() {
     assert!(live.contains("Live Board"));
     assert!(props.contains("Owls Props"));
     assert!(props.contains("Props Board"));
+}
+
+#[test]
+fn props_panel_handles_unicode_preview_rows_without_crashing() {
+    let mut app = App::from_provider(StaticProvider {
+        snapshot: sample_snapshot(),
+    })
+    .expect("app");
+    app.set_trading_section(TradingSection::Props);
+
+    let mut dashboard = owls::dashboard_for_sport("soccer");
+    if let Some(endpoint) = dashboard
+        .endpoints
+        .iter_mut()
+        .find(|endpoint| endpoint.id == OwlsEndpointId::Props)
+    {
+        endpoint.status = String::from("ready");
+        endpoint.count = 1;
+        endpoint.detail = String::from("games 1");
+        endpoint.preview = vec![OwlsPreviewRow {
+            label: format!("{}ü matchup", "A".repeat(68)),
+            detail: String::from("José María prop sample"),
+            metric: String::from("shots 2.5"),
+        }];
+    }
+    app.set_owls_dashboard_for_test(dashboard);
+
+    let backend = TestBackend::new(160, 40);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| operator_console::ui::render(frame, &mut app))
+        .expect("draw ui");
+
+    let buffer = terminal.backend().buffer().clone();
+    let area = buffer.area;
+    let mut lines = Vec::new();
+    for y in 0..area.height {
+        let mut line = String::new();
+        for x in 0..area.width {
+            line.push_str(buffer.cell((x, y)).expect("cell").symbol());
+        }
+        lines.push(line);
+    }
+    let rendered = lines.join("\n");
+
+    assert!(rendered.contains("Owls Props"));
+    assert!(rendered.contains("Prop Preview"));
+    assert!(rendered.contains("ü..."));
 }
 
 #[test]
@@ -126,10 +175,12 @@ fn positions_live_view_overlay_renders_cashout_and_matrix() {
     assert!(rendered.contains("Live View"));
     assert!(rendered.contains("Opportunity Lens"));
     assert!(rendered.contains("Decision Matrix"));
-    assert!(rendered.contains("Half"));
+    assert!(rendered.contains("Position Board"));
+    assert!(rendered.contains("Best Odds Board"));
+    assert!(rendered.contains("Current Best"));
     assert!(rendered.contains("Execution Trail"));
     assert!(rendered.contains("cash_out bet-1"));
-    assert!(rendered.contains("16.16"));
+    assert!(rendered.contains("Book Entry"));
 }
 
 #[test]
@@ -493,6 +544,8 @@ fn sample_snapshot() -> ExchangePanelSnapshot {
             worst_case_pnl: 1.5,
             cash_out_venue: Some(String::from("smarkets")),
         }],
+        external_quotes: Vec::new(),
+        external_live_events: Vec::new(),
         horse_matcher: None,
     }
 }

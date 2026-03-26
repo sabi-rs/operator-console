@@ -1,11 +1,12 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Padding, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, ObservabilitySection, Panel, TradingSection};
+use crate::app::{App, ObservabilitySection, Panel, PositionsRenderState, TradingSection};
 use crate::domain::WorkerStatus;
+use crate::manual_positions::ManualPositionField;
 use crate::panels;
 use crate::recorder::RecorderStatus;
 
@@ -22,7 +23,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     panels::trading_markets::render_overlay(frame, frame.area(), app);
     panels::trading_action_overlay::render(frame, frame.area(), app);
+    render_manual_position_overlay(frame, frame.area(), app);
     render_keymap_overlay(frame, frame.area(), app);
+    render_notifications_overlay(frame, frame.area(), app);
 }
 
 fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -33,23 +36,28 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             render_trading_subnav(frame, layout[0], app);
             match app.active_trading_section() {
                 TradingSection::Positions => {
-                    let snapshot = app.snapshot().clone();
-                    let owls_dashboard = app.owls_dashboard().clone();
-                    let status_message = app.status_message().to_string();
-                    let status_scroll = app.status_scroll();
-                    let positions_focus = app.positions_focus();
-                    let show_live_view_overlay = app.live_view_overlay_visible();
-                    let (open_state, historical_state) = app.position_table_states();
+                    let PositionsRenderState {
+                        snapshot,
+                        owls_dashboard,
+                        matchbook_account_state,
+                        open_table_state,
+                        historical_table_state,
+                        positions_focus,
+                        show_live_view_overlay,
+                        status_message,
+                        status_scroll,
+                    } = app.positions_render_state();
                     panels::trading_positions::render(
                         frame,
                         layout[1],
-                        &snapshot,
-                        &owls_dashboard,
-                        open_state,
-                        historical_state,
+                        snapshot,
+                        owls_dashboard,
+                        matchbook_account_state,
+                        open_table_state,
+                        historical_table_state,
                         positions_focus,
                         show_live_view_overlay,
-                        &status_message,
+                        status_message,
                         status_scroll,
                     )
                 }
@@ -63,6 +71,7 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     app.snapshot(),
                     app.matchbook_account_state(),
                 ),
+                TradingSection::Alerts => panels::alerts::render(frame, layout[1], app),
                 TradingSection::Calculator => panels::calculator::render(frame, layout[1], app),
                 TradingSection::Recorder => panels::recorder::render(frame, layout[1], app),
             }
@@ -209,6 +218,16 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 &format!("{owls_ready}/{owls_total}"),
                 accent_blue(),
             ),
+            Span::raw("  "),
+            badge_line(
+                "󰍡 Alerts",
+                &app.unread_notification_count().to_string(),
+                if app.unread_notification_count() > 0 {
+                    accent_gold()
+                } else {
+                    muted_text()
+                },
+            ),
         ]),
     ])
     .block(shell_block("Status", accent_blue()).padding(Padding::horizontal(1)))
@@ -228,22 +247,144 @@ fn render_keymap_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::raw(truncate_line(app.status_message(), 70)),
         ]),
         Line::raw(""),
-        Line::raw("? toggle keymap  •  q quit  •  esc close overlay/cancel"),
+        Line::raw("? toggle keymap  •  n toggle alerts  •  q quit  •  esc close overlay/cancel"),
         Line::raw("o observability  •  h/l sections  •  arrows or j/k navigate"),
         Line::raw("tab rotate pane tool/view  •  enter open/edit  •  r cache  •  R live"),
         Line::raw("[ / ] cycle Owls sport  •  s start recorder  •  x stop recorder"),
-        Line::raw("c cash out first actionable  •  p place action"),
+        Line::raw("c cash out first actionable  •  p place action  •  a manual position"),
         Line::raw("v live overlay  •  u reload config  •  D defaults"),
         Line::raw("b cycle calc type  •  m toggle calc mode"),
     ];
     let overlay = Paragraph::new(lines)
         .block(shell_block("󰘳 Keymap", accent_gold()).padding(Padding::horizontal(1)))
         .wrap(Wrap { trim: true });
+    frame.render_widget(Clear, popup);
     frame.render_widget(
         Block::default().style(Style::default().bg(shell_background())),
         popup,
     );
     frame.render_widget(overlay, popup);
+}
+
+fn render_notifications_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if !app.notifications_overlay_visible() {
+        return;
+    }
+
+    let popup = popup_area(area, 74, 58);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Unread ", Style::default().fg(accent_gold())),
+            Span::raw(app.unread_notification_count().to_string()),
+            Span::raw("  "),
+            Span::styled("Recent ", Style::default().fg(accent_blue())),
+            Span::raw(app.notifications().len().to_string()),
+        ]),
+        Line::raw(""),
+    ];
+    if app.notifications().is_empty() {
+        lines.push(Line::raw("No notifications yet."));
+    } else {
+        for entry in app.notifications().iter().rev().take(10) {
+            let level_color = match entry.level {
+                crate::alerts::NotificationLevel::Info => accent_blue(),
+                crate::alerts::NotificationLevel::Warning => accent_gold(),
+                crate::alerts::NotificationLevel::Critical => accent_red(),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} {} ", entry.created_at, entry.level.label()),
+                    Style::default()
+                        .fg(level_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(truncate_line(&entry.title, 28)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default().fg(muted_text())),
+                Span::raw(truncate_line(&entry.detail, 72)),
+            ]));
+        }
+    }
+
+    let overlay = Paragraph::new(lines)
+        .block(shell_block("󰍡 Notifications", accent_gold()).padding(Padding::horizontal(1)))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(shell_background())),
+        popup,
+    );
+    frame.render_widget(overlay, popup);
+}
+
+fn render_manual_position_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(overlay) = app.manual_position_overlay() else {
+        return;
+    };
+
+    let popup = popup_area(area, 70, 66);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Selected ", Style::default().fg(accent_blue())),
+            Span::raw(format!(
+                "{} / {} / {}",
+                truncate_line(&overlay.draft.event, 28),
+                truncate_line(&overlay.draft.market, 20),
+                truncate_line(&overlay.draft.selection, 16)
+            )),
+        ]),
+        Line::raw(""),
+    ];
+
+    for field in ManualPositionField::ALL {
+        let selected = overlay.selected_field() == field;
+        let label = format!("{:>9}", field.label());
+        let value = match field {
+            ManualPositionField::Save => String::from("Press Enter to save"),
+            _ if overlay.editing && selected => overlay.input_buffer.clone(),
+            _ => overlay.selected_value_for(field),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "▶ " } else { "  " },
+                Style::default().fg(if selected {
+                    accent_gold()
+                } else {
+                    muted_text()
+                }),
+            ),
+            Span::styled(
+                format!("{label}: "),
+                Style::default()
+                    .fg(if selected {
+                        accent_cyan()
+                    } else {
+                        muted_text()
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                truncate_line(&value, 52),
+                Style::default().fg(if selected { text_color() } else { muted_text() }),
+            ),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(
+        "j/k move  •  enter edit/apply/save  •  esc/q close",
+    ));
+    lines.push(Line::raw(truncate_line(app.manual_positions_note(), 72)));
+
+    let overlay_widget = Paragraph::new(lines)
+        .block(shell_block("󰍉 Manual Position", accent_gold()).padding(Padding::horizontal(1)))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(shell_background())),
+        popup,
+    );
+    frame.render_widget(overlay_widget, popup);
 }
 
 fn shell_block(title: &'static str, color: Color) -> Block<'static> {
@@ -409,8 +550,9 @@ fn trading_index(section: TradingSection) -> usize {
         TradingSection::Props => 3,
         TradingSection::Matcher => 4,
         TradingSection::Stats => 5,
-        TradingSection::Calculator => 6,
-        TradingSection::Recorder => 7,
+        TradingSection::Alerts => 6,
+        TradingSection::Calculator => 7,
+        TradingSection::Recorder => 8,
     }
 }
 

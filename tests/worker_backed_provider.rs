@@ -227,6 +227,7 @@ fn worker_backed_provider_maps_execute_trading_action_request() {
         expected_price: 2.44,
         event_url: None,
         deep_link_url: Some(String::from("https://smarkets.com/betslip/1")),
+        betslip_event_id: Some(String::from("event-1")),
         betslip_market_id: Some(String::from("market-1")),
         betslip_selection_id: Some(String::from("selection-1")),
         execution_policy: TradingExecutionPolicy::new(TradingTimeInForce::GoodTilCancel),

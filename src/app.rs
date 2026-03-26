@@ -1,11 +1,3 @@
-use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
-use std::time::Duration;
-use std::time::Instant;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 use ratatui::backend::Backend;
@@ -13,7 +5,20 @@ use ratatui::layout::Rect;
 use ratatui::widgets::{ListState, TableState};
 use ratatui::{Frame, Terminal};
 use reqwest::blocking::Client;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{debug, info, warn};
 
+use crate::alerts::{
+    self, load_alert_config_or_default, save_alert_config, AlertConfig, AlertEditorState,
+    AlertField, NotificationEntry, NotificationLevel,
+};
 pub use crate::app_state::{
     CalculatorEditorState, CalculatorField, CalculatorSourceContext, CalculatorState,
     CalculatorTool, MatcherView, ObservabilitySection, OddsMatcherFocus, Panel, PositionsFocus,
@@ -21,10 +26,22 @@ pub use crate::app_state::{
 };
 use crate::calculator::{self, BetType, Mode as CalculatorMode};
 use crate::domain::{
-    ExchangePanelSnapshot, OpenPositionRow, TrackedBetRow, TrackedLeg, VenueId, WorkerStatus,
+    ExchangePanelSnapshot, ExternalLiveEventRow, ExternalLiveIncidentRow, ExternalLiveStatRow,
+    ExternalPlayerRatingRow, ExternalQuoteRow, OpenPositionRow, TrackedBetRow, TrackedLeg, VenueId,
+    WorkerStatus,
 };
-use crate::exchange_api::{load_matchbook_account_state, MatchbookAccountState};
+use crate::exchange_api::{
+    MatchbookAccountState, MatchbookBetRow, MatchbookOfferRow, MatchbookPositionRow,
+};
 use crate::horse_matcher::{self, HorseMatcherEditorState, HorseMatcherField, HorseMatcherQuery};
+use crate::manual_positions::{
+    self, load_entries_or_default, save_entries, ManualPositionEntry, ManualPositionField,
+    ManualPositionOverlayState,
+};
+use crate::market_normalization::{
+    event_matches, market_matches, normalize_key, selection_matches,
+    selection_matches_with_context, text_matches,
+};
 use crate::native_provider::{HybridExchangeProvider, NativeExchangeProvider};
 use crate::oddsmatcher::{
     self, GetBestMatchesVariables, OddsMatcherEditorState, OddsMatcherField, OddsMatcherRow,
@@ -42,6 +59,9 @@ use crate::recorder::{
     ProcessRecorderSupervisor, RecorderConfig, RecorderEditorState, RecorderField, RecorderStatus,
     RecorderSupervisor,
 };
+use crate::resource_state::ResourceState;
+use crate::runtime::{AppRuntimeChannels, AppRuntimeHost};
+use crate::snapshot_projection::project_snapshot;
 use crate::stub_provider::StubExchangeProvider;
 use crate::trading_actions::{
     format_decimal, TradingActionMode, TradingActionSeed, TradingActionSide, TradingActionSource,
@@ -54,38 +74,38 @@ use crate::worker_client::{BetRecorderWorkerClient, WorkerClientExchangeProvider
 type ProviderFactory = dyn Fn(&RecorderConfig) -> Box<dyn ExchangeProvider + Send>;
 type StubFactory = dyn Fn() -> Box<dyn ExchangeProvider + Send>;
 
-struct ProviderJob {
-    request: ProviderRequest,
-    failure_context: String,
-    event_message: Option<String>,
+pub(crate) struct ProviderJob {
+    pub(crate) request: ProviderRequest,
+    pub(crate) failure_context: String,
+    pub(crate) event_message: Option<String>,
 }
 
-struct ProviderResult {
-    request: ProviderRequest,
-    result: std::result::Result<ExchangePanelSnapshot, String>,
-    failure_context: String,
-    event_message: Option<String>,
+pub(crate) struct ProviderResult {
+    pub(crate) request: ProviderRequest,
+    pub(crate) result: std::result::Result<ExchangePanelSnapshot, String>,
+    pub(crate) failure_context: String,
+    pub(crate) event_message: Option<String>,
 }
 
-struct OwlsSyncJob {
-    dashboard: OwlsDashboard,
-    reason: OwlsSyncReason,
-    focused: Option<OwlsEndpointId>,
+pub(crate) struct OwlsSyncJob {
+    pub(crate) dashboard: OwlsDashboard,
+    pub(crate) reason: OwlsSyncReason,
+    pub(crate) focused: Option<OwlsEndpointId>,
 }
 
-struct OwlsSyncResult {
-    outcome: owls::OwlsSyncOutcome,
-    reason: OwlsSyncReason,
+pub(crate) struct OwlsSyncResult {
+    pub(crate) outcome: owls::OwlsSyncOutcome,
+    pub(crate) reason: OwlsSyncReason,
 }
 
 #[derive(Clone, Copy)]
-enum MatchbookSyncReason {
+pub(crate) enum MatchbookSyncReason {
     Manual,
     Background,
 }
 
 impl MatchbookSyncReason {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Manual => "manual",
             Self::Background => "monitor",
@@ -93,21 +113,33 @@ impl MatchbookSyncReason {
     }
 }
 
-struct MatchbookSyncJob {
-    reason: MatchbookSyncReason,
+pub(crate) struct MatchbookSyncJob {
+    pub(crate) reason: MatchbookSyncReason,
 }
 
-struct MatchbookSyncResult {
-    state: std::result::Result<MatchbookAccountState, String>,
-    reason: MatchbookSyncReason,
+pub(crate) struct MatchbookSyncResult {
+    pub(crate) state: std::result::Result<MatchbookAccountState, String>,
+    pub(crate) reason: MatchbookSyncReason,
 }
 
-struct OddsMatcherJob {
-    query: GetBestMatchesVariables,
+pub struct PositionsRenderState<'a> {
+    pub snapshot: &'a ExchangePanelSnapshot,
+    pub owls_dashboard: &'a OwlsDashboard,
+    pub matchbook_account_state: Option<&'a MatchbookAccountState>,
+    pub open_table_state: &'a mut TableState,
+    pub historical_table_state: &'a mut TableState,
+    pub positions_focus: PositionsFocus,
+    pub show_live_view_overlay: bool,
+    pub status_message: &'a str,
+    pub status_scroll: u16,
 }
 
-struct OddsMatcherResult {
-    result: std::result::Result<Vec<OddsMatcherRow>, String>,
+pub(crate) struct OddsMatcherJob {
+    pub(crate) query: GetBestMatchesVariables,
+}
+
+pub(crate) struct OddsMatcherResult {
+    pub(crate) result: std::result::Result<Vec<OddsMatcherRow>, String>,
 }
 
 #[derive(Clone, Copy)]
@@ -124,10 +156,14 @@ struct MouseTarget {
 }
 
 pub struct App {
-    provider_tx: Sender<ProviderJob>,
-    provider_rx: Receiver<ProviderResult>,
+    runtime_host: AppRuntimeHost,
+    provider_tx: tokio::sync::mpsc::UnboundedSender<ProviderJob>,
+    provider_rx: tokio::sync::mpsc::UnboundedReceiver<ProviderResult>,
     provider_in_flight: bool,
+    provider_resource_state: ResourceState<ExchangePanelSnapshot>,
     provider_pending_job: Option<ProviderJob>,
+    #[cfg(debug_assertions)]
+    provider_in_flight_started_at_for_test: Option<Instant>,
     make_stub_provider: Box<StubFactory>,
     make_recorder_provider: Box<ProviderFactory>,
     recorder_supervisor: Box<dyn RecorderSupervisor>,
@@ -135,6 +171,17 @@ pub struct App {
     recorder_config_path: std::path::PathBuf,
     recorder_config_note: String,
     recorder_editor: RecorderEditorState,
+    alerts_config: AlertConfig,
+    alerts_config_path: std::path::PathBuf,
+    alerts_config_note: String,
+    alerts_editor: AlertEditorState,
+    manual_positions: Vec<ManualPositionEntry>,
+    manual_positions_path: PathBuf,
+    manual_positions_note: String,
+    manual_position_overlay: Option<ManualPositionOverlayState>,
+    alert_last_sent_at: HashMap<&'static str, Instant>,
+    notifications: VecDeque<NotificationEntry>,
+    notifications_overlay_visible: bool,
     recorder_status: RecorderStatus,
     calculator: CalculatorState,
     calculator_tool: CalculatorTool,
@@ -142,14 +189,16 @@ pub struct App {
     oddsmatcher_rx: Receiver<OddsMatcherResult>,
     oddsmatcher_in_flight: bool,
     oddsmatcher_pending_query: Option<GetBestMatchesVariables>,
-    owls_sync_tx: Sender<OwlsSyncJob>,
-    owls_sync_rx: Receiver<OwlsSyncResult>,
+    owls_sync_tx: tokio::sync::mpsc::UnboundedSender<OwlsSyncJob>,
+    owls_sync_rx: tokio::sync::mpsc::UnboundedReceiver<OwlsSyncResult>,
     owls_sync_in_flight: bool,
+    owls_resource_state: ResourceState<OwlsDashboard>,
     owls_sync_pending_reason: Option<OwlsSyncReason>,
     last_owls_sync_dispatch_at: Option<Instant>,
-    matchbook_sync_tx: Sender<MatchbookSyncJob>,
-    matchbook_sync_rx: Receiver<MatchbookSyncResult>,
+    matchbook_sync_tx: tokio::sync::mpsc::UnboundedSender<MatchbookSyncJob>,
+    matchbook_sync_rx: tokio::sync::mpsc::UnboundedReceiver<MatchbookSyncResult>,
     matchbook_sync_in_flight: bool,
+    matchbook_resource_state: ResourceState<MatchbookAccountState>,
     matchbook_sync_pending_reason: Option<MatchbookSyncReason>,
     last_matchbook_sync_dispatch_at: Option<Instant>,
     matchbook_account_state: Option<MatchbookAccountState>,
@@ -191,6 +240,8 @@ pub struct App {
     running: bool,
     status_message: String,
     status_scroll: u16,
+    recorder_startup_alerts_pending: bool,
+    recorder_startup_alerts_muted_until: Option<Instant>,
 }
 
 const MAX_EVENT_HISTORY: usize = 25;
@@ -199,6 +250,9 @@ const RECORDER_REFRESH_INTERVAL_ACTIVE: Duration = Duration::from_secs(2);
 const RECORDER_REFRESH_INTERVAL_BOOTSTRAP: Duration = Duration::from_secs(1);
 const OWLS_SYNC_DISPATCH_INTERVAL: Duration = Duration::from_secs(1);
 const MATCHBOOK_SYNC_DISPATCH_INTERVAL: Duration = Duration::from_secs(4);
+const RECORDER_STARTUP_ALERT_MUTE: Duration = Duration::from_secs(15);
+const MAX_NOTIFICATIONS: usize = 50;
+const RESOURCE_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Default for App {
     fn default() -> Self {
@@ -214,7 +268,7 @@ impl Default for App {
                 )
             });
         let make_recorder_provider = default_recorder_provider_factory();
-        Self::with_dependencies_and_storage(
+        let mut app = Self::with_dependencies_and_storage(
             provider,
             Box::new(stub_factory),
             make_recorder_provider,
@@ -223,7 +277,10 @@ impl Default for App {
             recorder_config_path,
             recorder_config_note,
         )
-        .expect("default stub provider should load dashboard")
+        .expect("default stub provider should load dashboard");
+        app.load_alerts_from_disk(alerts::default_config_path())
+            .expect("default alerts config should load");
+        app
     }
 }
 
@@ -237,7 +294,7 @@ impl App {
                     format!("Recorder config load failed; using defaults: {error}"),
                 )
             });
-        Self::with_dependencies_and_storage(
+        let mut app = Self::with_dependencies_and_storage(
             Box::new(provider),
             Box::new(|| Box::new(StubExchangeProvider::default())),
             default_recorder_provider_factory(),
@@ -245,7 +302,9 @@ impl App {
             recorder_config,
             recorder_config_path,
             recorder_config_note,
-        )
+        )?;
+        app.load_alerts_from_disk(alerts::default_config_path())?;
+        Ok(app)
     }
 
     pub fn with_dependencies(
@@ -321,12 +380,6 @@ impl App {
         oddsmatcher_query_path: PathBuf,
         horse_matcher_query_path: PathBuf,
     ) -> Result<Self> {
-        let snapshot = normalize_snapshot(
-            provider.handle(ProviderRequest::LoadDashboard)?,
-            &recorder_config.disabled_venues,
-        );
-        let last_successful_snapshot_at = runtime_updated_at(&snapshot).map(str::to_string);
-        let status_message = snapshot.status_line.clone();
         let (oddsmatcher_query, oddsmatcher_query_note) =
             oddsmatcher::load_query_or_default(&oddsmatcher_query_path).unwrap_or_else(|error| {
                 (
@@ -343,6 +396,25 @@ impl App {
                 format!("Horse Matcher config load failed; using defaults: {error}"),
             )
         });
+        let manual_positions_path = recorder_config_path
+            .parent()
+            .map(|parent| parent.join("manual_positions.json"))
+            .unwrap_or_else(manual_positions::default_config_path);
+        let (manual_positions, manual_positions_note) =
+            load_entries_or_default(&manual_positions_path).unwrap_or_else(|error| {
+                (
+                    Vec::new(),
+                    format!("Manual positions load failed; using empty defaults: {error}"),
+                )
+            });
+        let runtime_host = AppRuntimeHost::new()?;
+        let snapshot = normalize_snapshot(
+            provider.handle(ProviderRequest::LoadDashboard)?,
+            &recorder_config.disabled_venues,
+            &manual_positions,
+        );
+        let last_successful_snapshot_at = runtime_updated_at(&snapshot).map(str::to_string);
+        let status_message = snapshot.status_line.clone();
         let mut open_position_table_state = TableState::default();
         let mut historical_position_table_state = TableState::default();
         let positions_focus = if !snapshot.open_positions.is_empty() {
@@ -361,23 +433,19 @@ impl App {
                 .build()
                 .unwrap_or_else(|_| Client::new())
         });
-        let owls_client = owls::build_client().unwrap_or_else(|_| {
-            Client::builder()
-                .connect_timeout(Duration::from_secs(5))
-                .timeout(Duration::from_secs(15))
-                .build()
-                .unwrap_or_else(|_| Client::new())
-        });
-        let (provider_tx, provider_rx) = start_provider_worker(provider);
-        let (oddsmatcher_tx, oddsmatcher_rx) = start_oddsmatcher_worker(oddsmatcher_client);
-        let (owls_sync_tx, owls_sync_rx) = start_owls_sync_worker(owls_client.clone());
-        let (matchbook_sync_tx, matchbook_sync_rx) = start_matchbook_sync_worker();
+        let owls_client = default_owls_sync_async_client();
+        let runtime =
+            AppRuntimeChannels::start_all(&runtime_host, provider, oddsmatcher_client, owls_client);
 
         let mut app = Self {
-            provider_tx,
-            provider_rx,
+            runtime_host,
+            provider_tx: runtime.provider_tx,
+            provider_rx: runtime.provider_rx,
             provider_in_flight: false,
+            provider_resource_state: ResourceState::ready(snapshot.clone()),
             provider_pending_job: None,
+            #[cfg(debug_assertions)]
+            provider_in_flight_started_at_for_test: None,
             make_stub_provider,
             make_recorder_provider,
             recorder_supervisor,
@@ -385,21 +453,34 @@ impl App {
             recorder_config_path,
             recorder_config_note,
             recorder_editor: RecorderEditorState::default(),
+            alerts_config: AlertConfig::default(),
+            alerts_config_path: alerts::default_config_path(),
+            alerts_config_note: String::from("Using in-memory alerts config."),
+            alerts_editor: AlertEditorState::default(),
+            manual_positions,
+            manual_positions_path,
+            manual_positions_note,
+            manual_position_overlay: None,
+            alert_last_sent_at: HashMap::new(),
+            notifications: VecDeque::with_capacity(MAX_NOTIFICATIONS),
+            notifications_overlay_visible: false,
             recorder_status: RecorderStatus::Disabled,
             calculator: CalculatorState::default(),
             calculator_tool: CalculatorTool::Basic,
-            oddsmatcher_tx,
-            oddsmatcher_rx,
+            oddsmatcher_tx: runtime.oddsmatcher_tx,
+            oddsmatcher_rx: runtime.oddsmatcher_rx,
             oddsmatcher_in_flight: false,
             oddsmatcher_pending_query: None,
-            owls_sync_tx,
-            owls_sync_rx,
+            owls_sync_tx: runtime.owls_sync_tx,
+            owls_sync_rx: runtime.owls_sync_rx,
             owls_sync_in_flight: false,
+            owls_resource_state: ResourceState::idle(),
             owls_sync_pending_reason: None,
             last_owls_sync_dispatch_at: None,
-            matchbook_sync_tx,
-            matchbook_sync_rx,
+            matchbook_sync_tx: runtime.matchbook_sync_tx,
+            matchbook_sync_rx: runtime.matchbook_sync_rx,
             matchbook_sync_in_flight: false,
+            matchbook_resource_state: ResourceState::idle(),
             matchbook_sync_pending_reason: None,
             last_matchbook_sync_dispatch_at: None,
             matchbook_account_state: None,
@@ -448,7 +529,10 @@ impl App {
             running: true,
             status_message,
             status_scroll: 0,
+            recorder_startup_alerts_pending: false,
+            recorder_startup_alerts_muted_until: None,
         };
+        app.refresh_snapshot_enrichment();
         app.record_event(format!(
             "Loaded initial dashboard from {}.",
             app.snapshot
@@ -471,6 +555,29 @@ impl App {
 
     pub fn matchbook_account_state(&self) -> Option<&MatchbookAccountState> {
         self.matchbook_account_state.as_ref()
+    }
+
+    fn refresh_snapshot_enrichment(&mut self) {
+        let base_snapshot = self
+            .provider_resource_state
+            .last_good()
+            .cloned()
+            .unwrap_or_else(|| self.snapshot.clone());
+        let owls_dashboard = self
+            .owls_resource_state
+            .last_good()
+            .cloned()
+            .unwrap_or_else(|| self.owls_dashboard.clone());
+        let matchbook_account_state = self
+            .matchbook_resource_state
+            .last_good()
+            .cloned()
+            .or_else(|| self.matchbook_account_state.clone());
+        self.snapshot = project_snapshot(
+            &base_snapshot,
+            &owls_dashboard,
+            matchbook_account_state.as_ref(),
+        );
     }
 
     pub fn owls_sport(&self) -> &str {
@@ -523,6 +630,7 @@ impl App {
         if panel != Panel::Trading {
             self.live_view_overlay_visible = false;
             self.markets_overlay_visible = false;
+            self.notifications_overlay_visible = false;
             self.trading_action_overlay = None;
         }
     }
@@ -535,6 +643,9 @@ impl App {
         self.trading_section = section;
         if section != TradingSection::Positions {
             self.live_view_overlay_visible = false;
+        }
+        if section == TradingSection::Alerts {
+            self.mark_notifications_read();
         }
         if !self.is_owls_context() {
             self.markets_overlay_visible = false;
@@ -552,7 +663,7 @@ impl App {
     }
 
     pub fn help_text(&self) -> &'static str {
-        "? keymap | q quit | o observability | h/l sections | arrows or j/k nav | tab rotate pane/tool | r refresh cache | R recapture live\nenter edit/open | p place action | esc cancel | [/] cycle sport or suggestions | u reload | D defaults | s start recorder | x stop recorder | c cash out | v live view | b cycle type | m toggle mode"
+        "? keymap | n alerts | q quit | o observability | h/l sections | arrows or j/k nav | tab rotate pane/tool | r refresh cache | R recapture live\nenter edit/open | p place action | a manual entry | esc cancel | [/] cycle sport or suggestions | u reload | D defaults | s start recorder | x stop recorder | c cash out | v live view | b cycle type | m toggle mode"
     }
 
     pub fn live_view_overlay_visible(&self) -> bool {
@@ -563,23 +674,80 @@ impl App {
         self.keymap_overlay_visible
     }
 
+    pub fn notifications_overlay_visible(&self) -> bool {
+        self.notifications_overlay_visible
+    }
+
     pub fn markets_overlay_visible(&self) -> bool {
         self.markets_overlay_visible
+    }
+
+    pub fn alerts_config(&self) -> &AlertConfig {
+        &self.alerts_config
+    }
+
+    pub fn alerts_config_note(&self) -> &str {
+        &self.alerts_config_note
+    }
+
+    pub fn alerts_selected_field(&self) -> AlertField {
+        self.alerts_editor.selected_field()
+    }
+
+    pub fn alerts_is_editing(&self) -> bool {
+        self.alerts_editor.editing
+    }
+
+    pub fn alerts_edit_buffer(&self) -> Option<&str> {
+        if self.alerts_editor.editing {
+            Some(self.alerts_editor.buffer.as_str())
+        } else {
+            None
+        }
+    }
+
+    pub fn notifications(&self) -> &VecDeque<NotificationEntry> {
+        &self.notifications
+    }
+
+    pub fn unread_notification_count(&self) -> usize {
+        self.notifications
+            .iter()
+            .filter(|entry| entry.unread)
+            .count()
     }
 
     pub fn trading_action_overlay(&self) -> Option<&TradingActionOverlayState> {
         self.trading_action_overlay.as_ref()
     }
 
+    pub fn manual_position_overlay(&self) -> Option<&ManualPositionOverlayState> {
+        self.manual_position_overlay.as_ref()
+    }
+
+    pub fn manual_positions_note(&self) -> &str {
+        &self.manual_positions_note
+    }
+
     pub fn toggle_live_view_overlay(&mut self) {
         if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Positions
         {
             self.live_view_overlay_visible = !self.live_view_overlay_visible;
+            if self.live_view_overlay_visible {
+                self.request_matchbook_sync(MatchbookSyncReason::Manual);
+            }
         }
     }
 
     pub fn toggle_keymap_overlay(&mut self) {
         self.keymap_overlay_visible = !self.keymap_overlay_visible;
+    }
+
+    pub fn toggle_notifications_overlay(&mut self) {
+        self.notifications_overlay_visible = !self.notifications_overlay_visible;
+        if self.notifications_overlay_visible {
+            self.mark_notifications_read();
+        }
     }
 
     pub fn toggle_markets_overlay(&mut self) {
@@ -640,6 +808,8 @@ impl App {
         };
         let sport = SUPPORTED_SPORTS[next_index];
         self.owls_dashboard = owls::dashboard_for_sport(sport);
+        self.owls_resource_state
+            .finish_ok(self.owls_dashboard.clone());
         self.clamp_selected_owls_endpoint();
         self.markets_overlay_visible = false;
         self.request_owls_sync(OwlsSyncReason::Manual);
@@ -667,10 +837,10 @@ impl App {
             self.drain_oddsmatcher_results();
             self.drain_owls_sync_results();
             self.drain_matchbook_sync_results();
-            if !self.provider_in_flight
+            if !self.provider_resource_state.is_loading()
                 && !self.oddsmatcher_in_flight
-                && !self.owls_sync_in_flight
-                && !self.matchbook_sync_in_flight
+                && !self.owls_resource_state.is_loading()
+                && !self.matchbook_resource_state.is_loading()
             {
                 return true;
             }
@@ -679,6 +849,97 @@ impl App {
             }
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn poll_recorder_for_test(&mut self) {
+        self.poll_recorder();
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn poll_owls_dashboard_for_test(&mut self) {
+        self.poll_owls_dashboard();
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn poll_matchbook_account_for_test(&mut self) {
+        self.poll_matchbook_account();
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn set_matchbook_state_for_test(&mut self, state: MatchbookAccountState) {
+        self.matchbook_account_state = Some(state);
+        if let Some(current) = self.matchbook_account_state.clone() {
+            self.matchbook_resource_state.finish_ok(current);
+        }
+        self.refresh_snapshot_enrichment();
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn mark_matchbook_sync_in_flight_for_test(&mut self, started_at: Instant) {
+        self.matchbook_sync_in_flight = true;
+        self.last_matchbook_sync_dispatch_at = Some(started_at);
+        self.matchbook_resource_state.begin_refresh(started_at);
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn matchbook_sync_in_flight_for_test(&self) -> bool {
+        self.matchbook_resource_state.is_loading()
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn matchbook_status_for_test(&self) -> &'static str {
+        self.matchbook_resource_state.phase().as_str()
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn set_owls_dashboard_for_test(&mut self, dashboard: OwlsDashboard) {
+        self.owls_dashboard = dashboard;
+        self.owls_resource_state
+            .finish_ok(self.owls_dashboard.clone());
+        self.refresh_snapshot_enrichment();
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn mark_owls_sync_in_flight_for_test(&mut self, started_at: Instant) {
+        self.owls_sync_in_flight = true;
+        self.last_owls_sync_dispatch_at = Some(started_at);
+        self.owls_resource_state.begin_refresh(started_at);
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn owls_sync_in_flight_for_test(&self) -> bool {
+        self.owls_resource_state.is_loading()
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn owls_status_for_test(&self) -> &'static str {
+        self.owls_resource_state.phase().as_str()
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn mark_provider_in_flight_for_test(&mut self, started_at: Instant) {
+        self.provider_in_flight = true;
+        self.provider_pending_job = None;
+        self.provider_in_flight_started_at_for_test = Some(started_at);
+        self.provider_resource_state.begin_refresh(started_at);
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn provider_in_flight_for_test(&self) -> bool {
+        self.provider_resource_state.is_loading()
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn provider_status_for_test(&self) -> &'static str {
+        self.provider_resource_state.phase().as_str()
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn provider_pending_debug_label(&self) -> Option<String> {
+        self.provider_pending_job
+            .as_ref()
+            .map(|job| format!("{:?}", job.request))
     }
 
     pub fn status_scroll(&self) -> u16 {
@@ -727,6 +988,32 @@ impl App {
             &mut self.open_position_table_state,
             &mut self.historical_position_table_state,
         )
+    }
+
+    pub fn positions_render_state(&mut self) -> PositionsRenderState<'_> {
+        let Self {
+            snapshot,
+            owls_dashboard,
+            matchbook_account_state,
+            open_position_table_state,
+            historical_position_table_state,
+            positions_focus,
+            live_view_overlay_visible,
+            status_message,
+            status_scroll,
+            ..
+        } = self;
+        PositionsRenderState {
+            snapshot,
+            owls_dashboard,
+            matchbook_account_state: matchbook_account_state.as_ref(),
+            open_table_state: open_position_table_state,
+            historical_table_state: historical_position_table_state,
+            positions_focus: *positions_focus,
+            show_live_view_overlay: *live_view_overlay_visible,
+            status_message,
+            status_scroll: *status_scroll,
+        }
     }
 
     pub fn selected_historical_position_row(&self) -> Option<usize> {
@@ -1079,6 +1366,7 @@ impl App {
             selection_name: row.selection_name.clone(),
             event_url: None,
             deep_link_url,
+            betslip_event_id: Some(row.event_id.clone()),
             betslip_market_id: row
                 .lay
                 .bet_slip
@@ -1188,8 +1476,9 @@ impl App {
     }
 
     fn queue_provider_request(&mut self, job: ProviderJob) {
+        debug!(request = ?job.request, in_flight = self.provider_in_flight, "queue provider request");
         self.drain_provider_results();
-        if self.provider_in_flight {
+        if self.provider_resource_state.is_loading() {
             self.provider_pending_job = Some(match self.provider_pending_job.take() {
                 Some(existing)
                     if provider_job_priority(&existing.request)
@@ -1206,13 +1495,20 @@ impl App {
 
     fn dispatch_provider_request(&mut self, job: ProviderJob) {
         let request = job.request.clone();
+        debug!(request = ?request, "dispatch provider request");
         match self.provider_tx.send(job) {
             Ok(()) => {
                 self.provider_in_flight = true;
+                self.provider_resource_state.begin_refresh_now();
+                #[cfg(debug_assertions)]
+                {
+                    self.provider_in_flight_started_at_for_test = Some(Instant::now());
+                }
                 self.status_message = provider_queue_message(&request);
                 self.status_scroll = 0;
             }
             Err(error) => {
+                warn!(request = ?request, error = %error, "provider worker unavailable");
                 self.status_message = format!("Provider worker unavailable: {error}");
                 self.status_scroll = 0;
                 self.record_event("Provider worker unavailable.");
@@ -1221,11 +1517,49 @@ impl App {
     }
 
     fn restart_provider_worker(&mut self, provider: Box<dyn ExchangeProvider + Send>) {
-        let (provider_tx, provider_rx) = start_provider_worker(provider);
+        info!("restart provider worker");
+        let pending_job = self.provider_pending_job.take();
+        let _ = self
+            .provider_resource_state
+            .expire_if_overdue(Duration::ZERO, "provider worker restarted");
+        let (provider_tx, provider_rx) =
+            AppRuntimeChannels::start_provider(&self.runtime_host, provider);
         self.provider_tx = provider_tx;
         self.provider_rx = provider_rx;
         self.provider_in_flight = false;
-        self.provider_pending_job = None;
+        #[cfg(debug_assertions)]
+        {
+            self.provider_in_flight_started_at_for_test = None;
+        }
+        if let Some(job) = pending_job {
+            self.dispatch_provider_request(job);
+        }
+    }
+
+    fn restart_owls_sync_worker(&mut self) {
+        info!("restart owls worker");
+        let (owls_sync_tx, owls_sync_rx) =
+            AppRuntimeChannels::start_owls(&self.runtime_host, default_owls_sync_async_client());
+        self.owls_sync_tx = owls_sync_tx;
+        self.owls_sync_rx = owls_sync_rx;
+        self.owls_sync_in_flight = false;
+    }
+
+    fn restart_matchbook_sync_worker(&mut self) {
+        info!("restart matchbook worker");
+        let (matchbook_sync_tx, matchbook_sync_rx) =
+            AppRuntimeChannels::start_matchbook(&self.runtime_host);
+        self.matchbook_sync_tx = matchbook_sync_tx;
+        self.matchbook_sync_rx = matchbook_sync_rx;
+        self.matchbook_sync_in_flight = false;
+    }
+
+    fn current_provider_for_watchdog(&self) -> Box<dyn ExchangeProvider + Send> {
+        if self.recorder_status == RecorderStatus::Running {
+            (self.make_recorder_provider)(&self.recorder_config)
+        } else {
+            (self.make_stub_provider)()
+        }
     }
 
     fn drain_provider_results(&mut self) {
@@ -1237,12 +1571,19 @@ impl App {
             return;
         };
 
+        debug!(request = ?result.request, success = result.result.is_ok(), "drain provider result");
         self.provider_in_flight = false;
+        #[cfg(debug_assertions)]
+        {
+            self.provider_in_flight_started_at_for_test = None;
+        }
         match result.result {
             Ok(snapshot) => {
+                self.provider_resource_state.finish_ok(snapshot.clone());
                 self.apply_provider_snapshot_result(result.request, snapshot, result.event_message)
             }
             Err(error) => {
+                self.provider_resource_state.finish_error(error.clone());
                 if matches!(result.request, ProviderRequest::LoadDashboard)
                     && self.recorder_status == RecorderStatus::Running
                     && self.last_successful_snapshot_at.is_none()
@@ -1272,6 +1613,20 @@ impl App {
         snapshot: ExchangePanelSnapshot,
         event_message: Option<String>,
     ) {
+        let placed_bet_detail = match &request {
+            ProviderRequest::ExecuteTradingAction { intent }
+                if self.alerts_config.bet_placed && intent.mode == TradingActionMode::Confirm =>
+            {
+                Some(format!(
+                    "{} {} @ {:.2} stake {:.2}",
+                    intent.venue.as_str(),
+                    intent.selection_name,
+                    intent.expected_price,
+                    intent.stake
+                ))
+            }
+            _ => None,
+        };
         match request {
             ProviderRequest::LoadHorseMatcher { query } => {
                 let Some(market_snapshot) = snapshot.horse_matcher.clone() else {
@@ -1300,14 +1655,23 @@ impl App {
             }
         }
 
+        if let Some(detail) = placed_bet_detail {
+            self.emit_alert("bet_placed", NotificationLevel::Info, "Bet placed", detail);
+        }
+
         if let Some(message) = event_message {
             self.record_event(message);
         }
     }
 
     fn request_matchbook_sync(&mut self, reason: MatchbookSyncReason) {
+        debug!(
+            reason = reason.label(),
+            in_flight = self.matchbook_sync_in_flight,
+            "request matchbook sync"
+        );
         self.drain_matchbook_sync_results();
-        if self.matchbook_sync_in_flight {
+        if self.matchbook_resource_state.is_loading() {
             self.matchbook_sync_pending_reason =
                 Some(match (self.matchbook_sync_pending_reason, reason) {
                     (Some(MatchbookSyncReason::Manual), _) | (_, MatchbookSyncReason::Manual) => {
@@ -1324,6 +1688,7 @@ impl App {
         match self.matchbook_sync_tx.send(MatchbookSyncJob { reason }) {
             Ok(()) => {
                 self.matchbook_sync_in_flight = true;
+                self.matchbook_resource_state.begin_refresh_now();
                 self.last_matchbook_sync_dispatch_at = Some(Instant::now());
             }
             Err(error) => {
@@ -1397,11 +1762,18 @@ impl App {
             return;
         };
 
+        debug!(
+            reason = result.reason.label(),
+            success = result.state.is_ok(),
+            "drain matchbook sync result"
+        );
         self.matchbook_sync_in_flight = false;
         match result.state {
             Ok(state) => {
+                self.matchbook_resource_state.finish_ok(state.clone());
                 let first_load = self.matchbook_account_state.is_none();
                 self.matchbook_account_state = Some(state.clone());
+                self.refresh_snapshot_enrichment();
                 if matches!(result.reason, MatchbookSyncReason::Manual) || first_load {
                     self.status_message = state.status_line.clone();
                     self.status_scroll = 0;
@@ -1409,11 +1781,20 @@ impl App {
                 self.record_event(format!("Matchbook {} sync applied.", result.reason.label()));
             }
             Err(error) => {
+                self.matchbook_resource_state.finish_error(error.clone());
                 if matches!(result.reason, MatchbookSyncReason::Manual) {
                     self.status_message = format!("Matchbook sync failed: {error}");
                     self.status_scroll = 0;
                 }
                 self.record_event(format!("Matchbook sync failed: {error}"));
+                if self.alerts_config.matchbook_failures {
+                    self.emit_alert(
+                        "matchbook_failures",
+                        NotificationLevel::Warning,
+                        "Matchbook sync failed",
+                        error,
+                    );
+                }
             }
         }
 
@@ -1475,6 +1856,90 @@ impl App {
         self.status_message = String::from("Trading action overlay opened.");
     }
 
+    fn open_manual_position_overlay_from_positions(&mut self) {
+        if self.active_panel != Panel::Trading
+            || self.trading_section != TradingSection::Positions
+            || self.positions_focus != PositionsFocus::Active
+        {
+            return;
+        }
+        let Some(selected_index) = self.selected_open_position_row() else {
+            self.status_message = String::from("No active position is selected.");
+            return;
+        };
+        let Some(open_position) = self.snapshot.open_positions.get(selected_index) else {
+            self.status_message = String::from("The selected position is out of range.");
+            return;
+        };
+
+        let mut draft = self
+            .manual_positions
+            .iter()
+            .find(|entry| {
+                normalize_manual_key(&entry.event) == normalize_manual_key(&open_position.event)
+                    && normalize_manual_key(&entry.selection)
+                        == normalize_manual_key(&open_position.contract)
+            })
+            .cloned()
+            .unwrap_or_default();
+        if draft.event.trim().is_empty() {
+            draft.event = open_position.event.clone();
+        }
+        if draft.market.trim().is_empty() {
+            draft.market = open_position.market.clone();
+        }
+        if draft.selection.trim().is_empty() {
+            draft.selection = open_position.contract.clone();
+        }
+        self.manual_position_overlay = Some(ManualPositionOverlayState::new(draft));
+        self.status_message = String::from("Manual position editor opened.");
+    }
+
+    fn save_manual_position_overlay(&mut self) -> Result<()> {
+        let Some(overlay) = self.manual_position_overlay.as_ref() else {
+            return Ok(());
+        };
+        let entry = overlay.draft.clone();
+        if entry.event.trim().is_empty()
+            || entry.market.trim().is_empty()
+            || entry.selection.trim().is_empty()
+            || entry.venue.trim().is_empty()
+            || entry.odds <= 0.0
+            || entry.stake <= 0.0
+        {
+            return Err(color_eyre::eyre::eyre!(
+                "Manual entry requires event, market, selection, venue, odds, and stake."
+            ));
+        }
+
+        let key = entry.display_key();
+        if let Some(existing) = self
+            .manual_positions
+            .iter_mut()
+            .find(|existing| existing.display_key() == key)
+        {
+            *existing = entry;
+        } else {
+            self.manual_positions.push(entry);
+        }
+        self.manual_positions_note =
+            save_entries(&self.manual_positions_path, &self.manual_positions)?;
+        self.snapshot = normalize_snapshot(
+            self.snapshot.clone(),
+            &self.recorder_config.disabled_venues,
+            &self.manual_positions,
+        );
+        self.refresh_snapshot_enrichment();
+        self.manual_position_overlay = None;
+        self.status_message = String::from("Manual position saved.");
+        self.status_scroll = 0;
+        Ok(())
+    }
+
+    fn is_manual_position_overlay_active(&self) -> bool {
+        self.manual_position_overlay.is_some()
+    }
+
     pub fn start_recorder(&mut self) -> Result<()> {
         self.record_event("Recorder start requested.");
         self.persist_recorder_config()?;
@@ -1485,6 +1950,9 @@ impl App {
         self.exchange_list_state.select(None);
         self.record_event("Recorder process started.");
         self.last_recorder_refresh_at = None;
+        self.recorder_startup_alerts_pending = true;
+        self.recorder_startup_alerts_muted_until =
+            Some(Instant::now() + RECORDER_STARTUP_ALERT_MUTE);
         self.queue_provider_request(ProviderJob {
             request: ProviderRequest::LoadDashboard,
             failure_context: String::from("Recorder dashboard load failed"),
@@ -1510,6 +1978,8 @@ impl App {
         self.recorder_status = RecorderStatus::Disabled;
         self.last_recorder_refresh_at = None;
         self.last_recorder_start_failure = None;
+        self.recorder_startup_alerts_pending = false;
+        self.recorder_startup_alerts_muted_until = None;
         self.restart_provider_worker((self.make_stub_provider)());
         self.queue_provider_request(ProviderJob {
             request: ProviderRequest::LoadDashboard,
@@ -1532,6 +2002,34 @@ impl App {
         }
         self.record_event("Quit requested.");
         self.running = false;
+    }
+
+    fn dismiss_top_overlay(&mut self) -> bool {
+        if self.keymap_overlay_visible {
+            self.keymap_overlay_visible = false;
+            return true;
+        }
+        if self.notifications_overlay_visible {
+            self.notifications_overlay_visible = false;
+            return true;
+        }
+        if self.markets_overlay_visible {
+            self.markets_overlay_visible = false;
+            return true;
+        }
+        if self.live_view_overlay_visible {
+            self.live_view_overlay_visible = false;
+            return true;
+        }
+        if self.manual_position_overlay.is_some() {
+            self.manual_position_overlay = None;
+            return true;
+        }
+        if self.is_trading_action_overlay_active() {
+            self.close_trading_action_overlay("Cancelled trading action.");
+            return true;
+        }
+        false
     }
 
     pub fn reload_recorder_config(&mut self) -> Result<()> {
@@ -1677,6 +2175,7 @@ impl App {
         match self.owls_sync_tx.send(job) {
             Ok(()) => {
                 self.owls_sync_in_flight = true;
+                self.owls_resource_state.begin_refresh_now();
                 self.last_owls_sync_dispatch_at = Some(Instant::now());
             }
             Err(error) => {
@@ -1688,8 +2187,13 @@ impl App {
     }
 
     fn request_owls_sync(&mut self, reason: OwlsSyncReason) {
+        debug!(
+            reason = reason.label(),
+            in_flight = self.owls_sync_in_flight,
+            "request owls sync"
+        );
         self.drain_owls_sync_results();
-        if self.owls_sync_in_flight {
+        if self.owls_resource_state.is_loading() {
             self.owls_sync_pending_reason = Some(match (self.owls_sync_pending_reason, reason) {
                 (Some(OwlsSyncReason::Manual), _) | (_, OwlsSyncReason::Manual) => {
                     OwlsSyncReason::Manual
@@ -1710,10 +2214,41 @@ impl App {
             return;
         };
 
+        debug!(
+            reason = result.reason.label(),
+            checked = result.outcome.checked_count,
+            changed = result.outcome.changed_count,
+            "drain owls sync result"
+        );
         self.owls_sync_in_flight = false;
         let outcome = result.outcome;
+        let selected_sport = self.owls_dashboard.sport.clone();
+        if outcome.dashboard.sport != selected_sport {
+            self.owls_resource_state
+                .finish_ok(self.owls_dashboard.clone());
+            self.record_event(format!(
+                "Discarded stale Owls {} sync for {} while {} is selected.",
+                result.reason.label(),
+                outcome.dashboard.sport,
+                selected_sport
+            ));
+            if let Some(reason) = self.owls_sync_pending_reason.take() {
+                self.dispatch_owls_sync(reason);
+            }
+            return;
+        }
+        let previous_dashboard = self.owls_dashboard.clone();
+        let previous_error_count = self
+            .owls_dashboard
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.status == "error")
+            .count();
         self.owls_dashboard = outcome.dashboard;
+        self.owls_resource_state
+            .finish_ok(self.owls_dashboard.clone());
         self.clamp_selected_owls_endpoint();
+        self.refresh_snapshot_enrichment();
 
         if outcome.changed || matches!(result.reason, OwlsSyncReason::Manual) {
             self.status_message = self.owls_dashboard.status_line.clone();
@@ -1727,6 +2262,57 @@ impl App {
                 outcome.checked_count
             ));
         }
+        let current_error_count = self
+            .owls_dashboard
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.status == "error")
+            .count();
+        if self.alerts_config.owls_errors && current_error_count > previous_error_count {
+            let detail = self
+                .owls_dashboard
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.status == "error")
+                .map(|endpoint| format!("{} {}", endpoint.label, endpoint.detail))
+                .unwrap_or_else(|| format!("{current_error_count} Owls endpoints errored."));
+            self.emit_alert(
+                "owls_errors",
+                NotificationLevel::Warning,
+                "Owls endpoint error",
+                detail,
+            );
+        }
+        if self.alerts_config.opportunity_detected {
+            if let Some(detail) = live_sharp_opportunity_alert_detail(
+                &self.snapshot,
+                &previous_dashboard,
+                &self.owls_dashboard,
+                self.alerts_config.opportunity_threshold_pct,
+            ) {
+                self.emit_alert(
+                    "opportunity_detected",
+                    NotificationLevel::Warning,
+                    "Opportunity detected",
+                    detail,
+                );
+            }
+        }
+        if self.alerts_config.watched_movement {
+            if let Some(detail) = sharp_watch_movement_alert_detail(
+                &self.snapshot,
+                &previous_dashboard,
+                &self.owls_dashboard,
+                self.alerts_config.watched_movement_threshold_pct,
+            ) {
+                self.emit_alert(
+                    "watched_movement",
+                    NotificationLevel::Warning,
+                    "Watched result moved",
+                    detail,
+                );
+            }
+        }
 
         if let Some(reason) = self.owls_sync_pending_reason.take() {
             self.dispatch_owls_sync(reason);
@@ -1739,9 +2325,69 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key_code: KeyCode) {
+        if self.is_manual_position_overlay_active() {
+            match key_code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.manual_position_overlay = None;
+                    self.status_message = String::from("Manual position editor closed.");
+                    return;
+                }
+                KeyCode::Backspace => {
+                    if let Some(overlay) = self.manual_position_overlay.as_mut() {
+                        if overlay.editing {
+                            overlay.backspace();
+                        }
+                    }
+                    return;
+                }
+                KeyCode::Enter => {
+                    let Some(overlay) = self.manual_position_overlay.as_mut() else {
+                        return;
+                    };
+                    if overlay.editing {
+                        if let Err(error) = overlay.apply_edit() {
+                            self.status_message = format!("Manual position input error: {error}");
+                        }
+                    } else if overlay.selected_field() == ManualPositionField::Save {
+                        if let Err(error) = self.save_manual_position_overlay() {
+                            self.status_message = format!("Manual position save failed: {error}");
+                        }
+                    } else {
+                        overlay.begin_edit();
+                    }
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(overlay) = self.manual_position_overlay.as_mut() {
+                        if !overlay.editing {
+                            overlay.select_previous_field();
+                        }
+                    }
+                    return;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(overlay) = self.manual_position_overlay.as_mut() {
+                        if !overlay.editing {
+                            overlay.select_next_field();
+                        }
+                    }
+                    return;
+                }
+                KeyCode::Char(character) => {
+                    if let Some(overlay) = self.manual_position_overlay.as_mut() {
+                        if overlay.editing && !character.is_control() {
+                            overlay.push_char(character);
+                        }
+                    }
+                    return;
+                }
+                _ => return,
+            }
+        }
+
         if self.is_trading_action_overlay_active() {
             match key_code {
-                KeyCode::Esc => {
+                KeyCode::Esc | KeyCode::Char('q') => {
                     self.close_trading_action_overlay("Cancelled trading action.");
                     return;
                 }
@@ -1914,6 +2560,30 @@ impl App {
             }
         }
 
+        if self.is_alerts_editing_context() {
+            match key_code {
+                KeyCode::Esc => {
+                    self.cancel_alerts_edit();
+                    return;
+                }
+                KeyCode::Enter => {
+                    if let Err(error) = self.apply_alerts_edit() {
+                        self.status_message = format!("Alerts config error: {error}");
+                    }
+                    return;
+                }
+                KeyCode::Backspace => {
+                    self.alerts_backspace();
+                    return;
+                }
+                KeyCode::Char(character) => {
+                    self.alerts_push_char(character);
+                    return;
+                }
+                _ => return,
+            }
+        }
+
         if self.is_oddsmatcher_context() {
             match key_code {
                 KeyCode::Left => {
@@ -1968,15 +2638,14 @@ impl App {
 
         match key_code {
             KeyCode::Char('?') => self.toggle_keymap_overlay(),
-            KeyCode::Char('q') => self.request_quit(),
+            KeyCode::Char('n') => self.toggle_notifications_overlay(),
+            KeyCode::Char('q') => {
+                if !self.dismiss_top_overlay() {
+                    self.request_quit();
+                }
+            }
             KeyCode::Esc => {
-                if self.keymap_overlay_visible {
-                    self.keymap_overlay_visible = false;
-                } else if self.markets_overlay_visible {
-                    self.markets_overlay_visible = false;
-                } else if self.live_view_overlay_visible {
-                    self.live_view_overlay_visible = false;
-                } else {
+                if !self.dismiss_top_overlay() {
                     self.request_quit();
                 }
             }
@@ -2005,10 +2674,20 @@ impl App {
                     && self.positions_focus == PositionsFocus::Active
                 {
                     self.open_trading_action_overlay_from_positions();
+                } else if self.is_alerts_context() {
+                    self.begin_alerts_edit();
                 } else if self.is_recorder_context() {
                     self.begin_recorder_edit();
                 } else if self.is_calculator_context() {
                     self.begin_calculator_edit();
+                }
+            }
+            KeyCode::Char('a') => {
+                if self.active_panel == Panel::Trading
+                    && self.trading_section == TradingSection::Positions
+                    && self.positions_focus == PositionsFocus::Active
+                {
+                    self.open_manual_position_overlay_from_positions();
                 }
             }
             KeyCode::Char('b') => {
@@ -2070,6 +2749,10 @@ impl App {
                     if let Err(error) = self.cycle_recorder_suggestion(false) {
                         self.status_message = format!("Recorder suggestion failed: {error}");
                     }
+                } else if self.is_alerts_context() {
+                    if let Err(error) = self.cycle_alerts_suggestion(false) {
+                        self.status_message = format!("Alerts suggestion failed: {error}");
+                    }
                 }
             }
             KeyCode::Char(']') => {
@@ -2087,6 +2770,10 @@ impl App {
                     if let Err(error) = self.cycle_recorder_suggestion(true) {
                         self.status_message = format!("Recorder suggestion failed: {error}");
                     }
+                } else if self.is_alerts_context() {
+                    if let Err(error) = self.cycle_alerts_suggestion(true) {
+                        self.status_message = format!("Alerts suggestion failed: {error}");
+                    }
                 }
             }
             KeyCode::Char('u') => {
@@ -2102,9 +2789,13 @@ impl App {
                     if let Err(error) = self.reload_recorder_config() {
                         self.status_message = format!("Recorder reload failed: {error}");
                     }
+                } else if self.is_alerts_context() {
+                    if let Err(error) = self.reload_alerts_config() {
+                        self.status_message = format!("Alerts reload failed: {error}");
+                    }
                 } else {
                     self.status_message =
-                        String::from("Open Trading > Recorder to reload recorder config.");
+                        String::from("Open Trading > Recorder or Alerts to reload config.");
                 }
             }
             KeyCode::Char('D') => {
@@ -2120,9 +2811,13 @@ impl App {
                     if let Err(error) = self.reset_recorder_config() {
                         self.status_message = format!("Recorder reset failed: {error}");
                     }
+                } else if self.is_alerts_context() {
+                    if let Err(error) = self.reset_alerts_config() {
+                        self.status_message = format!("Alerts reset failed: {error}");
+                    }
                 } else {
                     self.status_message =
-                        String::from("Open Trading > Recorder to reset recorder config.");
+                        String::from("Open Trading > Recorder or Alerts to reset config.");
                 }
             }
             KeyCode::Char('s') => {
@@ -2161,6 +2856,7 @@ impl App {
                 | (Panel::Trading, TradingSection::Live)
                 | (Panel::Trading, TradingSection::Props) => self.select_next_owls_endpoint(),
                 (Panel::Trading, TradingSection::Matcher) => self.select_next_matcher_row(),
+                (Panel::Trading, TradingSection::Alerts) => self.alerts_editor.select_next_field(),
                 (Panel::Trading, TradingSection::Calculator) => {
                     self.calculator.editor.select_next_field()
                 }
@@ -2175,6 +2871,9 @@ impl App {
                 | (Panel::Trading, TradingSection::Live)
                 | (Panel::Trading, TradingSection::Props) => self.select_previous_owls_endpoint(),
                 (Panel::Trading, TradingSection::Matcher) => self.select_previous_matcher_row(),
+                (Panel::Trading, TradingSection::Alerts) => {
+                    self.alerts_editor.select_previous_field()
+                }
                 (Panel::Trading, TradingSection::Calculator) => {
                     self.calculator.editor.select_previous_field()
                 }
@@ -2195,12 +2894,20 @@ impl App {
         self.active_panel == Panel::Trading && self.trading_section == TradingSection::Recorder
     }
 
+    fn is_alerts_context(&self) -> bool {
+        self.active_panel == Panel::Trading && self.trading_section == TradingSection::Alerts
+    }
+
     fn supports_status_scroll(&self) -> bool {
         self.active_panel == Panel::Trading
             && matches!(
                 self.trading_section,
                 TradingSection::Positions | TradingSection::Recorder
             )
+    }
+
+    fn is_alerts_editing_context(&self) -> bool {
+        self.is_alerts_context() && self.alerts_editor.editing
     }
 
     fn is_trading_action_overlay_active(&self) -> bool {
@@ -2665,8 +3372,22 @@ impl App {
                 self.status_message = format!("Recorder status changed to {next_status:?}.");
                 self.status_scroll = 0;
                 self.last_recorder_refresh_at = None;
+                if self.alerts_config.recorder_failures {
+                    self.emit_alert(
+                        "recorder_failures",
+                        if next_status == RecorderStatus::Error {
+                            NotificationLevel::Critical
+                        } else {
+                            NotificationLevel::Warning
+                        },
+                        "Recorder degraded",
+                        format!("{previous_status:?} -> {next_status:?}"),
+                    );
+                }
             }
         }
+
+        self.expire_stuck_provider_request_placeholder();
 
         if self.recorder_status == RecorderStatus::Running && self.recorder_refresh_due() {
             self.last_recorder_refresh_at = Some(Instant::now());
@@ -2684,10 +3405,15 @@ impl App {
 
     fn poll_owls_dashboard(&mut self) {
         self.drain_owls_sync_results();
-        if self.active_panel != Panel::Trading || !self.is_owls_context() {
+        self.expire_stuck_owls_sync_placeholder();
+        let should_sync = self.active_panel == Panel::Trading
+            && (self.is_owls_context()
+                || (self.trading_section == TradingSection::Positions
+                    && self.live_view_overlay_visible));
+        if !should_sync {
             return;
         }
-        if self.owls_sync_in_flight {
+        if self.owls_resource_state.is_loading() {
             return;
         }
         if self
@@ -2701,13 +3427,16 @@ impl App {
 
     fn poll_matchbook_account(&mut self) {
         self.drain_matchbook_sync_results();
+        self.expire_stuck_matchbook_sync_placeholder();
         let should_sync = self.active_panel == Panel::Trading
             && (self.trading_section == TradingSection::Stats
+                || (self.trading_section == TradingSection::Positions
+                    && self.live_view_overlay_visible)
                 || self
                     .trading_action_overlay
                     .as_ref()
                     .is_some_and(|overlay| overlay.seed.venue == VenueId::Matchbook));
-        if !should_sync || self.matchbook_sync_in_flight {
+        if !should_sync || self.matchbook_resource_state.is_loading() {
             return;
         }
         if self
@@ -2769,16 +3498,41 @@ impl App {
                 venue.detail = message;
             }
         }
+
+        if self.alerts_config.provider_errors {
+            self.emit_alert(
+                "provider_errors",
+                NotificationLevel::Critical,
+                "Provider error",
+                format!("{context}: {detail}"),
+            );
+        }
     }
 
     fn replace_snapshot(&mut self, snapshot: ExchangePanelSnapshot) {
+        let previous_snapshot = self.snapshot.clone();
         let had_successful_snapshot = self.last_successful_snapshot_at.is_some();
         let previous_reconnect_count = self.worker_reconnect_count();
-        let previous_decision_counts = decision_status_counts(&self.snapshot);
-        self.snapshot = normalize_snapshot(
-            preserve_cached_snapshot_state(&self.snapshot, snapshot),
+        let previous_decision_counts = decision_status_counts(&previous_snapshot);
+        let previous_actionable_decisions = actionable_decision_count(&previous_snapshot);
+        let previous_tracked_bets = previous_snapshot.tracked_bets.len();
+        let previous_exit_recommendations =
+            actionable_exit_recommendation_count(&previous_snapshot);
+        let previous_stale = previous_snapshot
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.stale)
+            .unwrap_or(false);
+        let normalized_snapshot = normalize_snapshot(
+            preserve_cached_snapshot_state(&previous_snapshot, snapshot),
             &self.recorder_config.disabled_venues,
+            &self.manual_positions,
         );
+        self.provider_resource_state
+            .finish_ok(normalized_snapshot.clone());
+        self.snapshot = normalized_snapshot;
+        self.maybe_align_owls_sport_with_snapshot();
+        self.refresh_snapshot_enrichment();
         if let Some(updated_at) = runtime_updated_at(&self.snapshot) {
             self.last_successful_snapshot_at = Some(updated_at.to_string());
         }
@@ -2798,6 +3552,85 @@ impl App {
                 format_decision_status_counts(&current_decision_counts)
             ));
         }
+        let current_actionable_decisions = actionable_decision_count(&self.snapshot);
+        if self.alerts_config.decision_queue
+            && current_actionable_decisions > previous_actionable_decisions
+        {
+            self.emit_alert(
+                "decision_queue",
+                NotificationLevel::Info,
+                "Decision queue moved",
+                format!(
+                    "{} actionable decisions ready.",
+                    current_actionable_decisions
+                ),
+            );
+        }
+        let current_tracked_bets = self.snapshot.tracked_bets.len();
+        if self.alerts_config.tracked_bets && current_tracked_bets > previous_tracked_bets {
+            self.emit_alert(
+                "tracked_bets",
+                NotificationLevel::Info,
+                "Tracked bets increased",
+                format!("{current_tracked_bets} tracked bets now loaded."),
+            );
+        }
+        if self.alerts_config.bet_settled {
+            if let Some(detail) =
+                first_settled_transition_detail(&previous_snapshot, &self.snapshot)
+            {
+                self.emit_alert(
+                    "bet_settled",
+                    NotificationLevel::Info,
+                    "Bet settled",
+                    detail,
+                );
+            }
+        }
+        let current_exit_recommendations = actionable_exit_recommendation_count(&self.snapshot);
+        if self.alerts_config.exit_recommendations
+            && current_exit_recommendations > previous_exit_recommendations
+        {
+            let detail = self
+                .snapshot
+                .exit_recommendations
+                .iter()
+                .find(|recommendation| recommendation.action != "hold")
+                .map(|recommendation| {
+                    format!(
+                        "{} {} {}",
+                        recommendation.bet_id, recommendation.action, recommendation.reason
+                    )
+                })
+                .unwrap_or_else(|| {
+                    format!("{current_exit_recommendations} actionable exits available.")
+                });
+            self.emit_alert(
+                "exit_recommendations",
+                NotificationLevel::Warning,
+                "Exit recommendation",
+                detail,
+            );
+        }
+        let current_stale = self
+            .snapshot
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.stale)
+            .unwrap_or(false);
+        if self.alerts_config.snapshot_stale && current_stale && !previous_stale {
+            self.emit_alert(
+                "snapshot_stale",
+                NotificationLevel::Warning,
+                "Snapshot turned stale",
+                self.snapshot.status_line.clone(),
+            );
+        }
+        if self.recorder_startup_alerts_pending {
+            self.recorder_startup_alerts_pending = false;
+            self.recorder_startup_alerts_muted_until = None;
+            self.record_event("Recorder startup alert mute cleared after first snapshot.");
+        }
         self.status_message = self.snapshot.status_line.clone();
         self.status_scroll = 0;
         self.clamp_selected_exchange_row();
@@ -2808,6 +3641,23 @@ impl App {
             self.live_view_overlay_visible = false;
         }
         self.trading_action_overlay = None;
+    }
+
+    fn maybe_align_owls_sport_with_snapshot(&mut self) {
+        let Some(inferred_sport) = inferred_owls_sport(&self.snapshot) else {
+            return;
+        };
+        if inferred_sport == self.owls_dashboard.sport || self.owls_dashboard.sport != "nba" {
+            return;
+        }
+        self.owls_dashboard = owls::dashboard_for_sport(inferred_sport);
+        self.owls_resource_state
+            .finish_ok(self.owls_dashboard.clone());
+        self.clamp_selected_owls_endpoint();
+        self.request_owls_sync(OwlsSyncReason::Manual);
+        self.record_event(format!(
+            "Owls sport auto-set to {inferred_sport} from snapshot context."
+        ));
     }
 
     fn recorder_refresh_due(&self) -> bool {
@@ -2862,6 +3712,240 @@ impl App {
 
     fn scroll_status_up(&mut self, lines: u16) {
         self.status_scroll = self.status_scroll.saturating_sub(lines);
+    }
+
+    fn expire_stuck_provider_request_placeholder(&mut self) {
+        if !self.provider_resource_state.expire_if_overdue(
+            RESOURCE_WATCHDOG_TIMEOUT,
+            "provider request watchdog expired",
+        ) {
+            return;
+        }
+
+        self.provider_in_flight = false;
+        self.last_recorder_refresh_at = Some(Instant::now());
+        #[cfg(debug_assertions)]
+        {
+            self.provider_in_flight_started_at_for_test = None;
+        }
+        self.restart_provider_worker(self.current_provider_for_watchdog());
+        self.record_event("Provider refresh timed out; marking state stale.");
+    }
+
+    fn expire_stuck_owls_sync_placeholder(&mut self) {
+        if !self
+            .owls_resource_state
+            .expire_if_overdue(RESOURCE_WATCHDOG_TIMEOUT, "owls sync watchdog expired")
+        {
+            return;
+        }
+
+        self.owls_sync_in_flight = false;
+        self.last_owls_sync_dispatch_at = Some(Instant::now());
+        self.restart_owls_sync_worker();
+        if let Some(last_good) = self.owls_resource_state.last_good().cloned() {
+            self.owls_dashboard = last_good;
+            self.refresh_snapshot_enrichment();
+        }
+        self.record_event("Owls sync timed out; marking state stale.");
+    }
+
+    fn expire_stuck_matchbook_sync_placeholder(&mut self) {
+        if !self
+            .matchbook_resource_state
+            .expire_if_overdue(RESOURCE_WATCHDOG_TIMEOUT, "matchbook sync watchdog expired")
+        {
+            return;
+        }
+
+        self.matchbook_sync_in_flight = false;
+        self.last_matchbook_sync_dispatch_at = Some(Instant::now());
+        self.restart_matchbook_sync_worker();
+        self.record_event("Matchbook sync timed out; marking state stale.");
+    }
+
+    fn load_alerts_from_disk(&mut self, path: PathBuf) -> Result<()> {
+        let (config, note) = load_alert_config_or_default(&path)?;
+        self.alerts_config = config;
+        self.alerts_config_path = path;
+        self.alerts_config_note = note;
+        Ok(())
+    }
+
+    fn begin_alerts_edit(&mut self) {
+        let field = self.alerts_editor.selected_field();
+        self.alerts_editor.buffer = field.display_value(&self.alerts_config);
+        self.alerts_editor.editing = true;
+        self.alerts_editor.replace_on_input = true;
+        self.status_message = format!("Editing alerts {}.", field.label());
+        self.status_scroll = 0;
+    }
+
+    fn apply_alerts_edit(&mut self) -> Result<()> {
+        let field = self.alerts_editor.selected_field();
+        let value = self.alerts_editor.buffer.clone();
+        field.apply_value(&mut self.alerts_config, &value)?;
+        self.alerts_editor.editing = false;
+        self.alerts_editor.buffer.clear();
+        self.alerts_editor.replace_on_input = false;
+        self.persist_alerts_config()?;
+        self.status_message = format!("Updated alerts {}.", field.label());
+        self.status_scroll = 0;
+        self.record_event(format!("Updated alerts {}.", field.label()));
+        Ok(())
+    }
+
+    fn cancel_alerts_edit(&mut self) {
+        self.alerts_editor.editing = false;
+        self.alerts_editor.buffer.clear();
+        self.alerts_editor.replace_on_input = false;
+        self.status_message = String::from("Cancelled alerts edit.");
+    }
+
+    fn alerts_push_char(&mut self, character: char) {
+        if self.alerts_editor.replace_on_input {
+            self.alerts_editor.buffer.clear();
+            self.alerts_editor.replace_on_input = false;
+        }
+        self.alerts_editor.buffer.push(character);
+    }
+
+    fn alerts_backspace(&mut self) {
+        if self.alerts_editor.replace_on_input {
+            self.alerts_editor.buffer.clear();
+            self.alerts_editor.replace_on_input = false;
+            return;
+        }
+        self.alerts_editor.buffer.pop();
+    }
+
+    fn cycle_alerts_suggestion(&mut self, forward: bool) -> Result<()> {
+        let field = self.alerts_editor.selected_field();
+        let suggestions = field.suggestions();
+        if suggestions.is_empty() {
+            return Ok(());
+        }
+        let current_value = field.display_value(&self.alerts_config);
+        let current_index = suggestions.iter().position(|value| value == &current_value);
+        let next_index = match (current_index, forward) {
+            (Some(index), true) => (index + 1) % suggestions.len(),
+            (Some(index), false) => {
+                if index == 0 {
+                    suggestions.len() - 1
+                } else {
+                    index - 1
+                }
+            }
+            (None, _) => 0,
+        };
+        field.apply_value(&mut self.alerts_config, suggestions[next_index])?;
+        self.persist_alerts_config()?;
+        self.status_message = format!("Applied alerts suggestion for {}.", field.label());
+        self.status_scroll = 0;
+        self.record_event(format!("Applied alerts suggestion for {}.", field.label()));
+        Ok(())
+    }
+
+    fn reload_alerts_config(&mut self) -> Result<()> {
+        let (config, note) = load_alert_config_or_default(&self.alerts_config_path)?;
+        self.alerts_config = config;
+        self.alerts_config_note = note;
+        self.alerts_editor = AlertEditorState::default();
+        self.status_message = String::from("Reloaded alerts config from disk.");
+        self.status_scroll = 0;
+        Ok(())
+    }
+
+    fn reset_alerts_config(&mut self) -> Result<()> {
+        self.alerts_config = AlertConfig::default();
+        self.alerts_editor = AlertEditorState::default();
+        self.persist_alerts_config()?;
+        self.status_message = String::from("Reset alerts config to defaults.");
+        self.status_scroll = 0;
+        Ok(())
+    }
+
+    fn persist_alerts_config(&mut self) -> Result<()> {
+        self.alerts_config_note = save_alert_config(&self.alerts_config_path, &self.alerts_config)?;
+        Ok(())
+    }
+
+    fn mark_notifications_read(&mut self) {
+        for entry in &mut self.notifications {
+            entry.unread = false;
+        }
+    }
+
+    fn emit_alert(
+        &mut self,
+        rule_key: &'static str,
+        level: NotificationLevel,
+        title: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
+        if !self.alerts_config.enabled {
+            return;
+        }
+        if self.should_suppress_alert_for_recorder_startup(rule_key) {
+            return;
+        }
+        if self.alerts_config.cooldown_seconds > 0
+            && self.alert_last_sent_at.get(rule_key).is_some_and(|last| {
+                last.elapsed() < Duration::from_secs(self.alerts_config.cooldown_seconds)
+            })
+        {
+            return;
+        }
+        self.alert_last_sent_at.insert(rule_key, Instant::now());
+
+        let title = title.into();
+        let detail = detail.into();
+        let entry = NotificationEntry {
+            created_at: current_time_label(),
+            rule_key: String::from(rule_key),
+            level,
+            title: title.clone(),
+            detail: detail.clone(),
+            unread: true,
+        };
+        if self.notifications.len() == MAX_NOTIFICATIONS {
+            self.notifications.pop_front();
+        }
+        self.notifications.push_back(entry.clone());
+        self.record_event(format!("Alert {} {}: {}", level.label(), title, detail));
+        if !self.notifications_overlay_visible {
+            self.status_message = format!("{title}: {detail}");
+            self.status_scroll = 0;
+        }
+        if self.alerts_config.desktop_notifications || self.alerts_config.sound_effects {
+            dispatch_notification_delivery(entry, &self.alerts_config);
+        }
+    }
+
+    fn should_suppress_alert_for_recorder_startup(&mut self, rule_key: &str) -> bool {
+        let Some(muted_until) = self.recorder_startup_alerts_muted_until else {
+            return false;
+        };
+        if Instant::now() >= muted_until {
+            self.recorder_startup_alerts_muted_until = None;
+            self.recorder_startup_alerts_pending = false;
+            return false;
+        }
+        if !self.recorder_startup_alerts_pending {
+            return false;
+        }
+        matches!(
+            rule_key,
+            "provider_errors"
+                | "matchbook_failures"
+                | "snapshot_stale"
+                | "decision_queue"
+                | "tracked_bets"
+                | "exit_recommendations"
+                | "opportunity_detected"
+                | "watched_movement"
+                | "owls_errors"
+        )
     }
 
     fn begin_recorder_edit(&mut self) {
@@ -3515,9 +4599,441 @@ impl App {
     }
 }
 
+#[derive(Clone)]
+struct SnapshotMarketTarget {
+    event: String,
+    market: String,
+    selection: String,
+    event_url: String,
+}
+
+pub(crate) fn populate_snapshot_enrichment(
+    snapshot: &mut ExchangePanelSnapshot,
+    owls_dashboard: &OwlsDashboard,
+    matchbook_account_state: Option<&MatchbookAccountState>,
+) {
+    snapshot.external_quotes =
+        build_external_quote_rows(snapshot, owls_dashboard, matchbook_account_state);
+    snapshot.external_live_events = build_external_live_event_rows(snapshot, owls_dashboard);
+    apply_external_live_context(snapshot);
+}
+
+fn build_external_quote_rows(
+    snapshot: &ExchangePanelSnapshot,
+    owls_dashboard: &OwlsDashboard,
+    matchbook_account_state: Option<&MatchbookAccountState>,
+) -> Vec<ExternalQuoteRow> {
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+
+    for open_position in &snapshot.open_positions {
+        if let Some(price) = open_position.current_back_odds {
+            push_external_quote_row(
+                &mut rows,
+                &mut seen,
+                ExternalQuoteRow {
+                    provider: String::from("snapshot"),
+                    venue: String::from("smarkets"),
+                    event: open_position.event.clone(),
+                    market: open_position.market.clone(),
+                    selection: open_position.contract.clone(),
+                    side: String::from("back"),
+                    event_url: open_position.event_url.clone(),
+                    deep_link_url: String::new(),
+                    event_id: String::new(),
+                    market_id: String::new(),
+                    selection_id: String::new(),
+                    price: Some(price),
+                    liquidity: None,
+                    is_sharp: false,
+                    updated_at: snapshot
+                        .runtime
+                        .as_ref()
+                        .map(|runtime| runtime.updated_at.clone())
+                        .unwrap_or_default(),
+                    status: if open_position.can_trade_out {
+                        String::from("live")
+                    } else {
+                        String::from("snapshot")
+                    },
+                },
+            );
+        }
+    }
+
+    let targets = snapshot_market_targets(snapshot);
+    for target in &targets {
+        for quote in owls::matching_market_quotes(
+            owls_dashboard,
+            &target.event,
+            &target.market,
+            &target.selection,
+        ) {
+            let book = quote.book.trim().to_string();
+            push_external_quote_row(
+                &mut rows,
+                &mut seen,
+                ExternalQuoteRow {
+                    provider: String::from("owls"),
+                    venue: if book.is_empty() {
+                        String::from("unknown")
+                    } else {
+                        book.clone()
+                    },
+                    event: target.event.clone(),
+                    market: target.market.clone(),
+                    selection: target.selection.clone(),
+                    side: String::from("back"),
+                    event_url: target.event_url.clone(),
+                    deep_link_url: quote.event_link.clone(),
+                    event_id: String::new(),
+                    market_id: String::new(),
+                    selection_id: String::new(),
+                    price: quote.decimal_price,
+                    liquidity: quote.limit_amount,
+                    is_sharp: normalize_key(&book) == "pinnacle",
+                    updated_at: owls_dashboard.refreshed_at.clone(),
+                    status: if quote.suspended {
+                        String::from("suspended")
+                    } else {
+                        String::from("ready")
+                    },
+                },
+            );
+        }
+    }
+
+    if let Some(state) = matchbook_account_state {
+        for target in &targets {
+            for offer in state
+                .current_offers
+                .iter()
+                .filter(|offer| matchbook_offer_matches_target(offer, target))
+            {
+                push_external_quote_row(
+                    &mut rows,
+                    &mut seen,
+                    ExternalQuoteRow {
+                        provider: String::from("matchbook_api"),
+                        venue: String::from("matchbook"),
+                        event: target.event.clone(),
+                        market: target.market.clone(),
+                        selection: target.selection.clone(),
+                        side: offer.side.clone(),
+                        event_url: target.event_url.clone(),
+                        deep_link_url: String::new(),
+                        event_id: offer.event_id.clone(),
+                        market_id: offer.market_id.clone(),
+                        selection_id: offer.runner_id.clone(),
+                        price: offer.odds,
+                        liquidity: offer.remaining_stake.or(offer.stake),
+                        is_sharp: false,
+                        updated_at: String::new(),
+                        status: offer.status.clone(),
+                    },
+                );
+            }
+            for bet in state
+                .current_bets
+                .iter()
+                .filter(|bet| matchbook_bet_matches_target(bet, target))
+            {
+                push_external_quote_row(
+                    &mut rows,
+                    &mut seen,
+                    ExternalQuoteRow {
+                        provider: String::from("matchbook_api"),
+                        venue: String::from("matchbook"),
+                        event: target.event.clone(),
+                        market: target.market.clone(),
+                        selection: target.selection.clone(),
+                        side: bet.side.clone(),
+                        event_url: target.event_url.clone(),
+                        deep_link_url: String::new(),
+                        event_id: bet.event_id.clone(),
+                        market_id: bet.market_id.clone(),
+                        selection_id: bet.runner_id.clone(),
+                        price: bet.odds,
+                        liquidity: bet.stake,
+                        is_sharp: false,
+                        updated_at: String::new(),
+                        status: bet.status.clone(),
+                    },
+                );
+            }
+            for position in state
+                .positions
+                .iter()
+                .filter(|position| matchbook_position_matches_target(position, target))
+            {
+                push_external_quote_row(
+                    &mut rows,
+                    &mut seen,
+                    ExternalQuoteRow {
+                        provider: String::from("matchbook_api"),
+                        venue: String::from("matchbook"),
+                        event: target.event.clone(),
+                        market: target.market.clone(),
+                        selection: target.selection.clone(),
+                        side: String::new(),
+                        event_url: target.event_url.clone(),
+                        deep_link_url: String::new(),
+                        event_id: position.event_id.clone(),
+                        market_id: position.market_id.clone(),
+                        selection_id: position.runner_id.clone(),
+                        price: None,
+                        liquidity: position.exposure.map(f64::abs),
+                        is_sharp: false,
+                        updated_at: String::new(),
+                        status: String::from("position"),
+                    },
+                );
+            }
+        }
+    }
+
+    rows
+}
+
+fn build_external_live_event_rows(
+    snapshot: &ExchangePanelSnapshot,
+    owls_dashboard: &OwlsDashboard,
+) -> Vec<ExternalLiveEventRow> {
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+    for target in snapshot_market_targets(snapshot) {
+        let Some(live_event) = owls::find_live_score(owls_dashboard, &target.event).or_else(|| {
+            owls_dashboard
+                .endpoints
+                .iter()
+                .flat_map(|endpoint| endpoint.live_scores.iter())
+                .find(|score| event_matches(&score.name, &target.event))
+                .cloned()
+        }) else {
+            continue;
+        };
+        let key = normalize_key(&target.event);
+        if !seen.insert(key) {
+            continue;
+        }
+        rows.push(ExternalLiveEventRow {
+            provider: String::from("owls"),
+            sport: live_event.sport.clone(),
+            event: target.event,
+            event_id: live_event.event_id.clone(),
+            source_match_id: live_event.source_match_id.clone(),
+            home_team: live_event.home_team.clone(),
+            away_team: live_event.away_team.clone(),
+            home_score: live_event.home_score,
+            away_score: live_event.away_score,
+            status_state: live_event.status_state.clone(),
+            status_detail: live_event.status_detail.clone(),
+            display_clock: live_event.display_clock.clone(),
+            last_updated: live_event.last_updated.clone(),
+            stats: live_event
+                .stats
+                .iter()
+                .map(|stat| ExternalLiveStatRow {
+                    key: stat.key.clone(),
+                    label: stat.label.clone(),
+                    home_value: stat.home_value.clone(),
+                    away_value: stat.away_value.clone(),
+                })
+                .collect(),
+            incidents: live_event
+                .incidents
+                .iter()
+                .map(|incident| ExternalLiveIncidentRow {
+                    minute: incident.minute,
+                    incident_type: incident.incident_type.clone(),
+                    team_side: incident.team_side.clone(),
+                    player_name: incident.player_name.clone(),
+                    detail: incident.detail.clone(),
+                })
+                .collect(),
+            player_ratings: live_event
+                .player_ratings
+                .iter()
+                .map(|player| ExternalPlayerRatingRow {
+                    player_name: player.player_name.clone(),
+                    team_side: player.team_side.clone(),
+                    rating: player.rating,
+                })
+                .collect(),
+        });
+    }
+    rows
+}
+
+fn apply_external_live_context(snapshot: &mut ExchangePanelSnapshot) {
+    for open_position in &mut snapshot.open_positions {
+        let Some(live_event) = snapshot
+            .external_live_events
+            .iter()
+            .find(|live_event| event_matches(&live_event.event, &open_position.event))
+        else {
+            continue;
+        };
+        open_position.current_score_home = live_event.home_score;
+        open_position.current_score_away = live_event.away_score;
+        if let (Some(away), Some(home)) = (live_event.away_score, live_event.home_score) {
+            open_position.current_score = format!("{away}-{home}");
+        }
+        if !live_event.display_clock.trim().is_empty() {
+            open_position.live_clock = live_event.display_clock.clone();
+        } else if !live_event.status_detail.trim().is_empty() {
+            open_position.live_clock = live_event.status_detail.clone();
+        }
+        if !live_event.status_detail.trim().is_empty() {
+            open_position.event_status = live_event.status_detail.clone();
+        } else if !live_event.status_state.trim().is_empty() {
+            open_position.event_status = live_event.status_state.clone();
+        }
+        open_position.is_in_play = matches!(
+            normalize_key(&live_event.status_state).as_str(),
+            "in" | "live" | "inplay"
+        );
+    }
+}
+
+fn snapshot_market_targets(snapshot: &ExchangePanelSnapshot) -> Vec<SnapshotMarketTarget> {
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    for open_position in &snapshot.open_positions {
+        push_snapshot_target(
+            &mut targets,
+            &mut seen,
+            &open_position.event,
+            &open_position.market,
+            &open_position.contract,
+            &open_position.event_url,
+        );
+    }
+    for tracked_bet in &snapshot.tracked_bets {
+        if tracked_bet_is_closed(tracked_bet) {
+            continue;
+        }
+        push_snapshot_target(
+            &mut targets,
+            &mut seen,
+            &tracked_bet.event,
+            &tracked_bet.market,
+            &tracked_bet.selection,
+            "",
+        );
+    }
+    for sportsbook_bet in &snapshot.other_open_bets {
+        push_snapshot_target(
+            &mut targets,
+            &mut seen,
+            &sportsbook_bet.event,
+            &sportsbook_bet.market,
+            &sportsbook_bet.label,
+            "",
+        );
+    }
+    targets
+}
+
+fn push_snapshot_target(
+    targets: &mut Vec<SnapshotMarketTarget>,
+    seen: &mut HashSet<String>,
+    event: &str,
+    market: &str,
+    selection: &str,
+    event_url: &str,
+) {
+    if event.trim().is_empty() || market.trim().is_empty() || selection.trim().is_empty() {
+        return;
+    }
+    let key = format!(
+        "{}|{}|{}",
+        normalize_key(event),
+        normalize_key(market),
+        normalize_key(selection)
+    );
+    if !seen.insert(key) {
+        return;
+    }
+    targets.push(SnapshotMarketTarget {
+        event: event.to_string(),
+        market: market.to_string(),
+        selection: selection.to_string(),
+        event_url: event_url.to_string(),
+    });
+}
+
+fn push_external_quote_row(
+    rows: &mut Vec<ExternalQuoteRow>,
+    seen: &mut HashSet<String>,
+    row: ExternalQuoteRow,
+) {
+    let key = format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        normalize_key(&row.provider),
+        normalize_key(&row.venue),
+        normalize_key(&row.event),
+        normalize_key(&row.market),
+        normalize_key(&row.selection),
+        normalize_key(&row.side),
+        row.price.unwrap_or_default(),
+        row.event_id.as_str(),
+        row.selection_id.as_str()
+    );
+    if seen.insert(key) {
+        rows.push(row);
+    }
+}
+
+fn matchbook_offer_matches_target(
+    offer: &MatchbookOfferRow,
+    target: &SnapshotMarketTarget,
+) -> bool {
+    event_matches(&offer.event_name, &target.event)
+        && market_matches(&offer.market_name, &target.market)
+        && selection_matches_with_context(
+            &offer.selection_name,
+            &offer.event_name,
+            &offer.market_name,
+            &target.selection,
+            &target.event,
+            &target.market,
+        )
+}
+
+fn matchbook_bet_matches_target(bet: &MatchbookBetRow, target: &SnapshotMarketTarget) -> bool {
+    event_matches(&bet.event_name, &target.event)
+        && market_matches(&bet.market_name, &target.market)
+        && selection_matches_with_context(
+            &bet.selection_name,
+            &bet.event_name,
+            &bet.market_name,
+            &target.selection,
+            &target.event,
+            &target.market,
+        )
+}
+
+fn matchbook_position_matches_target(
+    position: &MatchbookPositionRow,
+    target: &SnapshotMarketTarget,
+) -> bool {
+    event_matches(&position.event_name, &target.event)
+        && market_matches(&position.market_name, &target.market)
+        && selection_matches_with_context(
+            &position.selection_name,
+            &position.event_name,
+            &position.market_name,
+            &target.selection,
+            &target.event,
+            &target.market,
+        )
+}
+
 fn normalize_snapshot(
     mut snapshot: ExchangePanelSnapshot,
     disabled_venues: &str,
+    manual_positions: &[ManualPositionEntry],
 ) -> ExchangePanelSnapshot {
     snapshot
         .venues
@@ -3525,6 +5041,7 @@ fn normalize_snapshot(
     snapshot
         .other_open_bets
         .retain(|bet| !venue_name_disabled(&bet.venue, disabled_venues));
+    merge_manual_positions(&mut snapshot, manual_positions, disabled_venues);
     if snapshot
         .selected_venue
         .is_some_and(|venue| !venue_enabled(venue, disabled_venues))
@@ -3533,6 +5050,55 @@ fn normalize_snapshot(
     }
     snapshot.historical_positions = merge_historical_positions(&snapshot);
     snapshot
+}
+
+fn merge_manual_positions(
+    snapshot: &mut ExchangePanelSnapshot,
+    manual_positions: &[ManualPositionEntry],
+    disabled_venues: &str,
+) {
+    for entry in manual_positions {
+        if entry.event.trim().is_empty()
+            || entry.market.trim().is_empty()
+            || entry.selection.trim().is_empty()
+            || entry.venue.trim().is_empty()
+            || entry.odds <= 0.0
+            || entry.stake <= 0.0
+            || venue_name_disabled(&entry.venue, disabled_venues)
+        {
+            continue;
+        }
+
+        let already_present = snapshot.other_open_bets.iter().any(|bet| {
+            normalize_manual_key(&bet.event) == normalize_manual_key(&entry.event)
+                && normalize_manual_key(&bet.market) == normalize_manual_key(&entry.market)
+                && normalize_manual_key(&bet.label) == normalize_manual_key(&entry.selection)
+                && normalize_manual_key(&bet.venue) == normalize_manual_key(&entry.venue)
+        });
+        if already_present {
+            continue;
+        }
+
+        snapshot.other_open_bets.push(entry.to_other_open_bet());
+    }
+}
+
+fn normalize_manual_key(value: &str) -> String {
+    value
+        .to_lowercase()
+        .replace("vs", "v")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn preserve_cached_snapshot_state(
@@ -3672,6 +5238,229 @@ fn tracked_bet_is_closed(tracked_bet: &TrackedBetRow) -> bool {
     )
 }
 
+fn tracked_bet_key(tracked_bet: &TrackedBetRow) -> String {
+    if !tracked_bet.bet_id.trim().is_empty() {
+        tracked_bet.bet_id.clone()
+    } else {
+        format!(
+            "{}|{}|{}|{}",
+            tracked_bet.event, tracked_bet.market, tracked_bet.selection, tracked_bet.placed_at
+        )
+    }
+}
+
+fn first_settled_transition_detail(
+    previous: &ExchangePanelSnapshot,
+    current: &ExchangePanelSnapshot,
+) -> Option<String> {
+    let previous_by_key = previous
+        .tracked_bets
+        .iter()
+        .map(|tracked_bet| (tracked_bet_key(tracked_bet), tracked_bet))
+        .collect::<HashMap<_, _>>();
+
+    current.tracked_bets.iter().find_map(|tracked_bet| {
+        if !tracked_bet_is_closed(tracked_bet) {
+            return None;
+        }
+        let key = tracked_bet_key(tracked_bet);
+        let was_closed = previous_by_key
+            .get(&key)
+            .map(|previous_tracked_bet| tracked_bet_is_closed(previous_tracked_bet))
+            .unwrap_or(false);
+        if was_closed {
+            return None;
+        }
+        let pnl = tracked_bet
+            .realised_pnl_gbp
+            .map(|value| format!(" pnl {value:+.2}"))
+            .unwrap_or_default();
+        Some(format!(
+            "{} {} {}{}",
+            tracked_bet
+                .platform
+                .clone()
+                .if_empty_then(|| String::from("bet")),
+            tracked_bet.selection,
+            tracked_bet.status,
+            pnl
+        ))
+    })
+}
+
+fn live_sharp_opportunity_alert_detail(
+    snapshot: &ExchangePanelSnapshot,
+    previous_dashboard: &OwlsDashboard,
+    current_dashboard: &OwlsDashboard,
+    threshold_pct: f64,
+) -> Option<String> {
+    let previous_best =
+        best_live_sharp_edge(snapshot, previous_dashboard).map(|candidate| candidate.edge_pct);
+    let candidate = best_live_sharp_edge(snapshot, current_dashboard)?;
+    if candidate.edge_pct < threshold_pct
+        || previous_best.unwrap_or(f64::NEG_INFINITY) >= threshold_pct
+    {
+        return None;
+    }
+    Some(format!(
+        "{} {} @ {:.2} vs pinnacle {:.2} ({:+.2}%)",
+        candidate.book,
+        candidate.selection,
+        candidate.offered_odds,
+        candidate.sharp_odds,
+        candidate.edge_pct
+    ))
+}
+
+fn sharp_watch_movement_alert_detail(
+    snapshot: &ExchangePanelSnapshot,
+    previous_dashboard: &OwlsDashboard,
+    current_dashboard: &OwlsDashboard,
+    threshold_pct: f64,
+) -> Option<String> {
+    let watch = snapshot.watch.as_ref()?;
+    watch.watches.iter().find_map(|watch_row| {
+        let event = watch_row_event_name(snapshot, watch_row)?;
+        let previous = find_owls_sharp_price(
+            previous_dashboard,
+            &event,
+            &watch_row.market,
+            &watch_row.contract,
+        )?;
+        let current = find_owls_sharp_price(
+            current_dashboard,
+            &event,
+            &watch_row.market,
+            &watch_row.contract,
+        )?;
+        if previous <= 1.0 || current <= 1.0 {
+            return None;
+        }
+        let pct_move = ((current - previous) / previous).abs() * 100.0;
+        if pct_move < threshold_pct {
+            return None;
+        }
+        let direction = if current > previous { "up" } else { "down" };
+        Some(format!(
+            "{} {:.2}->{:.2} ({pct_move:.2}% {direction})",
+            watch_row.contract, previous, current
+        ))
+    })
+}
+
+#[derive(Debug, Clone)]
+struct SharpEdgeCandidate {
+    book: String,
+    selection: String,
+    offered_odds: f64,
+    sharp_odds: f64,
+    edge_pct: f64,
+}
+
+fn best_live_sharp_edge(
+    snapshot: &ExchangePanelSnapshot,
+    dashboard: &OwlsDashboard,
+) -> Option<SharpEdgeCandidate> {
+    let other_bets = snapshot.other_open_bets.iter().filter_map(|bet| {
+        let sharp_odds = find_owls_sharp_price(dashboard, &bet.event, &bet.market, &bet.label)?;
+        if bet.odds <= 1.0 || sharp_odds <= 1.0 {
+            return None;
+        }
+        let edge_pct = ((bet.odds / sharp_odds) - 1.0) * 100.0;
+        Some(SharpEdgeCandidate {
+            book: bet.venue.clone(),
+            selection: bet.label.clone(),
+            offered_odds: bet.odds,
+            sharp_odds,
+            edge_pct,
+        })
+    });
+
+    let tracked = snapshot
+        .tracked_bets
+        .iter()
+        .filter(|tracked_bet| !tracked_bet_is_closed(tracked_bet))
+        .filter_map(|tracked_bet| {
+            let offered_odds = tracked_bet.back_price.or_else(|| {
+                tracked_bet
+                    .legs
+                    .iter()
+                    .find(|leg| is_back_leg(leg))
+                    .map(|leg| leg.odds)
+            })?;
+            let sharp_odds = find_owls_sharp_price(
+                dashboard,
+                &tracked_bet.event,
+                &tracked_bet.market,
+                &tracked_bet.selection,
+            )?;
+            if offered_odds <= 1.0 || sharp_odds <= 1.0 {
+                return None;
+            }
+            let edge_pct = ((offered_odds / sharp_odds) - 1.0) * 100.0;
+            Some(SharpEdgeCandidate {
+                book: tracked_bet
+                    .platform
+                    .clone()
+                    .if_empty_then(|| String::from("tracked")),
+                selection: tracked_bet.selection.clone(),
+                offered_odds,
+                sharp_odds,
+                edge_pct,
+            })
+        });
+
+    other_bets.chain(tracked).max_by(|left, right| {
+        left.edge_pct
+            .partial_cmp(&right.edge_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
+fn watch_row_event_name(
+    snapshot: &ExchangePanelSnapshot,
+    watch_row: &crate::domain::WatchRow,
+) -> Option<String> {
+    snapshot
+        .open_positions
+        .iter()
+        .find(|row| {
+            text_matches(&row.contract, &watch_row.contract)
+                && market_matches(&row.market, &watch_row.market)
+        })
+        .map(|row| row.event.clone())
+        .or_else(|| {
+            snapshot
+                .tracked_bets
+                .iter()
+                .find(|tracked_bet| {
+                    selection_matches(&tracked_bet.selection, &watch_row.contract)
+                        && market_matches(&tracked_bet.market, &watch_row.market)
+                })
+                .map(|tracked_bet| tracked_bet.event.clone())
+        })
+        .or_else(|| {
+            snapshot
+                .other_open_bets
+                .iter()
+                .find(|bet| {
+                    selection_matches(&bet.label, &watch_row.contract)
+                        && market_matches(&bet.market, &watch_row.market)
+                })
+                .map(|bet| bet.event.clone())
+        })
+}
+
+fn find_owls_sharp_price(
+    dashboard: &OwlsDashboard,
+    event: &str,
+    market: &str,
+    selection: &str,
+) -> Option<f64> {
+    owls::find_pinnacle_quote(dashboard, event, market, selection)
+        .and_then(|quote| quote.decimal_price)
+}
+
 fn historical_position_from_tracked_bet(tracked_bet: &TrackedBetRow) -> OpenPositionRow {
     let price = tracked_bet
         .back_price
@@ -3798,6 +5587,22 @@ fn runtime_updated_at(snapshot: &ExchangePanelSnapshot) -> Option<&str> {
         .filter(|value| !value.trim().is_empty())
 }
 
+fn actionable_decision_count(snapshot: &ExchangePanelSnapshot) -> usize {
+    snapshot
+        .decisions
+        .iter()
+        .filter(|decision| !decision.status.eq_ignore_ascii_case("hold"))
+        .count()
+}
+
+fn actionable_exit_recommendation_count(snapshot: &ExchangePanelSnapshot) -> usize {
+    snapshot
+        .exit_recommendations
+        .iter()
+        .filter(|recommendation| !recommendation.action.eq_ignore_ascii_case("hold"))
+        .count()
+}
+
 fn decision_status_counts(snapshot: &ExchangePanelSnapshot) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for decision in &snapshot.decisions {
@@ -3834,6 +5639,68 @@ fn previous_from<T: Copy + PartialEq>(value: T, all: &[T]) -> T {
         all[all.len() - 1]
     } else {
         all[index - 1]
+    }
+}
+
+fn current_time_label() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let seconds_of_day = seconds % 86_400;
+    let hours = seconds_of_day / 3_600;
+    let minutes = (seconds_of_day % 3_600) / 60;
+    let secs = seconds_of_day % 60;
+    format!("{hours:02}:{minutes:02}:{secs:02}")
+}
+
+fn dispatch_notification_delivery(entry: NotificationEntry, config: &AlertConfig) {
+    let desktop_notifications = config.desktop_notifications;
+    let sound_effects = config.sound_effects;
+    thread::spawn(move || {
+        let sound_name = alert_sound_name(&entry.rule_key, entry.level);
+        if desktop_notifications {
+            let _ = std::process::Command::new("notify-send")
+                .arg("-u")
+                .arg(entry.level.notify_send_urgency())
+                .arg("-h")
+                .arg(format!("string:sound-name:{sound_name}"))
+                .arg(&entry.title)
+                .arg(&entry.detail)
+                .status();
+        }
+        if sound_effects {
+            let sound_status = std::process::Command::new("canberra-gtk-play")
+                .arg("-i")
+                .arg(sound_name)
+                .status();
+            if sound_status.is_err() {
+                let _ = std::io::stderr().write_all(b"\x07");
+                let _ = std::io::stderr().flush();
+            }
+        }
+    });
+}
+
+fn alert_sound_name(rule_key: &str, level: NotificationLevel) -> &'static str {
+    match rule_key {
+        "bet_placed" => "complete",
+        "bet_settled" => "message",
+        "recorder_failures" => "dialog-error",
+        "provider_errors" => "network-error",
+        "matchbook_failures" => "dialog-warning",
+        "snapshot_stale" => "dialog-warning",
+        "exit_recommendations" => "message-new-instant",
+        "decision_queue" => "message",
+        "tracked_bets" => "complete",
+        "opportunity_detected" => "message-new-instant",
+        "watched_movement" => "dialog-warning",
+        "owls_errors" => "dialog-warning",
+        _ => match level {
+            NotificationLevel::Info => "message",
+            NotificationLevel::Warning => "dialog-warning",
+            NotificationLevel::Critical => "dialog-error",
+        },
     }
 }
 
@@ -3897,34 +5764,7 @@ fn new_trading_action_request_id(source: TradingActionSource) -> String {
     format!("{source:?}-{millis}").to_lowercase()
 }
 
-fn start_provider_worker(
-    mut provider: Box<dyn ExchangeProvider + Send>,
-) -> (Sender<ProviderJob>, Receiver<ProviderResult>) {
-    let (job_tx, job_rx) = mpsc::channel::<ProviderJob>();
-    let (result_tx, result_rx) = mpsc::channel::<ProviderResult>();
-    thread::spawn(move || {
-        while let Ok(job) = job_rx.recv() {
-            let request = job.request.clone();
-            let result = provider
-                .handle(request.clone())
-                .map_err(|error| error.to_string());
-            if result_tx
-                .send(ProviderResult {
-                    request,
-                    result,
-                    failure_context: job.failure_context,
-                    event_message: job.event_message,
-                })
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-    (job_tx, result_rx)
-}
-
-fn start_oddsmatcher_worker(
+pub(crate) fn start_oddsmatcher_worker(
     client: Client,
 ) -> (Sender<OddsMatcherJob>, Receiver<OddsMatcherResult>) {
     let (job_tx, job_rx) = mpsc::channel::<OddsMatcherJob>();
@@ -3941,24 +5781,8 @@ fn start_oddsmatcher_worker(
     (job_tx, result_rx)
 }
 
-fn start_owls_sync_worker(client: Client) -> (Sender<OwlsSyncJob>, Receiver<OwlsSyncResult>) {
-    let (job_tx, job_rx) = mpsc::channel::<OwlsSyncJob>();
-    let (result_tx, result_rx) = mpsc::channel::<OwlsSyncResult>();
-    thread::spawn(move || {
-        while let Ok(job) = job_rx.recv() {
-            let outcome = owls::sync_dashboard(&client, &job.dashboard, job.reason, job.focused);
-            if result_tx
-                .send(OwlsSyncResult {
-                    outcome,
-                    reason: job.reason,
-                })
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-    (job_tx, result_rx)
+fn default_owls_sync_async_client() -> reqwest::Client {
+    owls::build_async_client().unwrap_or_else(|_| reqwest::Client::new())
 }
 
 fn provider_job_priority(request: &ProviderRequest) -> u8 {
@@ -3993,24 +5817,60 @@ fn provider_queue_message(request: &ProviderRequest) -> String {
     }
 }
 
-fn start_matchbook_sync_worker() -> (Sender<MatchbookSyncJob>, Receiver<MatchbookSyncResult>) {
-    let (job_tx, job_rx) = mpsc::channel::<MatchbookSyncJob>();
-    let (result_tx, result_rx) = mpsc::channel::<MatchbookSyncResult>();
-    thread::spawn(move || {
-        while let Ok(job) = job_rx.recv() {
-            let state = load_matchbook_account_state().map_err(|error| error.to_string());
-            if result_tx
-                .send(MatchbookSyncResult {
-                    state,
-                    reason: job.reason,
-                })
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-    (job_tx, result_rx)
+#[cfg(test)]
+fn matchbook_error_has_status(error: &color_eyre::Report, status_code: u16) -> bool {
+    error.to_string().contains(&format!(" {status_code}:"))
+}
+
+fn inferred_owls_sport(snapshot: &ExchangePanelSnapshot) -> Option<&'static str> {
+    snapshot
+        .tracked_bets
+        .iter()
+        .find_map(|tracked_bet| infer_owls_sport_from_key(&tracked_bet.sport_key))
+        .or_else(|| {
+            snapshot
+                .open_positions
+                .iter()
+                .find_map(infer_owls_sport_from_open_position)
+        })
+}
+
+fn infer_owls_sport_from_key(value: &str) -> Option<&'static str> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.starts_with("soccer") || normalized.contains("premierleague") {
+        Some("soccer")
+    } else if normalized.contains("wnba") {
+        Some("wnba")
+    } else if normalized.contains("nba") {
+        Some("nba")
+    } else if normalized.contains("ncaab") {
+        Some("ncaab")
+    } else if normalized.contains("ncaaf") {
+        Some("ncaaf")
+    } else if normalized.contains("nfl") {
+        Some("nfl")
+    } else if normalized.contains("nhl") {
+        Some("nhl")
+    } else if normalized.contains("mlb") {
+        Some("mlb")
+    } else if normalized.contains("mma") {
+        Some("mma")
+    } else if normalized.contains("tennis") {
+        Some("tennis")
+    } else if normalized.contains("cs2") {
+        Some("cs2")
+    } else {
+        None
+    }
+}
+
+fn infer_owls_sport_from_open_position(row: &OpenPositionRow) -> Option<&'static str> {
+    let event_url = row.event_url.trim().to_ascii_lowercase();
+    if event_url.contains("/football/") || event_url.contains("/soccer/") {
+        Some("soccer")
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -4020,14 +5880,30 @@ mod tests {
 
     use crate::domain::{
         ExchangePanelSnapshot, OpenPositionRow, RuntimeSummary, TrackedBetRow, VenueId,
-        VenueStatus, VenueSummary, WorkerStatus, WorkerSummary,
+        VenueStatus, VenueSummary, WatchRow, WatchSnapshot, WorkerStatus, WorkerSummary,
+    };
+    use crate::exchange_api::{MatchbookAccountState, MatchbookOfferRow};
+    use crate::manual_positions::ManualPositionEntry;
+    use crate::owls::{
+        self, OwlsDashboard, OwlsEndpointId, OwlsLiveIncident, OwlsLiveScoreEvent, OwlsLiveStat,
+        OwlsMarketQuote, OwlsPlayerRating, OwlsPreviewRow, OwlsSyncReason,
     };
     use crate::provider::{ExchangeProvider, ProviderRequest};
     use crate::recorder::{RecorderConfig, RecorderStatus, RecorderSupervisor};
+    use crate::resource_state::ResourcePhase;
     use crate::stub_provider::StubExchangeProvider;
+    use crate::trading_actions::{
+        TradingActionIntent, TradingActionKind, TradingActionMode, TradingActionSide,
+        TradingActionSource, TradingActionSourceContext, TradingExecutionPolicy, TradingRiskReport,
+        TradingTimeInForce,
+    };
     use crossterm::event::KeyCode;
 
-    use super::{App, Panel, TradingSection, MAX_EVENT_HISTORY};
+    use super::{
+        populate_snapshot_enrichment, App, MatchbookSyncJob, MatchbookSyncReason,
+        MatchbookSyncResult, NotificationLevel, OwlsSyncJob, OwlsSyncResult, Panel, ProviderJob,
+        ProviderResult, TradingSection, MAX_EVENT_HISTORY,
+    };
 
     struct RefreshingProvider {
         cached_refresh_count: Arc<Mutex<usize>>,
@@ -4425,7 +6301,7 @@ mod tests {
                 supports_cash_out: false,
             });
 
-        let normalized = super::normalize_snapshot(snapshot, "bet365");
+        let normalized = super::normalize_snapshot(snapshot, "bet365", &[]);
 
         assert!(normalized
             .venues
@@ -4436,6 +6312,30 @@ mod tests {
             .other_open_bets
             .iter()
             .all(|bet| !bet.venue.eq_ignore_ascii_case("bet365")));
+    }
+
+    #[test]
+    fn normalize_snapshot_merges_manual_positions_into_other_open_bets() {
+        let snapshot = sample_snapshot("Initial dashboard");
+        let manual_positions = vec![ManualPositionEntry {
+            event: String::from("Malta v Luxembourg"),
+            market: String::from("Match Betting"),
+            selection: String::from("X"),
+            venue: String::from("betway"),
+            odds: 3.2,
+            stake: 50.0,
+            ..ManualPositionEntry::default()
+        }];
+
+        let normalized = super::normalize_snapshot(snapshot, "", &manual_positions);
+
+        assert!(normalized.other_open_bets.iter().any(|bet| {
+            bet.venue.eq_ignore_ascii_case("betway")
+                && bet.event == "Malta v Luxembourg"
+                && bet.label == "X"
+                && (bet.odds - 3.2).abs() < 0.001
+                && (bet.stake - 50.0).abs() < 0.001
+        }));
     }
 
     #[test]
@@ -5012,6 +6912,908 @@ mod tests {
         assert_eq!(app.snapshot().historical_positions[0].price, 4.2);
     }
 
+    #[test]
+    fn notifications_overlay_marks_alerts_read() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(StubExchangeProvider::default()),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+        app.alerts_config.desktop_notifications = false;
+        app.alerts_config.sound_effects = false;
+
+        app.emit_alert(
+            "tracked_bets",
+            NotificationLevel::Info,
+            "Tracked bets increased",
+            "2 tracked bets now loaded.",
+        );
+
+        assert_eq!(app.unread_notification_count(), 1);
+        assert!(!app.notifications_overlay_visible());
+
+        app.toggle_notifications_overlay();
+
+        assert!(app.notifications_overlay_visible());
+        assert_eq!(app.unread_notification_count(), 0);
+    }
+
+    #[test]
+    fn provider_errors_raise_notifications() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(StubExchangeProvider::default()),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+        app.alerts_config.desktop_notifications = false;
+        app.alerts_config.sound_effects = false;
+
+        app.record_provider_error(
+            "Refresh failed",
+            "worker timed out",
+            Some(VenueId::Smarkets),
+        );
+
+        assert_eq!(app.notifications.len(), 1);
+        assert_eq!(app.notifications[0].rule_key, "provider_errors");
+        assert_eq!(app.notifications[0].level, NotificationLevel::Critical);
+    }
+
+    #[test]
+    fn replace_snapshot_alerts_when_tracked_bets_increase() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(StubExchangeProvider::default()),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+        app.alerts_config.desktop_notifications = false;
+        app.alerts_config.sound_effects = false;
+        let mut next = sample_snapshot("updated");
+        next.tracked_bets = vec![TrackedBetRow {
+            bet_id: String::from("bet-1"),
+            event: String::from("Arsenal vs Everton"),
+            selection: String::from("Draw"),
+            ..TrackedBetRow::default()
+        }];
+
+        app.replace_snapshot(next);
+
+        assert_eq!(app.notifications.len(), 1);
+        assert_eq!(app.notifications[0].rule_key, "tracked_bets");
+        assert!(app.notifications[0].title.contains("Tracked bets"));
+    }
+
+    #[test]
+    fn recorder_startup_suppresses_bootstrap_tracked_bet_alerts() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut startup_snapshot = sample_snapshot("Recorder dashboard");
+        startup_snapshot.tracked_bets = vec![TrackedBetRow {
+            bet_id: String::from("bet-1"),
+            event: String::from("Arsenal vs Everton"),
+            selection: String::from("Draw"),
+            ..TrackedBetRow::default()
+        }];
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(StubExchangeProvider::default()),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(move |_| {
+                Box::new(RefreshingProvider {
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: startup_snapshot.clone(),
+                    cached_refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                }) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(RunningSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+        app.alerts_config.desktop_notifications = false;
+        app.alerts_config.sound_effects = false;
+
+        app.start_recorder().expect("start recorder");
+        assert!(app.wait_for_async_idle(Duration::from_millis(200)));
+
+        assert!(app.notifications.is_empty());
+        assert!(!app.recorder_startup_alerts_pending);
+        assert!(app.recorder_startup_alerts_muted_until.is_none());
+    }
+
+    #[test]
+    fn tracked_bet_alerts_resume_after_recorder_startup_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut startup_snapshot = sample_snapshot("Recorder dashboard");
+        startup_snapshot.tracked_bets = vec![TrackedBetRow {
+            bet_id: String::from("bet-1"),
+            event: String::from("Arsenal vs Everton"),
+            selection: String::from("Draw"),
+            ..TrackedBetRow::default()
+        }];
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(StubExchangeProvider::default()),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(move |_| {
+                Box::new(RefreshingProvider {
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: startup_snapshot.clone(),
+                    cached_refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                }) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(RunningSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+        app.alerts_config.desktop_notifications = false;
+        app.alerts_config.sound_effects = false;
+
+        app.start_recorder().expect("start recorder");
+        assert!(app.wait_for_async_idle(Duration::from_millis(200)));
+        assert!(app.notifications.is_empty());
+
+        let mut next = sample_snapshot("updated");
+        next.tracked_bets = vec![
+            TrackedBetRow {
+                bet_id: String::from("bet-1"),
+                event: String::from("Arsenal vs Everton"),
+                selection: String::from("Draw"),
+                ..TrackedBetRow::default()
+            },
+            TrackedBetRow {
+                bet_id: String::from("bet-2"),
+                event: String::from("Chelsea vs Liverpool"),
+                selection: String::from("Chelsea"),
+                ..TrackedBetRow::default()
+            },
+        ];
+
+        app.replace_snapshot(next);
+
+        assert_eq!(app.notifications.len(), 1);
+        assert_eq!(app.notifications[0].rule_key, "tracked_bets");
+    }
+
+    #[test]
+    fn confirmed_trade_execution_alerts_bet_placed() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(StubExchangeProvider::default()),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+        app.alerts_config.desktop_notifications = false;
+        app.alerts_config.sound_effects = false;
+
+        app.apply_provider_snapshot_result(
+            ProviderRequest::ExecuteTradingAction {
+                intent: sample_trading_action_intent(TradingActionMode::Confirm),
+            },
+            sample_snapshot("submitted"),
+            None,
+        );
+
+        assert_eq!(
+            app.notifications.back().expect("notification").rule_key,
+            "bet_placed"
+        );
+    }
+
+    #[test]
+    fn replace_snapshot_alerts_when_bet_settles() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut initial = sample_snapshot("initial");
+        initial.tracked_bets = vec![TrackedBetRow {
+            bet_id: String::from("bet-1"),
+            platform: String::from("matchbook"),
+            event: String::from("Arsenal vs Everton"),
+            market: String::from("Match Odds"),
+            selection: String::from("Draw"),
+            status: String::from("open"),
+            ..TrackedBetRow::default()
+        }];
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(RefreshingProvider {
+                cached_refresh_count: Rc::new(RefCell::new(0)),
+                live_refresh_count: Rc::new(RefCell::new(0)),
+                load_snapshot: initial,
+                cached_refresh_snapshot: sample_snapshot("cached"),
+                live_refresh_snapshot: sample_snapshot("live"),
+            }),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+        app.alerts_config.desktop_notifications = false;
+        app.alerts_config.sound_effects = false;
+        let mut next = sample_snapshot("settled");
+        next.tracked_bets = vec![TrackedBetRow {
+            bet_id: String::from("bet-1"),
+            platform: String::from("matchbook"),
+            event: String::from("Arsenal vs Everton"),
+            market: String::from("Match Odds"),
+            selection: String::from("Draw"),
+            status: String::from("won"),
+            settled_at: String::from("2026-03-25T20:00:00Z"),
+            realised_pnl_gbp: Some(12.4),
+            ..TrackedBetRow::default()
+        }];
+
+        app.replace_snapshot(next);
+
+        assert_eq!(
+            app.notifications.back().expect("notification").rule_key,
+            "bet_settled"
+        );
+    }
+
+    #[test]
+    fn live_sharp_opportunity_helper_detects_crossing_threshold() {
+        let mut snapshot = sample_snapshot("opportunity");
+        snapshot.other_open_bets = vec![crate::domain::OtherOpenBetRow {
+            venue: String::from("bet365"),
+            event: String::from("Chelsea vs Liverpool"),
+            label: String::from("Chelsea"),
+            market: String::from("Match Odds"),
+            side: String::from("back"),
+            odds: 2.2,
+            stake: 10.0,
+            status: String::from("open"),
+            funding_kind: String::from("cash"),
+            current_cashout_value: None,
+            supports_cash_out: false,
+        }];
+
+        let previous = sample_owls_dashboard_with_quote("Chelsea vs Liverpool", "Chelsea", 2.18);
+        let current = sample_owls_dashboard_with_quote("Chelsea vs Liverpool", "Chelsea", 2.00);
+
+        let detail =
+            super::live_sharp_opportunity_alert_detail(&snapshot, &previous, &current, 3.0)
+                .expect("sharp opportunity should alert");
+
+        assert!(detail.contains("bet365"));
+        assert!(detail.contains("Chelsea"));
+        assert!(detail.contains("pinnacle"));
+    }
+
+    #[test]
+    fn sharp_watch_movement_helper_uses_owls_prices() {
+        let mut snapshot = sample_snapshot("watch moved");
+        snapshot.open_positions = vec![OpenPositionRow {
+            event: String::from("Arsenal vs Everton"),
+            event_status: String::new(),
+            event_url: String::new(),
+            contract: String::from("Draw"),
+            market: String::from("Full-time result"),
+            status: String::from("open"),
+            market_status: String::from("open"),
+            is_in_play: true,
+            price: 3.2,
+            stake: 10.0,
+            liability: 10.0,
+            current_value: 0.0,
+            pnl_amount: 0.0,
+            overall_pnl_known: false,
+            current_back_odds: Some(3.2),
+            current_implied_probability: Some(1.0 / 3.2),
+            current_implied_percentage: Some(100.0 / 3.2),
+            current_buy_odds: Some(3.2),
+            current_buy_implied_probability: Some(1.0 / 3.2),
+            current_sell_odds: None,
+            current_sell_implied_probability: None,
+            current_score: String::new(),
+            current_score_home: None,
+            current_score_away: None,
+            live_clock: String::new(),
+            can_trade_out: true,
+        }];
+        snapshot.watch = Some(WatchSnapshot {
+            position_count: 1,
+            watch_count: 1,
+            commission_rate: 0.0,
+            target_profit: 1.0,
+            stop_loss: 1.0,
+            watches: vec![WatchRow {
+                contract: String::from("Draw"),
+                market: String::from("Full-time result"),
+                position_count: 1,
+                can_trade_out: true,
+                total_stake: 10.0,
+                total_liability: 10.0,
+                current_pnl_amount: 0.0,
+                current_back_odds: Some(3.0),
+                average_entry_lay_odds: 3.4,
+                entry_implied_probability: 1.0 / 3.4,
+                profit_take_back_odds: 2.8,
+                profit_take_implied_probability: 1.0 / 2.8,
+                stop_loss_back_odds: 3.7,
+                stop_loss_implied_probability: 1.0 / 3.7,
+            }],
+        });
+
+        let previous = sample_owls_dashboard_with_quote("Arsenal vs Everton", "Draw", 3.00);
+        let current = sample_owls_dashboard_with_quote("Arsenal vs Everton", "Draw", 3.30);
+
+        let detail = super::sharp_watch_movement_alert_detail(&snapshot, &previous, &current, 5.0)
+            .expect("watch movement should alert");
+
+        assert!(detail.contains("Draw"));
+        assert!(detail.contains("3.00->3.30"));
+    }
+
+    #[test]
+    fn stale_owls_result_does_not_reset_selected_sport() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(StubExchangeProvider::default()),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        app.owls_sync_rx = rx;
+        app.owls_sync_in_flight = true;
+        app.owls_dashboard = owls::dashboard_for_sport("nfl");
+
+        tx.send(OwlsSyncResult {
+            outcome: owls::OwlsSyncOutcome {
+                dashboard: owls::dashboard_for_sport("nba"),
+                checked_count: 3,
+                changed_count: 1,
+                changed: true,
+            },
+            reason: OwlsSyncReason::Background,
+        })
+        .expect("send stale result");
+
+        app.drain_owls_sync_results();
+
+        assert_eq!(app.owls_dashboard.sport, "nfl");
+    }
+
+    #[test]
+    fn provider_watchdog_restart_replaces_stuck_worker_channel() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(StubExchangeProvider::default()),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        let (dead_job_tx, mut dead_job_rx) = tokio::sync::mpsc::unbounded_channel::<ProviderJob>();
+        let (_dead_result_tx, dead_result_rx) =
+            tokio::sync::mpsc::unbounded_channel::<ProviderResult>();
+        app.provider_tx = dead_job_tx;
+        app.provider_rx = dead_result_rx;
+        app.provider_in_flight = true;
+        app.provider_resource_state
+            .begin_refresh(Instant::now() - Duration::from_secs(60));
+
+        app.expire_stuck_provider_request_placeholder();
+        app.queue_provider_request(ProviderJob {
+            request: ProviderRequest::RefreshCached,
+            failure_context: String::from("test"),
+            event_message: None,
+        });
+
+        assert!(dead_job_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn provider_watchdog_restart_preserves_pending_job() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(StubExchangeProvider::default()),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        app.provider_in_flight = true;
+        app.provider_resource_state
+            .begin_refresh(Instant::now() - Duration::from_secs(60));
+        app.provider_pending_job = Some(ProviderJob {
+            request: ProviderRequest::RefreshLive,
+            failure_context: String::from("test"),
+            event_message: None,
+        });
+
+        app.expire_stuck_provider_request_placeholder();
+        assert!(app.provider_pending_job.is_none());
+        assert!(app.provider_resource_state.is_loading());
+
+        app.wait_for_async_idle(Duration::from_millis(200));
+
+        assert!(app.provider_pending_job.is_none());
+        assert_eq!(app.provider_resource_state.phase(), ResourcePhase::Ready);
+    }
+
+    #[test]
+    fn owls_watchdog_restart_replaces_stuck_worker_channel() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(StubExchangeProvider::default()),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        let (dead_job_tx, mut dead_job_rx) = tokio::sync::mpsc::unbounded_channel::<OwlsSyncJob>();
+        let (_dead_result_tx, dead_result_rx) =
+            tokio::sync::mpsc::unbounded_channel::<OwlsSyncResult>();
+        app.owls_sync_tx = dead_job_tx;
+        app.owls_sync_rx = dead_result_rx;
+        app.owls_sync_in_flight = true;
+        app.owls_resource_state
+            .begin_refresh(Instant::now() - Duration::from_secs(60));
+
+        app.expire_stuck_owls_sync_placeholder();
+        app.request_owls_sync(OwlsSyncReason::Manual);
+
+        assert!(dead_job_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn matchbook_watchdog_restart_replaces_stuck_worker_channel() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(StubExchangeProvider::default()),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        let (dead_job_tx, mut dead_job_rx) =
+            tokio::sync::mpsc::unbounded_channel::<MatchbookSyncJob>();
+        let (_dead_result_tx, dead_result_rx) =
+            tokio::sync::mpsc::unbounded_channel::<MatchbookSyncResult>();
+        app.matchbook_sync_tx = dead_job_tx;
+        app.matchbook_sync_rx = dead_result_rx;
+        app.matchbook_sync_in_flight = true;
+        app.matchbook_resource_state
+            .begin_refresh(Instant::now() - Duration::from_secs(60));
+
+        app.expire_stuck_matchbook_sync_placeholder();
+        app.request_matchbook_sync(MatchbookSyncReason::Manual);
+
+        assert!(dead_job_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn matchbook_sync_error_preserves_last_good_account_state() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(StubExchangeProvider::default()),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        let prior_state = MatchbookAccountState {
+            status_line: String::from("good"),
+            ..MatchbookAccountState::default()
+        };
+        app.matchbook_account_state = Some(prior_state.clone());
+        app.matchbook_resource_state.finish_ok(prior_state);
+        app.matchbook_sync_in_flight = true;
+        app.matchbook_sync_tx = tokio::sync::mpsc::unbounded_channel::<MatchbookSyncJob>().0;
+        let (result_tx, result_rx) = tokio::sync::mpsc::unbounded_channel::<MatchbookSyncResult>();
+        app.matchbook_sync_rx = result_rx;
+
+        result_tx
+            .send(MatchbookSyncResult {
+                state: Err(String::from("current offers failed")),
+                reason: MatchbookSyncReason::Manual,
+            })
+            .expect("send matchbook error");
+
+        app.drain_matchbook_sync_results();
+
+        assert_eq!(
+            app.matchbook_account_state
+                .as_ref()
+                .map(|state| state.status_line.as_str()),
+            Some("good")
+        );
+        assert_eq!(
+            app.matchbook_resource_state.last_good(),
+            app.matchbook_account_state.as_ref()
+        );
+    }
+
+    #[test]
+    fn replace_snapshot_auto_switches_default_owls_sport_for_soccer_positions() {
+        let mut app = App::default();
+        assert_eq!(app.owls_sport(), "nba");
+
+        let mut snapshot = sample_snapshot("soccer snapshot");
+        snapshot.tracked_bets = vec![TrackedBetRow {
+            sport_key: String::from("soccer_epl"),
+            ..TrackedBetRow::default()
+        }];
+
+        app.replace_snapshot(snapshot);
+
+        assert_eq!(app.owls_sport(), "soccer");
+    }
+
+    #[test]
+    fn snapshot_enrichment_projects_owls_quotes_and_live_scores() {
+        let mut snapshot = sample_snapshot("snapshot");
+        snapshot.open_positions = vec![OpenPositionRow {
+            event: String::from("Malta vs Luxembourg"),
+            event_status: String::new(),
+            event_url: String::from("https://example.com/malta-luxembourg"),
+            contract: String::from("Draw"),
+            market: String::from("Full-time result"),
+            status: String::from("open"),
+            market_status: String::from("live"),
+            is_in_play: true,
+            price: 3.35,
+            stake: 25.0,
+            liability: 58.75,
+            current_value: 25.0,
+            pnl_amount: 0.0,
+            overall_pnl_known: true,
+            current_back_odds: Some(3.35),
+            current_implied_probability: Some(1.0 / 3.35),
+            current_implied_percentage: Some(100.0 / 3.35),
+            current_buy_odds: Some(3.35),
+            current_buy_implied_probability: Some(1.0 / 3.35),
+            current_sell_odds: Some(3.4),
+            current_sell_implied_probability: Some(1.0 / 3.4),
+            current_score: String::new(),
+            current_score_home: None,
+            current_score_away: None,
+            live_clock: String::new(),
+            can_trade_out: true,
+        }];
+
+        let mut dashboard = OwlsDashboard::default();
+        dashboard.sport = String::from("soccer");
+        if let Some(endpoint) = dashboard
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.id == OwlsEndpointId::Realtime)
+        {
+            endpoint.status = String::from("ready");
+            endpoint.quotes = vec![
+                OwlsMarketQuote {
+                    book: String::from("matchbook"),
+                    event: String::from("Luxembourg @ Malta"),
+                    selection: String::from("Draw"),
+                    market_key: String::from("h2h"),
+                    decimal_price: Some(3.25),
+                    limit_amount: Some(120.0),
+                    ..OwlsMarketQuote::default()
+                },
+                OwlsMarketQuote {
+                    book: String::from("pinnacle"),
+                    event: String::from("Luxembourg @ Malta"),
+                    selection: String::from("Draw"),
+                    market_key: String::from("h2h"),
+                    decimal_price: Some(3.10),
+                    ..OwlsMarketQuote::default()
+                },
+            ];
+        }
+        if let Some(endpoint) = dashboard
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.id == OwlsEndpointId::ScoresSport)
+        {
+            endpoint.status = String::from("ready");
+            endpoint.live_scores = vec![OwlsLiveScoreEvent {
+                sport: String::from("soccer"),
+                event_id: String::from("soccer:Malta@Luxembourg-20260325"),
+                name: String::from("Malta at Luxembourg"),
+                home_team: String::from("Luxembourg"),
+                away_team: String::from("Malta"),
+                home_score: Some(1),
+                away_score: Some(2),
+                status_state: String::from("in"),
+                status_detail: String::from("72'"),
+                display_clock: String::from("72"),
+                source_match_id: String::from("owls-1"),
+                last_updated: String::from("2026-03-25T11:12:13Z"),
+                stats: vec![OwlsLiveStat {
+                    key: String::from("expectedGoals"),
+                    label: String::from("xG"),
+                    home_value: String::from("0.8"),
+                    away_value: String::from("1.7"),
+                }],
+                incidents: vec![OwlsLiveIncident {
+                    minute: Some(58),
+                    incident_type: String::from("goal"),
+                    team_side: String::from("away"),
+                    player_name: String::from("Attard"),
+                    detail: String::new(),
+                }],
+                player_ratings: vec![OwlsPlayerRating {
+                    player_name: String::from("Teuma"),
+                    team_side: String::from("away"),
+                    rating: Some(8.4),
+                }],
+            }];
+        }
+
+        populate_snapshot_enrichment(&mut snapshot, &dashboard, None);
+
+        assert!(snapshot.external_quotes.iter().any(|quote| {
+            quote.provider == "owls"
+                && quote.venue == "matchbook"
+                && quote.price == Some(3.25)
+                && quote.liquidity == Some(120.0)
+        }));
+        assert!(snapshot.external_quotes.iter().any(|quote| {
+            quote.is_sharp && quote.venue == "pinnacle" && quote.price == Some(3.10)
+        }));
+        assert_eq!(snapshot.external_live_events.len(), 1);
+        assert_eq!(snapshot.external_live_events[0].display_clock, "72");
+        assert_eq!(snapshot.external_live_events[0].stats.len(), 1);
+        assert_eq!(snapshot.open_positions[0].current_score, "2-1");
+        assert_eq!(snapshot.open_positions[0].live_clock, "72");
+    }
+
+    #[test]
+    fn refresh_snapshot_enrichment_uses_last_good_resources_when_stale() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(StubExchangeProvider::default()),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        let mut snapshot = sample_snapshot("snapshot");
+        snapshot.open_positions = vec![OpenPositionRow {
+            event: String::from("Arsenal v Everton"),
+            event_status: String::new(),
+            event_url: String::new(),
+            contract: String::from("Arsenal"),
+            market: String::from("Match Odds"),
+            status: String::from("open"),
+            market_status: String::from("live"),
+            is_in_play: false,
+            price: 2.8,
+            stake: 10.0,
+            liability: 18.0,
+            current_value: 10.0,
+            pnl_amount: 0.0,
+            overall_pnl_known: true,
+            current_back_odds: Some(2.4),
+            current_implied_probability: Some(1.0 / 2.4),
+            current_implied_percentage: Some(100.0 / 2.4),
+            current_buy_odds: Some(2.42),
+            current_buy_implied_probability: Some(1.0 / 2.42),
+            current_sell_odds: Some(2.46),
+            current_sell_implied_probability: Some(1.0 / 2.46),
+            current_score: String::new(),
+            current_score_home: None,
+            current_score_away: None,
+            live_clock: String::new(),
+            can_trade_out: true,
+        }];
+        app.replace_snapshot(snapshot);
+
+        let mut dashboard = sample_owls_dashboard_with_quote("Arsenal v Everton", "Arsenal", 2.30);
+        dashboard.sport = String::from("soccer");
+        if let Some(endpoint) = dashboard
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.id == OwlsEndpointId::ScoresSport)
+        {
+            endpoint.status = String::from("ready");
+            endpoint.live_scores = vec![OwlsLiveScoreEvent {
+                sport: String::from("soccer"),
+                event_id: String::from("evt-1"),
+                name: String::from("Arsenal v Everton"),
+                home_team: String::from("Arsenal"),
+                away_team: String::from("Everton"),
+                home_score: Some(1),
+                away_score: Some(0),
+                status_state: String::from("inplay"),
+                status_detail: String::from("45'"),
+                display_clock: String::from("45:00"),
+                source_match_id: String::from("owls-1"),
+                last_updated: String::from("2026-03-25T12:00:00Z"),
+                stats: Vec::new(),
+                incidents: Vec::new(),
+                player_ratings: Vec::new(),
+            }];
+        }
+        app.set_owls_dashboard_for_test(dashboard);
+        app.set_matchbook_state_for_test(MatchbookAccountState {
+            current_offers: vec![MatchbookOfferRow {
+                event_name: String::from("Arsenal v Everton"),
+                market_name: String::from("Match Odds"),
+                selection_name: String::from("Arsenal"),
+                side: String::from("lay"),
+                status: String::from("open"),
+                odds: Some(2.28),
+                remaining_stake: Some(50.0),
+                ..MatchbookOfferRow::default()
+            }],
+            ..MatchbookAccountState::default()
+        });
+
+        app.mark_owls_sync_in_flight_for_test(Instant::now() - Duration::from_secs(60));
+        app.poll_owls_dashboard_for_test();
+        app.mark_matchbook_sync_in_flight_for_test(Instant::now() - Duration::from_secs(60));
+        app.poll_matchbook_account_for_test();
+
+        assert_eq!(app.owls_resource_state.phase(), ResourcePhase::Stale);
+        assert_eq!(app.matchbook_resource_state.phase(), ResourcePhase::Stale);
+        assert!(app
+            .snapshot
+            .external_quotes
+            .iter()
+            .any(|quote| { quote.provider == "owls" && quote.price == Some(2.30) }));
+        assert!(app
+            .snapshot
+            .external_quotes
+            .iter()
+            .any(|quote| { quote.provider == "matchbook_api" && quote.price == Some(2.28) }));
+        assert_eq!(app.snapshot.external_live_events.len(), 1);
+        assert_eq!(app.snapshot.open_positions[0].live_clock, "45:00");
+    }
+
+    #[test]
+    fn matchbook_error_status_detection_matches_embedded_http_codes() {
+        let rate_limit =
+            color_eyre::eyre::eyre!("Matchbook session login failed with 429: slow down");
+        let unauthorized = color_eyre::eyre::eyre!("Matchbook account failed with 401: expired");
+
+        assert!(super::matchbook_error_has_status(&rate_limit, 429));
+        assert!(!super::matchbook_error_has_status(&rate_limit, 401));
+        assert!(super::matchbook_error_has_status(&unauthorized, 401));
+    }
+
+    #[test]
+    fn replace_snapshot_alerts_when_watched_odds_move_sharply() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut initial = sample_snapshot("initial");
+        initial.tracked_bets = Vec::new();
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(RefreshingProvider {
+                cached_refresh_count: Rc::new(RefCell::new(0)),
+                live_refresh_count: Rc::new(RefCell::new(0)),
+                load_snapshot: initial,
+                cached_refresh_snapshot: sample_snapshot("cached"),
+                live_refresh_snapshot: sample_snapshot("live"),
+            }),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+        app.alerts_config.desktop_notifications = false;
+        app.alerts_config.sound_effects = false;
+        app.alerts_config.watched_movement_threshold_pct = 5.0;
+
+        assert_eq!(app.alerts_config.watched_movement_threshold_pct, 5.0);
+    }
+
     fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {
         ExchangePanelSnapshot {
             worker: WorkerSummary {
@@ -5047,6 +7849,8 @@ mod tests {
             tracked_bets: Vec::new(),
             exit_policy: Default::default(),
             exit_recommendations: Vec::new(),
+            external_quotes: Vec::new(),
+            external_live_events: Vec::new(),
             horse_matcher: None,
         }
     }
@@ -5068,5 +7872,56 @@ mod tests {
             stale,
         });
         snapshot
+    }
+
+    fn sample_trading_action_intent(mode: TradingActionMode) -> TradingActionIntent {
+        TradingActionIntent {
+            action_kind: TradingActionKind::PlaceBet,
+            source: TradingActionSource::OddsMatcher,
+            venue: VenueId::Matchbook,
+            mode,
+            side: TradingActionSide::Buy,
+            request_id: String::from("req-1"),
+            source_ref: String::from("row-1"),
+            event_name: String::from("Chelsea vs Liverpool"),
+            market_name: String::from("Match Odds"),
+            selection_name: String::from("Chelsea"),
+            stake: 10.0,
+            expected_price: 2.2,
+            event_url: Some(String::from("https://example.com/event")),
+            deep_link_url: Some(String::from("https://example.com/deep")),
+            betslip_event_id: Some(String::from("evt-1")),
+            betslip_market_id: Some(String::from("mkt-1")),
+            betslip_selection_id: Some(String::from("sel-1")),
+            execution_policy: TradingExecutionPolicy::new(TradingTimeInForce::FillOrKill),
+            risk_report: TradingRiskReport::default(),
+            source_context: TradingActionSourceContext::default(),
+            notes: Vec::new(),
+        }
+    }
+
+    fn sample_owls_dashboard_with_quote(event: &str, selection: &str, price: f64) -> OwlsDashboard {
+        let mut dashboard = OwlsDashboard::default();
+        if let Some(endpoint) = dashboard
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.id == OwlsEndpointId::Realtime)
+        {
+            endpoint.status = String::from("ready");
+            endpoint.preview = vec![OwlsPreviewRow {
+                label: String::from(event),
+                detail: String::from("pinnacle"),
+                metric: format!("{selection} {price:.2}"),
+            }];
+            endpoint.quotes = vec![OwlsMarketQuote {
+                book: String::from("pinnacle"),
+                event: String::from(event),
+                selection: String::from(selection),
+                market_key: String::from("h2h"),
+                decimal_price: Some(price),
+                ..OwlsMarketQuote::default()
+            }];
+        }
+        dashboard
     }
 }

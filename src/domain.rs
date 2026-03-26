@@ -340,6 +340,113 @@ pub struct ExitRecommendation {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExternalQuoteRow {
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub provider: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub venue: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub event: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub market: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub selection: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub side: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub event_url: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub deep_link_url: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub event_id: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub market_id: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub selection_id: String,
+    pub price: Option<f64>,
+    pub liquidity: Option<f64>,
+    #[serde(default)]
+    pub is_sharp: bool,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub updated_at: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExternalLiveStatRow {
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub key: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub label: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub home_value: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub away_value: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExternalLiveIncidentRow {
+    pub minute: Option<u64>,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub incident_type: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub team_side: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub player_name: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExternalPlayerRatingRow {
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub player_name: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub team_side: String,
+    pub rating: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExternalLiveEventRow {
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub provider: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub sport: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub event: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub event_id: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub source_match_id: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub home_team: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub away_team: String,
+    pub home_score: Option<i64>,
+    pub away_score: Option<i64>,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub status_state: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub status_detail: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub display_clock: String,
+    #[serde(default, deserialize_with = "null_string_as_default")]
+    pub last_updated: String,
+    #[serde(default)]
+    pub stats: Vec<ExternalLiveStatRow>,
+    #[serde(default)]
+    pub incidents: Vec<ExternalLiveIncidentRow>,
+    #[serde(default)]
+    pub player_ratings: Vec<ExternalPlayerRatingRow>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LedgerPnlPoint {
     #[serde(default, deserialize_with = "null_string_as_default")]
     pub occurred_at: String,
@@ -395,6 +502,8 @@ pub struct ExchangePanelSnapshot {
     pub tracked_bets: Vec<TrackedBetRow>,
     pub exit_policy: ExitPolicySummary,
     pub exit_recommendations: Vec<ExitRecommendation>,
+    pub external_quotes: Vec<ExternalQuoteRow>,
+    pub external_live_events: Vec<ExternalLiveEventRow>,
     pub horse_matcher: Option<HorseMatcherSnapshot>,
 }
 

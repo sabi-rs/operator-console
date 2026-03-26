@@ -268,6 +268,11 @@ fn matchbook_context_lines(
         .iter()
         .filter(|offer| !runner_id.is_empty() && offer.runner_id == runner_id)
         .collect::<Vec<_>>();
+    let runner_bets = state
+        .current_bets
+        .iter()
+        .filter(|bet| !runner_id.is_empty() && bet.runner_id == runner_id)
+        .collect::<Vec<_>>();
     let runner_positions = state
         .positions
         .iter()
@@ -293,10 +298,17 @@ fn matchbook_context_lines(
         )),
     ];
 
-    if !runner_offers.is_empty() || !runner_positions.is_empty() {
+    if runner_id.is_empty() {
+        lines.push(Line::raw(
+            "runner id unavailable • market-specific Matchbook context limited",
+        ));
+    }
+
+    if !runner_offers.is_empty() || !runner_bets.is_empty() || !runner_positions.is_empty() {
         lines.push(Line::raw(format!(
-            "runner offers {} • runner positions {}",
+            "runner offers {} • runner bets {} • runner positions {}",
             runner_offers.len(),
+            runner_bets.len(),
             runner_positions.len()
         )));
     }
@@ -314,6 +326,39 @@ fn matchbook_context_lines(
                     .remaining_stake
                     .or(offer.stake)
                     .map(format_decimal)
+                    .unwrap_or_else(|| String::from("-"))
+            ),
+            Style::default().fg(muted_text()),
+        )));
+    }
+    for bet in runner_bets.iter().take(2) {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "• bet {} {} @ {} pnl {}",
+                bet.side,
+                bet.selection_name,
+                bet.odds
+                    .map(format_decimal)
+                    .unwrap_or_else(|| String::from("-")),
+                bet.profit_loss
+                    .map(|value| format!("{value:+.2}"))
+                    .unwrap_or_else(|| String::from("-"))
+            ),
+            Style::default().fg(muted_text()),
+        )));
+    }
+    for position in runner_positions.iter().take(2) {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "• pos {} exp {} pnl {}",
+                position.selection_name,
+                position
+                    .exposure
+                    .map(format_decimal)
+                    .unwrap_or_else(|| String::from("-")),
+                position
+                    .profit_loss
+                    .map(|value| format!("{value:+.2}"))
                     .unwrap_or_else(|| String::from("-"))
             ),
             Style::default().fg(muted_text()),

@@ -517,7 +517,15 @@ fn detect_external_watcher(run_dir: &Path) -> Option<u32> {
         .trim()
         .parse::<u32>()
         .ok()?;
-    external_watcher_matches(run_dir, recorded_pid).then_some(recorded_pid)
+    for attempt in 0..WATCHER_SPAWN_MAX_ATTEMPTS {
+        if external_watcher_matches(run_dir, recorded_pid) {
+            return Some(recorded_pid);
+        }
+        if attempt + 1 < WATCHER_SPAWN_MAX_ATTEMPTS {
+            thread::sleep(WATCHER_SPAWN_RETRY_DELAY);
+        }
+    }
+    None
 }
 
 fn external_watcher_matches(run_dir: &Path, pid: u32) -> bool {
@@ -599,7 +607,9 @@ fn spawn_recorder_command_with_retry(command: &mut Command) -> Result<Child> {
     loop {
         match command.spawn() {
             Ok(child) => return Ok(child),
-            Err(error) if is_text_file_busy_error(&error) && attempts + 1 < WATCHER_SPAWN_MAX_ATTEMPTS => {
+            Err(error)
+                if is_text_file_busy_error(&error) && attempts + 1 < WATCHER_SPAWN_MAX_ATTEMPTS =>
+            {
                 attempts += 1;
                 thread::sleep(WATCHER_SPAWN_RETRY_DELAY);
             }

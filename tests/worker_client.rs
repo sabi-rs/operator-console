@@ -139,6 +139,7 @@ fn worker_request_serializes_execute_trading_action() {
             expected_price: 2.34,
             event_url: Some(String::from("https://smarkets.com/event/1")),
             deep_link_url: None,
+            betslip_event_id: None,
             betslip_market_id: None,
             betslip_selection_id: None,
             execution_policy: TradingExecutionPolicy::new(TradingTimeInForce::FillOrKill),
@@ -185,6 +186,7 @@ fn worker_request_serializes_execute_trading_action() {
               "expected_price": 2.34,
               "event_url": "https://smarkets.com/event/1",
               "deep_link_url": null,
+              "betslip_event_id": null,
               "betslip_market_id": null,
               "betslip_selection_id": null,
               "execution_policy": {

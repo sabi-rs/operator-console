@@ -30,18 +30,20 @@ pub enum TradingSection {
     Props,
     Matcher,
     Stats,
+    Alerts,
     Calculator,
     Recorder,
 }
 
 impl TradingSection {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Positions,
         Self::Markets,
         Self::Live,
         Self::Props,
         Self::Matcher,
         Self::Stats,
+        Self::Alerts,
         Self::Calculator,
         Self::Recorder,
     ];
@@ -54,6 +56,7 @@ impl TradingSection {
             Self::Props => "Props",
             Self::Matcher => "Matcher",
             Self::Stats => "Stats",
+            Self::Alerts => "Alerts",
             Self::Calculator => "Calculator",
             Self::Recorder => "Recorder",
         }

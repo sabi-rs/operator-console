@@ -514,6 +514,7 @@ fn sample_trading_intent(
         expected_price: 2.44,
         event_url: None,
         deep_link_url: Some(String::from("https://smarkets.com/event/1/betslip")),
+        betslip_event_id: Some(String::from("event-1")),
         betslip_market_id: Some(String::from("market-1")),
         betslip_selection_id: Some(String::from("selection-1")),
         execution_policy: TradingExecutionPolicy::new(time_in_force),
@@ -535,6 +536,7 @@ fn sample_api_trading_intent() -> TradingActionIntent {
         venue: VenueId::Matchbook,
         expected_price: 2.16,
         deep_link_url: Some(String::from("https://www.matchbook.com/events/1")),
+        betslip_event_id: Some(String::from("1")),
         betslip_selection_id: Some(String::from("runner-7")),
         notes: vec![String::from("runner_id:runner-7")],
         ..sample_trading_intent(TradingActionMode::Review, TradingTimeInForce::GoodTilCancel)

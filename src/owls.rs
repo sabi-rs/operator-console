@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -5,14 +6,18 @@ use std::time::{Duration, Instant};
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use reqwest::blocking::Client;
+use reqwest::Client as AsyncClient;
 use serde_json::Value;
+
+use crate::market_normalization::{
+    event_matches, market_matches, normalize_key, selection_matches_with_context,
+};
 
 const DEFAULT_BASE_URL: &str = "https://api.owlsinsight.com";
 const API_KEY_ENV_NAMES: [&str; 2] = ["OWLS_INSIGHT_API_KEY", "OWLSINSIGHT_API_KEY"];
 const DEFAULT_SPORT: &str = "nba";
 const DEFAULT_PLAYER: &str = "LeBron James";
 const DEFAULT_PROP_TYPE: &str = "points";
-const DEFAULT_BOOKS: &str = "pinnacle,bet365,betmgm";
 const DEFAULT_BOOK_PROPS_PLAYER: &str = "LeBron";
 const HOT_SYNC_INTERVAL: Duration = Duration::from_secs(3);
 const WARM_SYNC_INTERVAL: Duration = Duration::from_secs(10);
@@ -20,7 +25,7 @@ const COOL_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const COLD_SYNC_INTERVAL: Duration = Duration::from_secs(120);
 const BACKGROUND_SYNC_BATCH: usize = 3;
 pub const SUPPORTED_SPORTS: &[&str] = &[
-    "nba", "nfl", "mlb", "nhl", "wnba", "ncaab", "ncaaf", "epl", "mma", "tennis", "cs2",
+    "nba", "nfl", "mlb", "nhl", "wnba", "ncaab", "ncaaf", "soccer", "epl", "mma", "tennis", "cs2",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +117,7 @@ pub struct OwlsDashboard {
     pub total_polls: usize,
     pub groups: Vec<OwlsGroupSummary>,
     pub endpoints: Vec<OwlsEndpointSummary>,
+    pub team_normalizations: Vec<OwlsTeamNormalization>,
     seeds: OwlsSeeds,
 }
 
@@ -147,6 +153,14 @@ pub struct OwlsEndpointSummary {
     pub change_count: usize,
     pub detail: String,
     pub preview: Vec<OwlsPreviewRow>,
+    pub requested_books: Vec<String>,
+    pub available_books: Vec<String>,
+    pub books_returned: Vec<String>,
+    pub freshness_age_seconds: Option<u64>,
+    pub freshness_stale: Option<bool>,
+    pub freshness_threshold_seconds: Option<u64>,
+    pub quotes: Vec<OwlsMarketQuote>,
+    pub live_scores: Vec<OwlsLiveScoreEvent>,
     last_checked_at: Option<Instant>,
 }
 
@@ -171,6 +185,14 @@ impl OwlsEndpointSummary {
             change_count: 0,
             detail: String::from("Press r to hydrate"),
             preview: Vec::new(),
+            requested_books: Vec::new(),
+            available_books: Vec::new(),
+            books_returned: Vec::new(),
+            freshness_age_seconds: None,
+            freshness_stale: None,
+            freshness_threshold_seconds: None,
+            quotes: Vec::new(),
+            live_scores: Vec::new(),
             last_checked_at: None,
         }
     }
@@ -181,6 +203,72 @@ pub struct OwlsPreviewRow {
     pub label: String,
     pub detail: String,
     pub metric: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OwlsMarketQuote {
+    pub book: String,
+    pub event: String,
+    pub selection: String,
+    pub market_key: String,
+    pub point: Option<f64>,
+    pub decimal_price: Option<f64>,
+    pub american_price: Option<f64>,
+    pub limit_amount: Option<f64>,
+    pub event_link: String,
+    pub league: String,
+    pub country_code: String,
+    pub suspended: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OwlsTeamNormalization {
+    pub input: String,
+    pub canonical: String,
+    pub simplified: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OwlsLiveStat {
+    pub key: String,
+    pub label: String,
+    pub home_value: String,
+    pub away_value: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OwlsLiveIncident {
+    pub minute: Option<u64>,
+    pub incident_type: String,
+    pub team_side: String,
+    pub player_name: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OwlsPlayerRating {
+    pub player_name: String,
+    pub team_side: String,
+    pub rating: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OwlsLiveScoreEvent {
+    pub sport: String,
+    pub event_id: String,
+    pub name: String,
+    pub home_team: String,
+    pub away_team: String,
+    pub home_score: Option<i64>,
+    pub away_score: Option<i64>,
+    pub status_state: String,
+    pub status_detail: String,
+    pub display_clock: String,
+    pub source_match_id: String,
+    pub last_updated: String,
+    pub stats: Vec<OwlsLiveStat>,
+    pub incidents: Vec<OwlsLiveIncident>,
+    pub player_ratings: Vec<OwlsPlayerRating>,
 }
 
 #[derive(Debug, Clone)]
@@ -244,6 +332,14 @@ pub fn build_client() -> Result<Client> {
         .wrap_err("failed to build Owls Insight HTTP client")
 }
 
+pub fn build_async_client() -> Result<AsyncClient> {
+    AsyncClient::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .wrap_err("failed to build Owls Insight async HTTP client")
+}
+
 pub fn fetch_dashboard(client: &Client) -> OwlsDashboard {
     sync_dashboard(
         client,
@@ -271,6 +367,7 @@ pub fn dashboard_for_sport(sport: &str) -> OwlsDashboard {
         total_polls: 0,
         groups,
         endpoints,
+        team_normalizations: Vec::new(),
         seeds: OwlsSeeds::default(),
     }
 }
@@ -340,6 +437,10 @@ pub fn sync_dashboard(
         }
     }
 
+    if sport_supports_team_normalization(&sport) {
+        refresh_dashboard_team_normalizations(client, &base_url, &api_key, &sport, &mut dashboard);
+    }
+
     dashboard.groups = build_group_summaries(&dashboard.endpoints);
     dashboard.refreshed_at = dashboard
         .endpoints
@@ -371,6 +472,203 @@ pub fn sync_dashboard(
         checked_count,
         changed_count,
     }
+}
+
+pub async fn sync_dashboard_async(
+    client: &AsyncClient,
+    previous: &OwlsDashboard,
+    reason: OwlsSyncReason,
+    focused: Option<OwlsEndpointId>,
+) -> OwlsSyncOutcome {
+    let mut dashboard = previous.clone();
+    if dashboard.endpoints.is_empty() {
+        dashboard = dashboard_for_sport(&dashboard.sport);
+    }
+    let sport = normalize_sport(&dashboard.sport);
+    dashboard.sport = sport.clone();
+
+    let api_key = match load_api_key() {
+        Ok(value) => value,
+        Err(error) => {
+            let previous_dashboard = dashboard.clone();
+            mark_all_endpoints_error(&mut dashboard, &error.to_string());
+            dashboard.status_line = format!("Owls unavailable: {error}");
+            dashboard.last_sync_mode = String::from(reason.label());
+            dashboard.groups = build_group_summaries(&dashboard.endpoints);
+            return OwlsSyncOutcome {
+                changed: dashboard_semantically_changed(&previous_dashboard, &dashboard),
+                dashboard,
+                checked_count: 0,
+                changed_count: 0,
+            };
+        }
+    };
+
+    let base_url = env::var("OWLS_INSIGHT_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| String::from(DEFAULT_BASE_URL));
+    let due_ids = due_endpoint_ids(&dashboard, reason, focused);
+
+    if due_ids.is_empty() {
+        dashboard.last_sync_mode = String::from(reason.label());
+        return OwlsSyncOutcome {
+            dashboard,
+            checked_count: 0,
+            changed_count: 0,
+            changed: false,
+        };
+    }
+
+    let previous_dashboard = dashboard.clone();
+    let mut checked_count = 0usize;
+    let mut changed_count = 0usize;
+
+    for id in due_ids {
+        checked_count += 1;
+        let summary = fetch_endpoint_summary_async(
+            client,
+            &base_url,
+            &api_key,
+            &sport,
+            id,
+            &mut dashboard.seeds,
+        )
+        .await;
+        if merge_endpoint(&mut dashboard, summary) {
+            changed_count += 1;
+        }
+    }
+
+    if sport_supports_team_normalization(&sport) {
+        refresh_dashboard_team_normalizations_async(
+            client,
+            &base_url,
+            &api_key,
+            &sport,
+            &mut dashboard,
+        )
+        .await;
+    }
+
+    dashboard.groups = build_group_summaries(&dashboard.endpoints);
+    dashboard.refreshed_at = dashboard
+        .endpoints
+        .iter()
+        .find_map(|endpoint| {
+            (!endpoint.updated_at.is_empty()).then_some(endpoint.updated_at.clone())
+        })
+        .unwrap_or_else(|| previous_dashboard.refreshed_at.clone());
+    dashboard.last_sync_mode = String::from(reason.label());
+    dashboard.sync_checks = checked_count;
+    dashboard.sync_changes = changed_count;
+    dashboard.total_polls += checked_count;
+    dashboard.status_line = if changed_count == 0 {
+        format!(
+            "Owls monitor steady: checked {checked_count} endpoint{} and found no changes.",
+            if checked_count == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "Owls {} sync applied {changed_count} endpoint change{} after checking {checked_count}.",
+            reason.label(),
+            if changed_count == 1 { "" } else { "s" }
+        )
+    };
+
+    OwlsSyncOutcome {
+        changed: dashboard_semantically_changed(&previous_dashboard, &dashboard),
+        dashboard,
+        checked_count,
+        changed_count,
+    }
+}
+
+pub fn find_pinnacle_quote(
+    dashboard: &OwlsDashboard,
+    event: &str,
+    market: &str,
+    selection: &str,
+) -> Option<OwlsMarketQuote> {
+    matching_market_quotes(dashboard, event, market, selection)
+        .into_iter()
+        .find(|quote| normalize_key(&quote.book) == "pinnacle")
+}
+
+pub fn matching_market_quotes(
+    dashboard: &OwlsDashboard,
+    event: &str,
+    market: &str,
+    selection: &str,
+) -> Vec<OwlsMarketQuote> {
+    let preferred = [
+        OwlsEndpointId::Realtime,
+        OwlsEndpointId::Moneyline,
+        OwlsEndpointId::Odds,
+        OwlsEndpointId::Spreads,
+        OwlsEndpointId::Totals,
+    ];
+    let mut matches = Vec::new();
+    for endpoint_id in preferred {
+        let Some(endpoint) = dashboard
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == endpoint_id)
+        else {
+            continue;
+        };
+        for quote in &endpoint.quotes {
+            if quote_matches_target(dashboard, quote, event, market, selection) {
+                matches.push(quote.clone());
+            }
+        }
+    }
+    matches
+}
+
+pub fn find_live_score(dashboard: &OwlsDashboard, event: &str) -> Option<OwlsLiveScoreEvent> {
+    [OwlsEndpointId::ScoresSport, OwlsEndpointId::ScoresAll]
+        .into_iter()
+        .find_map(|endpoint_id| {
+            dashboard
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.id == endpoint_id)
+                .and_then(|endpoint| {
+                    endpoint
+                        .live_scores
+                        .iter()
+                        .find(|score| score_matches_target_event(dashboard, score, event))
+                        .cloned()
+                })
+        })
+}
+
+fn quote_matches_target(
+    dashboard: &OwlsDashboard,
+    quote: &OwlsMarketQuote,
+    event: &str,
+    market: &str,
+    selection: &str,
+) -> bool {
+    event_matches_with_team_normalization(dashboard, &quote.event, event)
+        && (quote.market_key.trim().is_empty() || market_matches(&quote.market_key, market))
+        && selection_matches_with_context(
+            &quote.selection,
+            &quote.event,
+            &quote.market_key,
+            selection,
+            event,
+            market,
+        )
+}
+
+fn score_matches_target_event(
+    dashboard: &OwlsDashboard,
+    score: &OwlsLiveScoreEvent,
+    event: &str,
+) -> bool {
+    event_matches_with_team_normalization(dashboard, &score.name, event)
 }
 
 fn due_endpoint_ids(
@@ -464,7 +762,7 @@ fn fetch_endpoint_summary(
                 base_url,
                 api_key,
                 &format!("/api/v1/{sport}/odds"),
-                &[("books", DEFAULT_BOOKS), ("alternates", "true")],
+                &[("alternates", "true")],
             ),
             parse_book_market_summary,
         ),
@@ -475,7 +773,7 @@ fn fetch_endpoint_summary(
                 base_url,
                 api_key,
                 &format!("/api/v1/{sport}/moneyline"),
-                &[("books", DEFAULT_BOOKS)],
+                &[],
             ),
             parse_book_market_summary,
         ),
@@ -486,7 +784,7 @@ fn fetch_endpoint_summary(
                 base_url,
                 api_key,
                 &format!("/api/v1/{sport}/spreads"),
-                &[("books", DEFAULT_BOOKS), ("alternates", "true")],
+                &[("alternates", "true")],
             ),
             parse_book_market_summary,
         ),
@@ -497,7 +795,7 @@ fn fetch_endpoint_summary(
                 base_url,
                 api_key,
                 &format!("/api/v1/{sport}/totals"),
-                &[("books", DEFAULT_BOOKS), ("alternates", "true")],
+                &[("alternates", "true")],
             ),
             parse_book_market_summary,
         ),
@@ -507,10 +805,7 @@ fn fetch_endpoint_summary(
                 base_url,
                 api_key,
                 &format!("/api/v1/{sport}/props"),
-                &[
-                    ("player", DEFAULT_BOOK_PROPS_PLAYER),
-                    ("books", DEFAULT_BOOKS),
-                ],
+                &[("player", DEFAULT_BOOK_PROPS_PLAYER)],
             );
             if let Ok(value) = &payload {
                 let (game_id, player, category) = first_props_seed(value);
@@ -821,6 +1116,402 @@ fn fetch_endpoint_summary(
     }
 }
 
+async fn fetch_endpoint_summary_async(
+    client: &AsyncClient,
+    base_url: &str,
+    api_key: &str,
+    sport: &str,
+    id: OwlsEndpointId,
+    seeds: &mut OwlsSeeds,
+) -> OwlsEndpointSummary {
+    match id {
+        OwlsEndpointId::Odds => hydrate_result(
+            id,
+            fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/odds"),
+                &[("alternates", "true")],
+            )
+            .await,
+            parse_book_market_summary,
+        ),
+        OwlsEndpointId::Moneyline => hydrate_result(
+            id,
+            fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/moneyline"),
+                &[],
+            )
+            .await,
+            parse_book_market_summary,
+        ),
+        OwlsEndpointId::Spreads => hydrate_result(
+            id,
+            fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/spreads"),
+                &[("alternates", "true")],
+            )
+            .await,
+            parse_book_market_summary,
+        ),
+        OwlsEndpointId::Totals => hydrate_result(
+            id,
+            fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/totals"),
+                &[("alternates", "true")],
+            )
+            .await,
+            parse_book_market_summary,
+        ),
+        OwlsEndpointId::Props => {
+            let payload = fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/props"),
+                &[("player", DEFAULT_BOOK_PROPS_PLAYER)],
+            )
+            .await;
+            if let Ok(value) = &payload {
+                let (game_id, player, category) = first_props_seed(value);
+                seeds.props_game_id = game_id;
+                seeds.props_player = player;
+                seeds.props_category = category;
+            }
+            hydrate_result(id, payload, parse_props_summary)
+        }
+        OwlsEndpointId::FanDuelProps => hydrate_result(
+            id,
+            fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/props/fanduel"),
+                &[("player", DEFAULT_BOOK_PROPS_PLAYER)],
+            )
+            .await,
+            parse_book_props_summary,
+        ),
+        OwlsEndpointId::BetMgmProps => hydrate_result(
+            id,
+            fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/props/betmgm"),
+                &[("player", DEFAULT_BOOK_PROPS_PLAYER)],
+            )
+            .await,
+            parse_book_props_summary,
+        ),
+        OwlsEndpointId::Bet365Props => hydrate_result(
+            id,
+            fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/props/bet365"),
+                &[("player", DEFAULT_BOOK_PROPS_PLAYER)],
+            )
+            .await,
+            parse_book_props_summary,
+        ),
+        OwlsEndpointId::PropsHistory => {
+            ensure_props_seed_async(client, base_url, api_key, sport, seeds).await;
+            match (
+                seeds.props_game_id.as_deref(),
+                seeds.props_player.as_deref(),
+                seeds.props_category.as_deref(),
+            ) {
+                (Some(game_id), Some(player), Some(category)) => hydrate_result(
+                    id,
+                    fetch_json_async(
+                        client,
+                        base_url,
+                        api_key,
+                        &format!("/api/v1/{sport}/props/history"),
+                        &[
+                            ("game_id", game_id),
+                            ("player", player),
+                            ("category", category),
+                            ("hours", "12"),
+                        ],
+                    )
+                    .await,
+                    parse_props_history_summary,
+                ),
+                _ => waiting_summary(id, "Awaiting a sampled props game, player, and category."),
+            }
+        }
+        OwlsEndpointId::ScoresAll => hydrate_result(
+            id,
+            fetch_json_async(client, base_url, api_key, "/api/v1/scores/live", &[]).await,
+            parse_all_scores_summary,
+        ),
+        OwlsEndpointId::ScoresSport => hydrate_result(
+            id,
+            fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/scores/live"),
+                &[],
+            )
+            .await,
+            parse_scores_summary,
+        ),
+        OwlsEndpointId::Stats => hydrate_result(
+            id,
+            fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/stats"),
+                &[("player", DEFAULT_PLAYER)],
+            )
+            .await,
+            parse_stats_summary,
+        ),
+        OwlsEndpointId::Averages => hydrate_result(
+            id,
+            fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/stats/averages"),
+                &[("playerName", DEFAULT_PLAYER)],
+            )
+            .await,
+            parse_averages_summary,
+        ),
+        OwlsEndpointId::KalshiMarkets => hydrate_result(
+            id,
+            fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/kalshi/{sport}/markets"),
+                &[("limit", "5")],
+            )
+            .await,
+            parse_prediction_summary,
+        ),
+        OwlsEndpointId::KalshiSeries => {
+            let payload =
+                fetch_json_async(client, base_url, api_key, "/api/v1/kalshi/series", &[]).await;
+            if let Ok(value) = &payload {
+                seeds.kalshi_series_ticker = first_non_empty_string(
+                    value.pointer("/data/0"),
+                    &["series_ticker", "ticker", "seriesTicker"],
+                );
+            }
+            hydrate_result(id, payload, parse_prediction_summary)
+        }
+        OwlsEndpointId::KalshiSeriesMarkets => {
+            ensure_kalshi_series_seed_async(client, base_url, api_key, seeds).await;
+            match seeds.kalshi_series_ticker.as_deref() {
+                Some(series_ticker) => hydrate_result(
+                    id,
+                    fetch_json_async(
+                        client,
+                        base_url,
+                        api_key,
+                        &format!("/api/v1/kalshi/series/{series_ticker}/markets"),
+                        &[("limit", "5")],
+                    )
+                    .await,
+                    parse_prediction_summary,
+                ),
+                None => waiting_summary(id, "Awaiting a Kalshi series ticker."),
+            }
+        }
+        OwlsEndpointId::PolymarketMarkets => hydrate_result(
+            id,
+            fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/polymarket/{sport}/markets"),
+                &[],
+            )
+            .await,
+            parse_prediction_summary,
+        ),
+        OwlsEndpointId::HistoryGames => {
+            let payload = fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                "/api/v1/history/games",
+                &[("sport", sport), ("limit", "1")],
+            )
+            .await;
+            if let Ok(value) = &payload {
+                seeds.history_event_id = first_history_event_id(value);
+            }
+            hydrate_result(id, payload, parse_history_games_summary)
+        }
+        OwlsEndpointId::HistoryOdds => {
+            ensure_history_seed_async(client, base_url, api_key, sport, seeds).await;
+            match seeds.history_event_id.as_deref() {
+                Some(event_id) => hydrate_result(
+                    id,
+                    fetch_json_async(
+                        client,
+                        base_url,
+                        api_key,
+                        "/api/v1/history/odds",
+                        &[("eventId", event_id), ("limit", "5")],
+                    )
+                    .await,
+                    parse_history_snapshot_summary,
+                ),
+                None => waiting_summary(id, "Awaiting a sampled history event id."),
+            }
+        }
+        OwlsEndpointId::HistoryProps => {
+            ensure_history_seed_async(client, base_url, api_key, sport, seeds).await;
+            match seeds.history_event_id.as_deref() {
+                Some(event_id) => hydrate_result(
+                    id,
+                    fetch_json_async(
+                        client,
+                        base_url,
+                        api_key,
+                        "/api/v1/history/props",
+                        &[
+                            ("eventId", event_id),
+                            ("playerName", DEFAULT_PLAYER),
+                            ("propType", DEFAULT_PROP_TYPE),
+                            ("limit", "5"),
+                        ],
+                    )
+                    .await,
+                    parse_history_snapshot_summary,
+                ),
+                None => waiting_summary(id, "Awaiting a sampled history event id."),
+            }
+        }
+        OwlsEndpointId::HistoryStats => hydrate_result(
+            id,
+            fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                "/api/v1/history/stats",
+                &[
+                    ("playerName", DEFAULT_PLAYER),
+                    ("sport", sport),
+                    ("limit", "5"),
+                ],
+            )
+            .await,
+            parse_history_stats_summary,
+        ),
+        OwlsEndpointId::HistoryAverages => hydrate_result(
+            id,
+            fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                "/api/v1/history/stats/averages",
+                &[("playerName", DEFAULT_PLAYER), ("sport", sport)],
+            )
+            .await,
+            parse_averages_summary,
+        ),
+        OwlsEndpointId::TennisStats => {
+            ensure_tennis_seed_async(client, base_url, api_key, seeds).await;
+            match seeds.tennis_event_id.as_deref() {
+                Some(event_id) => hydrate_result(
+                    id,
+                    fetch_json_async(
+                        client,
+                        base_url,
+                        api_key,
+                        "/api/v1/history/tennis-stats",
+                        &[("eventId", event_id)],
+                    )
+                    .await,
+                    parse_tennis_stats_summary,
+                ),
+                None => waiting_summary(id, "Awaiting a sampled tennis history event id."),
+            }
+        }
+        OwlsEndpointId::Cs2Matches => {
+            let payload = fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                "/api/v1/history/cs2/matches",
+                &[("limit", "1")],
+            )
+            .await;
+            if let Ok(value) = &payload {
+                seeds.cs2_match_id = first_non_empty_string(
+                    value
+                        .pointer("/data/matches/0")
+                        .or_else(|| value.pointer("/data/0")),
+                    &["matchId", "id", "slug"],
+                );
+            }
+            hydrate_result(id, payload, parse_cs2_matches_summary)
+        }
+        OwlsEndpointId::Cs2Match => {
+            ensure_cs2_seed_async(client, base_url, api_key, seeds).await;
+            match seeds.cs2_match_id.as_deref() {
+                Some(match_id) => hydrate_result(
+                    id,
+                    fetch_json_async(
+                        client,
+                        base_url,
+                        api_key,
+                        &format!("/api/v1/history/cs2/matches/{match_id}"),
+                        &[],
+                    )
+                    .await,
+                    parse_cs2_match_summary,
+                ),
+                None => waiting_summary(id, "Awaiting a sampled CS2 match id."),
+            }
+        }
+        OwlsEndpointId::Cs2Players => hydrate_result(
+            id,
+            fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                "/api/v1/history/cs2/players",
+                &[("limit", "5")],
+            )
+            .await,
+            parse_cs2_players_summary,
+        ),
+        OwlsEndpointId::Realtime => hydrate_result(
+            id,
+            fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/realtime"),
+                &[],
+            )
+            .await,
+            parse_realtime_summary,
+        ),
+    }
+}
+
 fn ensure_history_seed(
     client: &Client,
     base_url: &str,
@@ -843,6 +1534,29 @@ fn ensure_history_seed(
     }
 }
 
+async fn ensure_history_seed_async(
+    client: &AsyncClient,
+    base_url: &str,
+    api_key: &str,
+    sport: &str,
+    seeds: &mut OwlsSeeds,
+) {
+    if seeds.history_event_id.is_some() {
+        return;
+    }
+    let payload = fetch_json_async(
+        client,
+        base_url,
+        api_key,
+        "/api/v1/history/games",
+        &[("sport", sport), ("limit", "1")],
+    )
+    .await;
+    if let Ok(value) = payload {
+        seeds.history_event_id = first_history_event_id(&value);
+    }
+}
+
 fn ensure_tennis_seed(client: &Client, base_url: &str, api_key: &str, seeds: &mut OwlsSeeds) {
     if seeds.tennis_event_id.is_some() {
         return;
@@ -854,6 +1568,28 @@ fn ensure_tennis_seed(client: &Client, base_url: &str, api_key: &str, seeds: &mu
         "/api/v1/history/games",
         &[("sport", "tennis"), ("limit", "1")],
     );
+    if let Ok(value) = payload {
+        seeds.tennis_event_id = first_history_event_id(&value);
+    }
+}
+
+async fn ensure_tennis_seed_async(
+    client: &AsyncClient,
+    base_url: &str,
+    api_key: &str,
+    seeds: &mut OwlsSeeds,
+) {
+    if seeds.tennis_event_id.is_some() {
+        return;
+    }
+    let payload = fetch_json_async(
+        client,
+        base_url,
+        api_key,
+        "/api/v1/history/games",
+        &[("sport", "tennis"), ("limit", "1")],
+    )
+    .await;
     if let Ok(value) = payload {
         seeds.tennis_event_id = first_history_event_id(&value);
     }
@@ -877,11 +1613,37 @@ fn ensure_props_seed(
         base_url,
         api_key,
         &format!("/api/v1/{sport}/props"),
-        &[
-            ("player", DEFAULT_BOOK_PROPS_PLAYER),
-            ("books", DEFAULT_BOOKS),
-        ],
+        &[("player", DEFAULT_BOOK_PROPS_PLAYER)],
     );
+    if let Ok(value) = payload {
+        let (game_id, player, category) = first_props_seed(&value);
+        seeds.props_game_id = game_id;
+        seeds.props_player = player;
+        seeds.props_category = category;
+    }
+}
+
+async fn ensure_props_seed_async(
+    client: &AsyncClient,
+    base_url: &str,
+    api_key: &str,
+    sport: &str,
+    seeds: &mut OwlsSeeds,
+) {
+    if seeds.props_game_id.is_some()
+        && seeds.props_player.is_some()
+        && seeds.props_category.is_some()
+    {
+        return;
+    }
+    let payload = fetch_json_async(
+        client,
+        base_url,
+        api_key,
+        &format!("/api/v1/{sport}/props"),
+        &[("player", DEFAULT_BOOK_PROPS_PLAYER)],
+    )
+    .await;
     if let Ok(value) = payload {
         let (game_id, player, category) = first_props_seed(&value);
         seeds.props_game_id = game_id;
@@ -899,6 +1661,265 @@ fn normalize_sport(value: &str) -> String {
     }
 }
 
+fn sport_supports_team_normalization(sport: &str) -> bool {
+    matches!(normalize_key(sport).as_str(), "soccer" | "tennis")
+}
+
+fn refresh_dashboard_team_normalizations(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    sport: &str,
+    dashboard: &mut OwlsDashboard,
+) {
+    let team_names = collect_dashboard_team_names(dashboard);
+    if team_names.is_empty() {
+        return;
+    }
+    let known = dashboard
+        .team_normalizations
+        .iter()
+        .map(|item| normalize_key(&item.input))
+        .collect::<BTreeSet<_>>();
+    let missing = team_names
+        .into_iter()
+        .filter(|name| !known.contains(&normalize_key(name)))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return;
+    }
+    if let Ok(fetched) = fetch_team_normalizations(client, base_url, api_key, sport, &missing) {
+        for item in fetched {
+            if item.input.trim().is_empty() {
+                continue;
+            }
+            let key = normalize_key(&item.input);
+            if dashboard
+                .team_normalizations
+                .iter()
+                .any(|existing| normalize_key(&existing.input) == key)
+            {
+                continue;
+            }
+            dashboard.team_normalizations.push(item);
+        }
+    }
+}
+
+async fn refresh_dashboard_team_normalizations_async(
+    client: &AsyncClient,
+    base_url: &str,
+    api_key: &str,
+    sport: &str,
+    dashboard: &mut OwlsDashboard,
+) {
+    let team_names = collect_dashboard_team_names(dashboard);
+    if team_names.is_empty() {
+        return;
+    }
+    let known = dashboard
+        .team_normalizations
+        .iter()
+        .map(|item| normalize_key(&item.input))
+        .collect::<BTreeSet<_>>();
+    let missing = team_names
+        .into_iter()
+        .filter(|name| !known.contains(&normalize_key(name)))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return;
+    }
+    if let Ok(fetched) =
+        fetch_team_normalizations_async(client, base_url, api_key, sport, &missing).await
+    {
+        for item in fetched {
+            if item.input.trim().is_empty() {
+                continue;
+            }
+            let key = normalize_key(&item.input);
+            if dashboard
+                .team_normalizations
+                .iter()
+                .any(|existing| normalize_key(&existing.input) == key)
+            {
+                continue;
+            }
+            dashboard.team_normalizations.push(item);
+        }
+    }
+}
+
+fn collect_dashboard_team_names(dashboard: &OwlsDashboard) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    for endpoint in &dashboard.endpoints {
+        for quote in &endpoint.quotes {
+            if let Some((left, right)) = split_event_teams(&quote.event) {
+                names.insert(left);
+                names.insert(right);
+            }
+        }
+        for score in &endpoint.live_scores {
+            if !score.home_team.trim().is_empty() {
+                names.insert(score.home_team.clone());
+            }
+            if !score.away_team.trim().is_empty() {
+                names.insert(score.away_team.clone());
+            }
+            if let Some((left, right)) = split_event_teams(&score.name) {
+                names.insert(left);
+                names.insert(right);
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+fn fetch_team_normalizations(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    sport: &str,
+    team_names: &[String],
+) -> Result<Vec<OwlsTeamNormalization>> {
+    let mut rows = Vec::new();
+    for chunk in team_names.chunks(25) {
+        let joined = chunk
+            .iter()
+            .map(|item| item.trim())
+            .filter(|item| !item.is_empty())
+            .collect::<Vec<_>>()
+            .join(",");
+        if joined.is_empty() {
+            continue;
+        }
+        let query = [("names", joined.as_str()), ("sport", sport)];
+        let payload = fetch_json(client, base_url, api_key, "/api/v1/normalize/batch", &query)?;
+        rows.extend(parse_team_normalizations(&payload));
+    }
+    Ok(rows)
+}
+
+async fn fetch_team_normalizations_async(
+    client: &AsyncClient,
+    base_url: &str,
+    api_key: &str,
+    sport: &str,
+    team_names: &[String],
+) -> Result<Vec<OwlsTeamNormalization>> {
+    let mut rows = Vec::new();
+    for chunk in team_names.chunks(25) {
+        let joined = chunk
+            .iter()
+            .map(|item| item.trim())
+            .filter(|item| !item.is_empty())
+            .collect::<Vec<_>>()
+            .join(",");
+        if joined.is_empty() {
+            continue;
+        }
+        let query = [("names", joined.as_str()), ("sport", sport)];
+        let payload =
+            fetch_json_async(client, base_url, api_key, "/api/v1/normalize/batch", &query).await?;
+        rows.extend(parse_team_normalizations(&payload));
+    }
+    Ok(rows)
+}
+
+fn parse_team_normalizations(value: &Value) -> Vec<OwlsTeamNormalization> {
+    let rows = extract_array(value, &["/results", "/data/results", ""]);
+    if rows.is_empty() {
+        return first_non_empty_string(Some(value), &["input"]).map_or_else(Vec::new, |_| {
+            vec![OwlsTeamNormalization {
+                input: first_non_empty(value, &["input"]),
+                canonical: first_non_empty(value, &["canonical"]),
+                simplified: first_non_empty(value, &["simplified"]),
+            }]
+        });
+    }
+    rows.into_iter()
+        .map(|row| OwlsTeamNormalization {
+            input: first_non_empty(&row, &["input"]),
+            canonical: first_non_empty(&row, &["canonical"]),
+            simplified: first_non_empty(&row, &["simplified"]),
+        })
+        .collect()
+}
+
+fn event_matches_with_team_normalization(
+    dashboard: &OwlsDashboard,
+    left: &str,
+    right: &str,
+) -> bool {
+    event_matches(left, right)
+        || match (
+            canonical_event_pair(dashboard, left),
+            canonical_event_pair(dashboard, right),
+        ) {
+            (Some(left_pair), Some(right_pair)) => left_pair == right_pair,
+            _ => false,
+        }
+}
+
+fn canonical_event_pair(dashboard: &OwlsDashboard, event: &str) -> Option<(String, String)> {
+    let (left, right) = split_event_teams(event)?;
+    let mut pair = [
+        canonical_team_key(dashboard, &left),
+        canonical_team_key(dashboard, &right),
+    ];
+    pair.sort();
+    Some((pair[0].clone(), pair[1].clone()))
+}
+
+fn canonical_team_key(dashboard: &OwlsDashboard, name: &str) -> String {
+    let normalized = normalize_key(name);
+    dashboard
+        .team_normalizations
+        .iter()
+        .find(|item| {
+            normalize_key(&item.input) == normalized
+                || normalize_key(&item.canonical) == normalized
+                || normalize_key(&item.simplified) == normalized
+        })
+        .map(|item| {
+            if !item.canonical.trim().is_empty() {
+                simple_team_key(&item.canonical)
+            } else if !item.simplified.trim().is_empty() {
+                simple_team_key(&item.simplified)
+            } else {
+                simple_team_key(name)
+            }
+        })
+        .unwrap_or_else(|| simple_team_key(name))
+}
+
+fn simple_team_key(name: &str) -> String {
+    normalize_key(name)
+        .split_whitespace()
+        .filter(|token| {
+            !matches!(
+                *token,
+                "fc" | "sc" | "cf" | "afc" | "bk" | "fk" | "club" | "de" | "ac"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn split_event_teams(value: &str) -> Option<(String, String)> {
+    let trimmed = value.trim();
+    let lowercase = trimmed.to_ascii_lowercase();
+    for separator in [" @ ", "@", " at ", " vs ", " v "] {
+        if let Some(index) = lowercase.find(separator) {
+            let left = trimmed[..index].trim();
+            let right = trimmed[index + separator.len()..].trim();
+            if !left.is_empty() && !right.is_empty() {
+                return Some((left.to_string(), right.to_string()));
+            }
+        }
+    }
+    None
+}
+
 fn ensure_kalshi_series_seed(
     client: &Client,
     base_url: &str,
@@ -909,6 +1930,24 @@ fn ensure_kalshi_series_seed(
         return;
     }
     let payload = fetch_json(client, base_url, api_key, "/api/v1/kalshi/series", &[]);
+    if let Ok(value) = payload {
+        seeds.kalshi_series_ticker = first_non_empty_string(
+            value.pointer("/data/0"),
+            &["series_ticker", "ticker", "seriesTicker"],
+        );
+    }
+}
+
+async fn ensure_kalshi_series_seed_async(
+    client: &AsyncClient,
+    base_url: &str,
+    api_key: &str,
+    seeds: &mut OwlsSeeds,
+) {
+    if seeds.kalshi_series_ticker.is_some() {
+        return;
+    }
+    let payload = fetch_json_async(client, base_url, api_key, "/api/v1/kalshi/series", &[]).await;
     if let Ok(value) = payload {
         seeds.kalshi_series_ticker = first_non_empty_string(
             value.pointer("/data/0"),
@@ -938,6 +1977,33 @@ fn ensure_cs2_seed(client: &Client, base_url: &str, api_key: &str, seeds: &mut O
     }
 }
 
+async fn ensure_cs2_seed_async(
+    client: &AsyncClient,
+    base_url: &str,
+    api_key: &str,
+    seeds: &mut OwlsSeeds,
+) {
+    if seeds.cs2_match_id.is_some() {
+        return;
+    }
+    let payload = fetch_json_async(
+        client,
+        base_url,
+        api_key,
+        "/api/v1/history/cs2/matches",
+        &[("limit", "1")],
+    )
+    .await;
+    if let Ok(value) = payload {
+        seeds.cs2_match_id = first_non_empty_string(
+            value
+                .pointer("/data/matches/0")
+                .or_else(|| value.pointer("/data/0")),
+            &["matchId", "id", "slug"],
+        );
+    }
+}
+
 fn merge_endpoint(dashboard: &mut OwlsDashboard, mut summary: OwlsEndpointSummary) -> bool {
     let checked_at = Instant::now();
     if let Some(slot) = dashboard
@@ -957,6 +2023,14 @@ fn merge_endpoint(dashboard: &mut OwlsDashboard, mut summary: OwlsEndpointSummar
             summary.count = slot.count;
             summary.status = slot.status.clone();
             summary.updated_at = slot.updated_at.clone();
+            summary.requested_books = slot.requested_books.clone();
+            summary.available_books = slot.available_books.clone();
+            summary.books_returned = slot.books_returned.clone();
+            summary.freshness_age_seconds = slot.freshness_age_seconds;
+            summary.freshness_stale = slot.freshness_stale;
+            summary.freshness_threshold_seconds = slot.freshness_threshold_seconds;
+            summary.quotes = slot.quotes.clone();
+            summary.live_scores = slot.live_scores.clone();
         }
         *slot = summary;
         return changed;
@@ -976,6 +2050,14 @@ fn endpoint_semantically_changed(
         || current.count != next.count
         || current.updated_at != next.updated_at
         || current.detail != next.detail
+        || current.requested_books != next.requested_books
+        || current.available_books != next.available_books
+        || current.books_returned != next.books_returned
+        || current.freshness_age_seconds != next.freshness_age_seconds
+        || current.freshness_stale != next.freshness_stale
+        || current.freshness_threshold_seconds != next.freshness_threshold_seconds
+        || current.quotes != next.quotes
+        || current.live_scores != next.live_scores
         || current.preview.len() != next.preview.len()
         || current
             .preview
@@ -989,7 +2071,8 @@ fn endpoint_semantically_changed(
 }
 
 fn dashboard_semantically_changed(current: &OwlsDashboard, next: &OwlsDashboard) -> bool {
-    current.endpoints.len() != next.endpoints.len()
+    current.team_normalizations != next.team_normalizations
+        || current.endpoints.len() != next.endpoints.len()
         || current
             .endpoints
             .iter()
@@ -1056,6 +2139,35 @@ fn fetch_json(
     serde_json::from_str(&payload).wrap_err("failed to decode Owls response")
 }
 
+async fn fetch_json_async(
+    client: &AsyncClient,
+    base_url: &str,
+    api_key: &str,
+    path: &str,
+    query: &[(&str, &str)],
+) -> Result<Value> {
+    let response = client
+        .get(format!("{}{}", base_url.trim_end_matches('/'), path))
+        .bearer_auth(api_key)
+        .query(query)
+        .send()
+        .await
+        .wrap_err_with(|| format!("request failed for {path}"))?;
+    let status = response.status();
+    let payload = response
+        .text()
+        .await
+        .wrap_err("failed to read Owls response body")?;
+    if !status.is_success() {
+        return Err(eyre!(
+            "HTTP {}: {}",
+            status.as_u16(),
+            truncate(&payload, 120)
+        ));
+    }
+    serde_json::from_str(&payload).wrap_err("failed to decode Owls response")
+}
+
 fn parse_book_market_summary(id: OwlsEndpointId, value: &Value) -> OwlsEndpointSummary {
     let books = value
         .get("data")
@@ -1064,11 +2176,15 @@ fn parse_book_market_summary(id: OwlsEndpointId, value: &Value) -> OwlsEndpointS
         .unwrap_or_default();
     let mut preview = Vec::new();
     let mut event_count = 0usize;
+    let mut quotes = Vec::new();
     for (book, events) in books {
         let Some(rows) = events.as_array() else {
             continue;
         };
         event_count += rows.len();
+        for event in rows {
+            quotes.extend(extract_market_quotes(event, Some(&book)));
+        }
         if let Some(event) = rows.first() {
             preview.push(OwlsPreviewRow {
                 label: matchup_label(event),
@@ -1082,12 +2198,30 @@ fn parse_book_market_summary(id: OwlsEndpointId, value: &Value) -> OwlsEndpointS
     summary.status = String::from("ready");
     summary.count = event_count;
     summary.updated_at = first_pointer_string(value, &["/meta/timestamp"]);
+    summary.requested_books = string_array_at(value, "/meta/requestedBooks");
+    summary.available_books = string_array_at(value, "/meta/availableBooks");
+    summary.books_returned = string_array_at(value, "/meta/booksReturned");
+    summary.freshness_age_seconds = unsigned_number_at(value, "/meta/freshness/ageSeconds");
+    summary.freshness_stale = value
+        .pointer("/meta/freshness/stale")
+        .and_then(Value::as_bool);
+    summary.freshness_threshold_seconds = unsigned_number_at(value, "/meta/freshness/threshold");
     summary.detail = format!(
-        "books {} • market {}",
-        books_len(value),
-        first_pointer_string(value, &["/meta/market"]).if_empty("filtered")
+        "books {} • market {} • age {}s{}",
+        books_returned_len(value),
+        first_pointer_string(value, &["/meta/market"]).if_empty("filtered"),
+        summary
+            .freshness_age_seconds
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| String::from("-")),
+        if summary.freshness_stale.unwrap_or(false) {
+            " stale"
+        } else {
+            ""
+        }
     );
     summary.preview = preview;
+    summary.quotes = quotes;
     summary
 }
 
@@ -1181,12 +2315,19 @@ fn parse_all_scores_summary(id: OwlsEndpointId, value: &Value) -> OwlsEndpointSu
         .unwrap_or_default();
     let mut preview = Vec::new();
     let mut total = 0usize;
+    let mut live_scores = Vec::new();
 
     for (sport, rows) in sports {
         let Some(events) = rows.as_array() else {
             continue;
         };
         total += events.len();
+        live_scores.extend(
+            events
+                .iter()
+                .map(|event| parse_live_score_event(&sport, event))
+                .collect::<Vec<_>>(),
+        );
         if let Some(event) = events.first() {
             preview.push(OwlsPreviewRow {
                 label: sport,
@@ -1206,15 +2347,12 @@ fn parse_all_scores_summary(id: OwlsEndpointId, value: &Value) -> OwlsEndpointSu
     summary.updated_at = first_pointer_string(value, &["/data/timestamp"]);
     summary.detail = format!("sports {}", preview.len());
     summary.preview = preview;
+    summary.live_scores = live_scores;
     summary
 }
 
 fn parse_scores_summary(id: OwlsEndpointId, value: &Value) -> OwlsEndpointSummary {
-    let games = value
-        .pointer(&format!("/data/sports/{DEFAULT_SPORT}"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let (sport, games) = extract_sport_score_games(value);
     let preview = games
         .iter()
         .take(4)
@@ -1232,9 +2370,118 @@ fn parse_scores_summary(id: OwlsEndpointId, value: &Value) -> OwlsEndpointSummar
     summary.status = String::from("ready");
     summary.count = games.len();
     summary.updated_at = first_pointer_string(value, &["/data/timestamp"]);
-    summary.detail = String::from("live feed");
+    summary.detail = format!("live feed {}", sport.clone().if_empty("-"));
     summary.preview = preview;
+    summary.live_scores = games
+        .iter()
+        .map(|event| parse_live_score_event(&sport, event))
+        .collect();
     summary
+}
+
+fn extract_sport_score_games(value: &Value) -> (String, Vec<Value>) {
+    let sports = value
+        .pointer("/data/sports")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    sports
+        .into_iter()
+        .find_map(|(sport, rows)| rows.as_array().map(|items| (sport, items.clone())))
+        .unwrap_or_else(|| (String::new(), Vec::new()))
+}
+
+fn parse_live_score_event(sport: &str, value: &Value) -> OwlsLiveScoreEvent {
+    let home_team = first_non_empty_string(value.pointer("/home/team"), &["displayName", "name"])
+        .unwrap_or_default();
+    let away_team = first_non_empty_string(value.pointer("/away/team"), &["displayName", "name"])
+        .unwrap_or_default();
+    OwlsLiveScoreEvent {
+        sport: sport.to_string(),
+        event_id: first_non_empty(value, &["id"]),
+        name: first_non_empty(value, &["name"]),
+        home_team,
+        away_team,
+        home_score: integer_value(value.pointer("/home/score")),
+        away_score: integer_value(value.pointer("/away/score")),
+        status_state: first_non_empty_string(value.pointer("/status"), &["state"])
+            .unwrap_or_default(),
+        status_detail: first_non_empty_string(value.pointer("/status"), &["detail"])
+            .unwrap_or_default(),
+        display_clock: first_non_empty_string(value.pointer("/status"), &["displayClock"])
+            .unwrap_or_default(),
+        source_match_id: first_non_empty(value, &["sourceMatchId"]),
+        last_updated: first_non_empty(value, &["lastUpdated"]),
+        stats: parse_live_stats(value.pointer("/matchStats")),
+        incidents: extract_array(value, &["/incidents"])
+            .into_iter()
+            .map(|row| OwlsLiveIncident {
+                minute: row.get("minute").and_then(Value::as_u64),
+                incident_type: first_non_empty(&row, &["type"]),
+                team_side: first_non_empty(&row, &["teamSide"]),
+                player_name: first_non_empty(&row, &["playerName"]),
+                detail: first_non_empty(
+                    &row,
+                    &["assistPlayerName", "playerOut", "detail", "description"],
+                ),
+            })
+            .collect(),
+        player_ratings: extract_array(value, &["/playerStats"])
+            .into_iter()
+            .map(|row| OwlsPlayerRating {
+                player_name: first_non_empty(&row, &["playerName"]),
+                team_side: first_non_empty(&row, &["teamSide"]),
+                rating: numeric_value(row.get("rating")),
+            })
+            .collect(),
+    }
+}
+
+fn parse_live_stats(value: Option<&Value>) -> Vec<OwlsLiveStat> {
+    let Some(stats) = value.and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for (key, entry) in stats {
+        let home_value = stringify(entry.get("home"));
+        let away_value = stringify(entry.get("away"));
+        if home_value.is_empty() && away_value.is_empty() {
+            continue;
+        }
+        rows.push(OwlsLiveStat {
+            key: key.clone(),
+            label: live_stat_label(key),
+            home_value: home_value.if_empty("-"),
+            away_value: away_value.if_empty("-"),
+        });
+    }
+    rows
+}
+
+fn live_stat_label(key: &str) -> String {
+    match key {
+        "shotsOnTarget" => String::from("Shots OT"),
+        "shotsOffTarget" => String::from("Shots Off"),
+        "expectedGoals" => String::from("xG"),
+        "bigChances" => String::from("Big Ch"),
+        "yellowCards" => String::from("Yellow"),
+        "redCards" => String::from("Red"),
+        "goalkeeperSaves" => String::from("Saves"),
+        "shotsInsideBox" => String::from("In Box"),
+        "shotsOutsideBox" => String::from("Out Box"),
+        "freeKicks" => String::from("FK"),
+        "throwIns" => String::from("Throw"),
+        other => other
+            .chars()
+            .enumerate()
+            .fold(String::new(), |mut label, (index, character)| {
+                if index > 0 && character.is_ascii_uppercase() {
+                    label.push(' ');
+                }
+                label.push(character);
+                label
+            }),
+    }
 }
 
 fn parse_stats_summary(id: OwlsEndpointId, value: &Value) -> OwlsEndpointSummary {
@@ -1506,11 +2753,29 @@ fn parse_realtime_summary(id: OwlsEndpointId, value: &Value) -> OwlsEndpointSumm
     summary.status = String::from("ready");
     summary.count = events.len();
     summary.updated_at = first_pointer_string(value, &["/meta/timestamp"]);
+    summary.books_returned = vec![String::from("pinnacle")];
+    summary.freshness_age_seconds = unsigned_number_at(value, "/meta/freshness/ageSeconds");
+    summary.freshness_stale = value
+        .pointer("/meta/freshness/stale")
+        .and_then(Value::as_bool);
+    summary.freshness_threshold_seconds = unsigned_number_at(value, "/meta/freshness/threshold");
     summary.detail = format!(
-        "age {}s",
-        first_pointer_string(value, &["/meta/freshness/ageSeconds"]).if_empty("-")
+        "pinnacle realtime • age {}s{}",
+        summary
+            .freshness_age_seconds
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| String::from("-")),
+        if summary.freshness_stale.unwrap_or(false) {
+            " stale"
+        } else {
+            ""
+        }
     );
     summary.preview = preview;
+    summary.quotes = events
+        .iter()
+        .flat_map(|event| extract_market_quotes(event, Some("pinnacle")))
+        .collect();
     summary
 }
 
@@ -1572,6 +2837,15 @@ fn books_len(value: &Value) -> usize {
         .unwrap_or(0)
 }
 
+fn books_returned_len(value: &Value) -> usize {
+    let returned = string_array_at(value, "/meta/booksReturned");
+    if returned.is_empty() {
+        books_len(value)
+    } else {
+        returned.len()
+    }
+}
+
 fn extract_array(value: &Value, paths: &[&str]) -> Vec<Value> {
     for path in paths {
         let current = if path.is_empty() {
@@ -1597,17 +2871,136 @@ fn matchup_label(event: &Value) -> String {
 }
 
 fn first_market_price(event: &Value) -> String {
-    let Some(market) = event
+    let Some(outcome) = event
         .pointer("/bookmakers/0/markets/0/outcomes/0")
         .or_else(|| event.pointer("/markets/0/outcomes/0"))
     else {
         return String::from("-");
     };
-    format!(
-        "{} {}",
-        stringify(market.get("name")).if_empty("-"),
-        stringify(market.get("price")).if_empty("-")
-    )
+    format_outcome_price(outcome)
+}
+
+fn extract_market_quotes(event: &Value, book_hint: Option<&str>) -> Vec<OwlsMarketQuote> {
+    let event_name = matchup_label(event);
+    let league = first_non_empty(event, &["league"]);
+    let country_code = first_non_empty(event, &["country_code", "countryCode"]);
+
+    let bookmakers = event
+        .get("bookmakers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| {
+            book_hint
+                .map(|book| vec![serde_json::json!({ "key": book, "markets": event.get("markets").cloned().unwrap_or(Value::Null) })])
+                .unwrap_or_default()
+        });
+    let mut quotes = Vec::new();
+
+    for bookmaker in bookmakers {
+        let book =
+            first_non_empty(&bookmaker, &["key", "title"]).if_empty(book_hint.unwrap_or("unknown"));
+        let event_link = first_non_empty(&bookmaker, &["event_link", "eventLink", "link"]);
+        for market in extract_array(&bookmaker, &["/markets"]) {
+            let market_key = first_non_empty(&market, &["key", "market"]);
+            let suspended = market
+                .get("suspended")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let limit_amount = extract_array(&market, &["/limits"])
+                .into_iter()
+                .filter_map(|limit| numeric_value(limit.get("amount")))
+                .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+            for outcome in extract_array(&market, &["/outcomes"]) {
+                let american_price = numeric_value(outcome.get("price"));
+                quotes.push(OwlsMarketQuote {
+                    book: book.clone(),
+                    event: event_name.clone(),
+                    selection: first_non_empty(&outcome, &["name", "label", "selection"]),
+                    market_key: market_key.clone(),
+                    point: numeric_value(outcome.get("point")),
+                    decimal_price: american_price.and_then(normalize_odds_price),
+                    american_price,
+                    limit_amount,
+                    event_link: event_link.clone(),
+                    league: league.clone(),
+                    country_code: country_code.clone(),
+                    suspended,
+                });
+            }
+        }
+    }
+
+    quotes
+}
+
+fn format_outcome_price(outcome: &Value) -> String {
+    let selection = first_non_empty(outcome, &["name", "label", "selection"]).if_empty("-");
+    let point = numeric_value(outcome.get("point"));
+    let decimal_price = numeric_value(outcome.get("price")).and_then(normalize_odds_price);
+    match (point, decimal_price) {
+        (Some(point), Some(price)) => format!("{selection} {point:+} @ {price:.2}"),
+        (None, Some(price)) => format!("{selection} {price:.2}"),
+        (Some(point), None) => format!("{selection} {point:+}"),
+        (None, None) => selection,
+    }
+}
+
+fn normalize_odds_price(price: f64) -> Option<f64> {
+    if price.abs() >= 100.0 {
+        american_to_decimal(price)
+    } else if price > 1.0 {
+        Some(price)
+    } else {
+        None
+    }
+}
+
+fn american_to_decimal(price: f64) -> Option<f64> {
+    if price > 0.0 {
+        Some(1.0 + (price / 100.0))
+    } else if price < 0.0 {
+        Some(1.0 + (100.0 / price.abs()))
+    } else {
+        None
+    }
+}
+
+fn numeric_value(value: Option<&Value>) -> Option<f64> {
+    match value {
+        Some(Value::Number(number)) => number.as_f64(),
+        Some(Value::String(text)) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn integer_value(value: Option<&Value>) -> Option<i64> {
+    match value {
+        Some(Value::Number(number)) => number.as_i64(),
+        Some(Value::String(text)) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn unsigned_number_at(value: &Value, path: &str) -> Option<u64> {
+    value.pointer(path).and_then(|item| match item {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    })
+}
+
+fn string_array_at(value: &Value, path: &str) -> Vec<String> {
+    value
+        .pointer(path)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| stringify(Some(item)))
+                .filter(|item| !item.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn first_non_empty(value: &Value, keys: &[&str]) -> String {
@@ -1985,6 +3378,31 @@ impl EmptyFallback for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn fetch_json_async_reads_success_payload() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let base_url = spawn_http_server(vec![http_ok(r#"{"ok":true}"#)]);
+        let client = build_async_client().expect("async client");
+
+        let value = runtime
+            .block_on(fetch_json_async(
+                &client,
+                &base_url,
+                "token",
+                "/status",
+                &[],
+            ))
+            .expect("async json payload");
+
+        assert_eq!(value["ok"], serde_json::json!(true));
+    }
 
     #[test]
     fn background_due_ids_prioritize_hot_feeds() {
@@ -2067,6 +3485,140 @@ mod tests {
         assert_eq!(slot.change_count, 1);
     }
 
+    #[test]
+    fn parse_book_market_summary_extracts_quote_rows_and_metadata() {
+        let value = serde_json::json!({
+            "data": {
+                "pinnacle": [{
+                    "away_team": "Arsenal",
+                    "home_team": "Everton",
+                    "league": "England - Premier League",
+                    "country_code": "GB",
+                    "bookmakers": [{
+                        "key": "pinnacle",
+                        "event_link": "https://www.pinnacle.com/event/1",
+                        "markets": [{
+                            "key": "h2h",
+                            "limits": [{"type": "maxRiskStake", "amount": 1500}],
+                            "outcomes": [
+                                {"name": "Arsenal", "price": -150},
+                                {"name": "Draw", "price": 220},
+                                {"name": "Everton", "price": 430}
+                            ]
+                        }]
+                    }]
+                }],
+                "bet365": [{
+                    "away_team": "Arsenal",
+                    "home_team": "Everton",
+                    "bookmakers": [{
+                        "key": "bet365",
+                        "markets": [{
+                            "key": "h2h",
+                            "outcomes": [{"name": "Draw", "price": 3.30}]
+                        }]
+                    }]
+                }]
+            },
+            "meta": {
+                "market": "moneyline",
+                "requestedBooks": ["pinnacle", "bet365"],
+                "availableBooks": ["pinnacle", "bet365", "betmgm"],
+                "booksReturned": ["pinnacle", "bet365"],
+                "timestamp": "2026-03-25T01:02:03Z",
+                "freshness": {"ageSeconds": 2, "stale": false, "threshold": 90}
+            }
+        });
+
+        let summary = parse_book_market_summary(OwlsEndpointId::Moneyline, &value);
+        let draw = summary
+            .quotes
+            .iter()
+            .find(|quote| quote.book == "pinnacle" && quote.selection == "Draw")
+            .expect("draw quote");
+
+        assert_eq!(summary.books_returned, vec!["pinnacle", "bet365"]);
+        assert_eq!(
+            summary.available_books,
+            vec!["pinnacle", "bet365", "betmgm"]
+        );
+        assert_eq!(summary.requested_books, vec!["pinnacle", "bet365"]);
+        assert_eq!(summary.freshness_age_seconds, Some(2));
+        assert!(!summary.freshness_stale.unwrap_or(true));
+        assert_eq!(draw.event, "Arsenal @ Everton");
+        assert_eq!(draw.market_key, "h2h");
+        assert_eq!(draw.limit_amount, Some(1500.0));
+        assert_eq!(
+            draw.decimal_price.map(|value| value.round() as i64),
+            Some(3)
+        );
+        assert!(summary.detail.contains("age 2s"));
+    }
+
+    #[test]
+    fn parse_scores_summary_extracts_soccer_live_context() {
+        let value = serde_json::json!({
+            "success": true,
+            "data": {
+                "sports": {
+                    "soccer": [{
+                        "id": "soccer:Malta@Luxembourg-20260325",
+                        "sport": "soccer",
+                        "name": "Malta at Luxembourg",
+                        "status": {
+                            "state": "in",
+                            "detail": "72'",
+                            "displayClock": "72"
+                        },
+                        "home": {
+                            "team": {"displayName": "Luxembourg"},
+                            "score": 1
+                        },
+                        "away": {
+                            "team": {"displayName": "Malta"},
+                            "score": 2
+                        },
+                        "sourceMatchId": "mb-1",
+                        "matchStats": {
+                            "possession": {"home": 40, "away": 60},
+                            "shotsOnTarget": {"home": 3, "away": 7},
+                            "expectedGoals": {"home": 0.8, "away": 1.7}
+                        },
+                        "incidents": [{
+                            "minute": 58,
+                            "type": "goal",
+                            "playerName": "Attard",
+                            "teamSide": "away"
+                        }],
+                        "playerStats": [{
+                            "playerName": "Teuma",
+                            "teamSide": "away",
+                            "rating": 8.4
+                        }],
+                        "lastUpdated": "2026-03-25T11:12:13Z"
+                    }]
+                },
+                "timestamp": "2026-03-25T11:12:13Z"
+            }
+        });
+
+        let summary = parse_scores_summary(OwlsEndpointId::ScoresSport, &value);
+
+        assert_eq!(summary.count, 1);
+        assert!(summary.detail.contains("soccer"));
+        assert_eq!(summary.live_scores.len(), 1);
+        assert_eq!(summary.live_scores[0].sport, "soccer");
+        assert_eq!(summary.live_scores[0].home_team, "Luxembourg");
+        assert_eq!(summary.live_scores[0].away_team, "Malta");
+        assert_eq!(summary.live_scores[0].display_clock, "72");
+        assert_eq!(summary.live_scores[0].incidents.len(), 1);
+        assert_eq!(summary.live_scores[0].player_ratings.len(), 1);
+        assert!(summary.live_scores[0]
+            .stats
+            .iter()
+            .any(|stat| stat.label == "xG" && stat.away_value == "1.7"));
+    }
+
     fn summary_fixture(
         id: OwlsEndpointId,
         status: &str,
@@ -2084,5 +3636,30 @@ mod tests {
             metric: String::from("metric"),
         }];
         summary
+    }
+
+    fn spawn_http_server(responses: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept connection");
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer);
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+                stream.flush().expect("flush response");
+            }
+        });
+        format!("http://{}", address)
+    }
+
+    fn http_ok(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
     }
 }

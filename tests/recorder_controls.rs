@@ -704,7 +704,7 @@ fn recorder_reload_outside_recorder_panel_reports_guidance() {
 
     assert!(app
         .status_message()
-        .contains("Open Trading > Recorder to reload recorder config."));
+        .contains("Open Trading > Recorder or Alerts to reload config."));
 }
 
 fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {

@@ -1,8 +1,11 @@
 use std::env;
-use std::time::Duration;
+use std::fs;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use reqwest::blocking::Client;
+use reqwest::Client as AsyncClient;
 use reqwest::Method;
 use serde_json::{json, Value};
 
@@ -20,6 +23,8 @@ pub struct ExchangeApiExecutionResult {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct MatchbookOfferRow {
     pub offer_id: String,
+    pub event_id: String,
+    pub market_id: String,
     pub runner_id: String,
     pub event_name: String,
     pub market_name: String,
@@ -34,6 +39,8 @@ pub struct MatchbookOfferRow {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct MatchbookBetRow {
     pub bet_id: String,
+    pub event_id: String,
+    pub market_id: String,
     pub runner_id: String,
     pub event_name: String,
     pub market_name: String,
@@ -47,6 +54,8 @@ pub struct MatchbookBetRow {
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct MatchbookPositionRow {
+    pub event_id: String,
+    pub market_id: String,
     pub runner_id: String,
     pub event_name: String,
     pub market_name: String,
@@ -72,6 +81,13 @@ pub struct MatchbookApiClient {
     token: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct AsyncMatchbookApiClient {
+    client: AsyncClient,
+    base_url: String,
+    token: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct MatchbookPreflightSummary {
     pub balance: Option<String>,
@@ -83,6 +99,10 @@ pub struct MatchbookPreflightSummary {
     pub runner_bet_count: usize,
     pub runner_position_count: usize,
     pub runner_open_stake: Option<f64>,
+    pub runner_best_back_odds: Option<f64>,
+    pub runner_best_back_liquidity: Option<f64>,
+    pub runner_best_lay_odds: Option<f64>,
+    pub runner_best_lay_liquidity: Option<f64>,
 }
 
 impl MatchbookPreflightSummary {
@@ -112,6 +132,13 @@ impl MatchbookPreflightSummary {
             self.position_count,
             runner_count_suffix(self.runner_position_count)
         ));
+        if self.runner_best_back_odds.is_some() || self.runner_best_lay_odds.is_some() {
+            segments.push(format!(
+                "prices back {} • lay {}",
+                format_price_liquidity(self.runner_best_back_odds, self.runner_best_back_liquidity),
+                format_price_liquidity(self.runner_best_lay_odds, self.runner_best_lay_liquidity)
+            ));
+        }
         if segments.is_empty() {
             String::new()
         } else {
@@ -127,9 +154,7 @@ impl MatchbookApiClient {
             .timeout(Duration::from_secs(MATCHBOOK_TIMEOUT_SECS))
             .build()
             .wrap_err("failed to build Matchbook HTTP client")?;
-        let base_url = env::var("MATCHBOOK_API_BASE_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
+        let base_url = env_or_dotenv("MATCHBOOK_API_BASE_URL")
             .unwrap_or_else(|| String::from(MATCHBOOK_BASE_URL));
         let token = matchbook_session_token(&client, &base_url)?;
         Ok(Self {
@@ -198,14 +223,31 @@ impl MatchbookApiClient {
         let matched_bets = self.aggregated_matched_bets().ok();
         let positions = self.positions().ok();
 
-        Ok(matchbook_preflight_summary_from_values(
+        let mut summary = matchbook_preflight_summary_from_values(
             &runner_id,
             balance.as_ref(),
             current_offers.as_ref(),
             current_bets.as_ref(),
             matched_bets.as_ref(),
             positions.as_ref(),
-        ))
+        );
+        if let Some((event_id, market_id)) = matchbook_price_lookup_ids(intent) {
+            if let Ok(prices) = self.runner_prices(&event_id, &market_id, &runner_id) {
+                let (back, lay) = matchbook_best_prices_from_value(&prices);
+                summary.runner_best_back_odds = back.0;
+                summary.runner_best_back_liquidity = back.1;
+                summary.runner_best_lay_odds = lay.0;
+                summary.runner_best_lay_liquidity = lay.1;
+            }
+        }
+        Ok(summary)
+    }
+
+    pub fn runner_prices(&self, event_id: &str, market_id: &str, runner_id: &str) -> Result<Value> {
+        self.get_json(
+            &format!("/edge/rest/events/{event_id}/markets/{market_id}/runners/{runner_id}/prices"),
+            "Matchbook runner prices",
+        )
     }
 
     fn get_json(&self, path: &str, label: &str) -> Result<Value> {
@@ -252,6 +294,100 @@ impl MatchbookApiClient {
     }
 }
 
+impl AsyncMatchbookApiClient {
+    pub async fn new() -> Result<Self> {
+        let client = AsyncClient::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(MATCHBOOK_TIMEOUT_SECS))
+            .build()
+            .wrap_err("failed to build Matchbook HTTP client")?;
+        let base_url = env_or_dotenv("MATCHBOOK_API_BASE_URL")
+            .unwrap_or_else(|| String::from(MATCHBOOK_BASE_URL));
+        let token = matchbook_session_token_async(&client, &base_url).await?;
+        Ok(Self {
+            client,
+            base_url,
+            token,
+        })
+    }
+
+    pub async fn account(&self) -> Result<Value> {
+        self.get_json("/edge/rest/account", "Matchbook account")
+            .await
+    }
+
+    pub async fn balance(&self) -> Result<Value> {
+        self.get_json("/edge/rest/account/balance", "Matchbook balance")
+            .await
+    }
+
+    pub async fn positions(&self) -> Result<Value> {
+        self.get_json("/edge/rest/account/positions", "Matchbook positions")
+            .await
+    }
+
+    pub async fn current_offers(&self) -> Result<Value> {
+        self.get_json(
+            "/edge/rest/reports/v2/offers/current",
+            "Matchbook current offers",
+        )
+        .await
+    }
+
+    pub async fn current_bets(&self) -> Result<Value> {
+        self.get_json(
+            "/edge/rest/reports/v2/bets/current",
+            "Matchbook current bets",
+        )
+        .await
+    }
+
+    async fn get_json(&self, path: &str, label: &str) -> Result<Value> {
+        self.send_json(Method::GET, path, None, label).await
+    }
+
+    async fn send_json(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        label: &str,
+    ) -> Result<Value> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut request = self
+            .client
+            .request(method.clone(), url)
+            .header("accept", "application/json")
+            .header("session-token", &self.token);
+        if let Some(body) = body {
+            request = request
+                .header("content-type", "application/json")
+                .json(body);
+        }
+        let response = request
+            .send()
+            .await
+            .wrap_err_with(|| format!("failed to {label}"))?;
+        let status = response.status();
+        let response_body = response
+            .text()
+            .await
+            .wrap_err_with(|| format!("failed to read {label} response body"))?;
+        if !status.is_success() {
+            return Err(eyre!(
+                "{label} failed with {}: {}",
+                status,
+                truncate(&response_body, 220)
+            ));
+        }
+        if response_body.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str(&response_body)
+            .wrap_err_with(|| format!("failed to decode {label} response"))
+    }
+}
+
 pub fn execute_trade(intent: &TradingActionIntent) -> Result<ExchangeApiExecutionResult> {
     match intent.venue {
         VenueId::Matchbook => execute_matchbook_trade(intent),
@@ -272,24 +408,31 @@ pub fn execute_trade(intent: &TradingActionIntent) -> Result<ExchangeApiExecutio
 
 pub fn load_matchbook_account_state() -> Result<MatchbookAccountState> {
     let client = MatchbookApiClient::new()?;
-    let account = client.account().ok();
-    let balance = client.balance().ok();
-    let current_offers = client.current_offers().ok();
-    let current_bets = client.current_bets().ok();
-    let matched_bets = client.aggregated_matched_bets().ok();
-    let positions = client.positions().ok();
+    load_matchbook_account_state_with_client(&client)
+}
+
+pub fn load_matchbook_account_state_with_client(
+    client: &MatchbookApiClient,
+) -> Result<MatchbookAccountState> {
+    let account = client.account().wrap_err("Matchbook account failed")?;
+    let balance = client.balance().wrap_err("Matchbook balance failed")?;
+    let current_offers = client
+        .current_offers()
+        .wrap_err("Matchbook current offers failed")?;
+    let current_bets = client
+        .current_bets()
+        .wrap_err("Matchbook current bets failed")?;
+    let positions = client.positions().wrap_err("Matchbook positions failed")?;
 
     let summary = matchbook_preflight_summary_from_values(
         "",
-        balance.as_ref(),
-        current_offers.as_ref(),
-        current_bets.as_ref(),
-        matched_bets.as_ref(),
-        positions.as_ref(),
+        Some(&balance),
+        Some(&current_offers),
+        Some(&current_bets),
+        None,
+        Some(&positions),
     );
-    let account_label = account
-        .as_ref()
-        .and_then(matchbook_account_label_from_value)
+    let account_label = matchbook_account_label_from_value(&account)
         .unwrap_or_else(|| String::from("account ready"));
     let balance_label = summary
         .balance
@@ -305,10 +448,105 @@ pub fn load_matchbook_account_state() -> Result<MatchbookAccountState> {
         },
         balance_label,
         summary,
-        current_offers: parse_matchbook_offer_rows(current_offers.as_ref()),
-        current_bets: parse_matchbook_bet_rows(current_bets.as_ref()),
-        positions: parse_matchbook_position_rows(positions.as_ref()),
+        current_offers: parse_matchbook_offer_rows(Some(&current_offers)),
+        current_bets: parse_matchbook_bet_rows(Some(&current_bets)),
+        positions: parse_matchbook_position_rows(Some(&positions)),
     })
+}
+
+pub async fn load_matchbook_account_state_with_async_client(
+    client: &AsyncMatchbookApiClient,
+) -> Result<MatchbookAccountState> {
+    let account = client
+        .account()
+        .await
+        .wrap_err("Matchbook account failed")?;
+    let balance = client
+        .balance()
+        .await
+        .wrap_err("Matchbook balance failed")?;
+    let current_offers = client
+        .current_offers()
+        .await
+        .wrap_err("Matchbook current offers failed")?;
+    let current_bets = client
+        .current_bets()
+        .await
+        .wrap_err("Matchbook current bets failed")?;
+    let positions = client
+        .positions()
+        .await
+        .wrap_err("Matchbook positions failed")?;
+
+    let summary = matchbook_preflight_summary_from_values(
+        "",
+        Some(&balance),
+        Some(&current_offers),
+        Some(&current_bets),
+        None,
+        Some(&positions),
+    );
+    let account_label = matchbook_account_label_from_value(&account)
+        .unwrap_or_else(|| String::from("account ready"));
+    let balance_label = summary
+        .balance
+        .clone()
+        .unwrap_or_else(|| String::from("balance unavailable"));
+    let detail_suffix = summary.detail_suffix();
+
+    Ok(MatchbookAccountState {
+        status_line: if detail_suffix.is_empty() {
+            format!("Matchbook API ready • {account_label}")
+        } else {
+            format!("Matchbook API ready • {account_label}{detail_suffix}")
+        },
+        balance_label,
+        summary,
+        current_offers: parse_matchbook_offer_rows(Some(&current_offers)),
+        current_bets: parse_matchbook_bet_rows(Some(&current_bets)),
+        positions: parse_matchbook_position_rows(Some(&positions)),
+    })
+}
+
+pub async fn run_matchbook_sync_job_async(
+    client: &mut Option<AsyncMatchbookApiClient>,
+    rate_limited_until: &mut Option<Instant>,
+) -> Result<MatchbookAccountState> {
+    if let Some(until) = rate_limited_until {
+        if Instant::now() < *until {
+            let remaining_secs = until.saturating_duration_since(Instant::now()).as_secs();
+            return Err(eyre!(
+                "Matchbook API remains rate limited; retry after {}s",
+                remaining_secs
+            ));
+        }
+        *rate_limited_until = None;
+    }
+
+    if client.is_none() {
+        *client = Some(AsyncMatchbookApiClient::new().await?);
+    }
+
+    match load_matchbook_account_state_with_async_client(
+        client.as_ref().expect("client should be initialized"),
+    )
+    .await
+    {
+        Ok(state) => Ok(state),
+        Err(error) if matchbook_error_has_status(&error, 401) => {
+            *client = Some(AsyncMatchbookApiClient::new().await?);
+            load_matchbook_account_state_with_async_client(
+                client.as_ref().expect("client refreshed"),
+            )
+            .await
+        }
+        Err(error) if matchbook_error_has_status(&error, 429) => {
+            *client = None;
+            *rate_limited_until = Some(Instant::now() + Duration::from_secs(10 * 60));
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn execute_matchbook_trade(intent: &TradingActionIntent) -> Result<ExchangeApiExecutionResult> {
@@ -363,8 +601,8 @@ fn scaffolded_exchange(label: &str, detail: &str) -> Result<ExchangeApiExecution
 
 fn matchbook_offer_payload(intent: &TradingActionIntent, runner_id: &str) -> Value {
     json!({
-        "odds-type": env::var("MATCHBOOK_ODDS_TYPE").ok().filter(|value| !value.trim().is_empty()).unwrap_or_else(|| String::from("DECIMAL")),
-        "exchange-type": env::var("MATCHBOOK_EXCHANGE_TYPE").ok().filter(|value| !value.trim().is_empty()).unwrap_or_else(|| String::from("back-lay")),
+        "odds-type": env_or_dotenv("MATCHBOOK_ODDS_TYPE").unwrap_or_else(|| String::from("DECIMAL")),
+        "exchange-type": env_or_dotenv("MATCHBOOK_EXCHANGE_TYPE").unwrap_or_else(|| String::from("back-lay")),
         "offers": [{
             "runner-id": runner_id,
             "side": matchbook_side_label(intent.side),
@@ -375,11 +613,12 @@ fn matchbook_offer_payload(intent: &TradingActionIntent, runner_id: &str) -> Val
     })
 }
 
+fn matchbook_error_has_status(error: &color_eyre::Report, status_code: u16) -> bool {
+    error.to_string().contains(&format!(" {status_code}:"))
+}
+
 fn matchbook_session_token(client: &Client, base_url: &str) -> Result<String> {
-    if let Some(token) = env::var("MATCHBOOK_SESSION_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
+    if let Some(token) = env_or_dotenv("MATCHBOOK_SESSION_TOKEN") {
         return Ok(token);
     }
 
@@ -398,6 +637,51 @@ fn matchbook_session_token(client: &Client, base_url: &str) -> Result<String> {
     let status = response.status();
     let body = response
         .text()
+        .wrap_err("failed to read Matchbook session response body")?;
+    if !status.is_success() {
+        return Err(eyre!(
+            "Matchbook session login failed with {}: {}",
+            status,
+            truncate(&body, 220)
+        ));
+    }
+    let value: Value =
+        serde_json::from_str(&body).wrap_err("failed to decode Matchbook session response")?;
+    first_non_empty_string(
+        &value,
+        &[
+            "/session-token",
+            "/session_token",
+            "/token",
+            "/data/session-token",
+            "/data/session_token",
+        ],
+    )
+    .ok_or_else(|| eyre!("Matchbook session response did not include a session token"))
+}
+
+async fn matchbook_session_token_async(client: &AsyncClient, base_url: &str) -> Result<String> {
+    if let Some(token) = env_or_dotenv("MATCHBOOK_SESSION_TOKEN") {
+        return Ok(token);
+    }
+
+    let username = required_env("MATCHBOOK_USERNAME")?;
+    let password = required_env("MATCHBOOK_PASSWORD")?;
+    let response = client
+        .post(format!("{base_url}/bpapi/rest/security/session"))
+        .header("accept", "application/json")
+        .header("content-type", "application/json")
+        .json(&json!({
+            "username": username,
+            "password": password,
+        }))
+        .send()
+        .await
+        .wrap_err("failed to create Matchbook session")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
         .wrap_err("failed to read Matchbook session response body")?;
     if !status.is_success() {
         return Err(eyre!(
@@ -483,6 +767,92 @@ fn matchbook_preflight_summary_from_values(
                 "/stake",
             ],
         ),
+        runner_best_back_odds: None,
+        runner_best_back_liquidity: None,
+        runner_best_lay_odds: None,
+        runner_best_lay_liquidity: None,
+    }
+}
+
+fn matchbook_price_lookup_ids(intent: &TradingActionIntent) -> Option<(String, String)> {
+    let event_id = intent
+        .betslip_event_id
+        .clone()
+        .or_else(|| note_value(&intent.notes, "event_id"))
+        .or_else(|| matchbook_event_id_from_url(intent.deep_link_url.as_deref()))
+        .filter(|value| !value.trim().is_empty())?;
+    let market_id = intent
+        .betslip_market_id
+        .clone()
+        .or_else(|| note_value(&intent.notes, "market_id"))
+        .filter(|value| !value.trim().is_empty())?;
+    Some((event_id, market_id))
+}
+
+fn matchbook_event_id_from_url(url: Option<&str>) -> Option<String> {
+    let url = url?.trim();
+    if url.is_empty() {
+        return None;
+    }
+    let marker = "/events/";
+    let start = url.find(marker)? + marker.len();
+    let tail = &url[start..];
+    let event_id = tail
+        .chars()
+        .take_while(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .collect::<String>();
+    (!event_id.is_empty()).then_some(event_id)
+}
+
+fn matchbook_best_prices_from_value(
+    value: &Value,
+) -> ((Option<f64>, Option<f64>), (Option<f64>, Option<f64>)) {
+    let rows = rows_from_value(
+        Some(value),
+        &[
+            "/prices",
+            "/data/prices",
+            "/data/runner/prices",
+            "/runner/prices",
+        ],
+    );
+    let mut best_back = (None, None);
+    let mut best_lay = (None, None);
+    for row in rows {
+        let side = first_non_empty_string(row, &["/side", "/type"]).unwrap_or_default();
+        let odds = first_numeric(row, &["/decimal-odds", "/decimal_odds", "/odds", "/price"]);
+        let liquidity = first_numeric(
+            row,
+            &[
+                "/available-amount",
+                "/available_amount",
+                "/available",
+                "/amount",
+                "/stake",
+            ],
+        );
+        match side.to_ascii_lowercase().as_str() {
+            "back" => {
+                if odds > best_back.0 {
+                    best_back = (odds, liquidity);
+                }
+            }
+            "lay" => {
+                if best_lay.0.is_none() || odds < best_lay.0 {
+                    best_lay = (odds, liquidity);
+                }
+            }
+            _ => {}
+        }
+    }
+    (best_back, best_lay)
+}
+
+fn format_price_liquidity(price: Option<f64>, liquidity: Option<f64>) -> String {
+    match (price, liquidity) {
+        (Some(price), Some(liquidity)) => format!("{price:.2}/{liquidity:.2}"),
+        (Some(price), None) => format!("{price:.2}"),
+        _ => String::from("-"),
     }
 }
 
@@ -543,6 +913,10 @@ fn parse_matchbook_offer_rows(value: Option<&Value>) -> Vec<MatchbookOfferRow> {
     .map(|row| MatchbookOfferRow {
         offer_id: first_non_empty_string(row, &["/id", "/offer-id", "/offer_id"])
             .unwrap_or_else(|| String::from("-")),
+        event_id: first_non_empty_string(row, &["/event-id", "/event_id", "/event/id"])
+            .unwrap_or_default(),
+        market_id: first_non_empty_string(row, &["/market-id", "/market_id", "/market/id"])
+            .unwrap_or_default(),
         runner_id: first_non_empty_string(
             row,
             &["/runner-id", "/runner_id", "/selection-id", "/selection_id"],
@@ -591,6 +965,10 @@ fn parse_matchbook_bet_rows(value: Option<&Value>) -> Vec<MatchbookBetRow> {
     .map(|row| MatchbookBetRow {
         bet_id: first_non_empty_string(row, &["/id", "/bet-id", "/bet_id"])
             .unwrap_or_else(|| String::from("-")),
+        event_id: first_non_empty_string(row, &["/event-id", "/event_id", "/event/id"])
+            .unwrap_or_default(),
+        market_id: first_non_empty_string(row, &["/market-id", "/market_id", "/market/id"])
+            .unwrap_or_default(),
         runner_id: first_non_empty_string(
             row,
             &["/runner-id", "/runner_id", "/selection-id", "/selection_id"],
@@ -634,6 +1012,10 @@ fn parse_matchbook_position_rows(value: Option<&Value>) -> Vec<MatchbookPosition
     rows_from_value(value, &["/positions", "/data/positions"])
         .into_iter()
         .map(|row| MatchbookPositionRow {
+            event_id: first_non_empty_string(row, &["/event-id", "/event_id", "/event/id"])
+                .unwrap_or_default(),
+            market_id: first_non_empty_string(row, &["/market-id", "/market_id", "/market/id"])
+                .unwrap_or_default(),
             runner_id: first_non_empty_string(
                 row,
                 &["/runner-id", "/runner_id", "/selection-id", "/selection_id"],
@@ -728,10 +1110,62 @@ fn matchbook_side_label(side: TradingActionSide) -> &'static str {
 }
 
 fn required_env(name: &str) -> Result<String> {
+    env_or_dotenv(name).ok_or_else(|| eyre!("missing {name}"))
+}
+
+fn env_or_dotenv(name: &str) -> Option<String> {
     env::var(name)
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| eyre!("missing {name}"))
+        .or_else(|| dotenv_value_from_paths(name, &dotenv_candidates()))
+}
+
+fn dotenv_value_from_paths(name: &str, paths: &[PathBuf]) -> Option<String> {
+    for path in paths {
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = trimmed.split_once('=') else {
+                continue;
+            };
+            if key.trim() != name {
+                continue;
+            }
+            let parsed = value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
+            if !parsed.is_empty() {
+                return Some(parsed);
+            }
+        }
+    }
+    None
+}
+
+fn dotenv_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = env::var_os("HOME") {
+        let home_path = PathBuf::from(home);
+        paths.push(home_path.join(".env"));
+        paths.push(home_path.join(".env.local"));
+    }
+    if let Ok(current_dir) = env::current_dir() {
+        for ancestor in current_dir.ancestors() {
+            paths.push(ancestor.join(".env"));
+            paths.push(ancestor.join(".env.local"));
+        }
+    }
+    paths
 }
 
 fn first_non_empty_string(value: &Value, paths: &[&str]) -> Option<String> {
@@ -787,11 +1221,20 @@ fn truncate(value: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
+    use reqwest::blocking::Client;
     use serde_json::json;
 
     use super::{
-        matchbook_offer_payload, matchbook_preflight_summary_from_values, matchbook_runner_id,
-        matchbook_side_label,
+        dotenv_value_from_paths, load_matchbook_account_state_with_client,
+        matchbook_best_prices_from_value, matchbook_event_id_from_url, matchbook_offer_payload,
+        matchbook_preflight_summary_from_values, matchbook_runner_id, matchbook_side_label,
+        MatchbookApiClient,
     };
     use crate::domain::VenueId;
     use crate::trading_actions::{
@@ -885,6 +1328,76 @@ mod tests {
         assert!(summary.detail_suffix().contains("runner stake 12.00"));
     }
 
+    #[test]
+    fn dotenv_value_reader_supports_home_style_env_files() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let dotenv_path = temp_dir.path().join(".env");
+        fs::write(
+            &dotenv_path,
+            "MATCHBOOK_USERNAME=alice\nMATCHBOOK_PASSWORD=\"secret\"\n",
+        )
+        .expect("write dotenv");
+
+        assert_eq!(
+            dotenv_value_from_paths("MATCHBOOK_USERNAME", &[dotenv_path.clone()]),
+            Some(String::from("alice"))
+        );
+        assert_eq!(
+            dotenv_value_from_paths("MATCHBOOK_PASSWORD", &[dotenv_path]),
+            Some(String::from("secret"))
+        );
+    }
+
+    #[test]
+    fn matchbook_event_id_reader_uses_event_path_segment() {
+        assert_eq!(
+            matchbook_event_id_from_url(Some("https://www.matchbook.com/events/12345?foo=bar")),
+            Some(String::from("12345"))
+        );
+        assert_eq!(matchbook_event_id_from_url(Some("")), None);
+    }
+
+    #[test]
+    fn matchbook_best_prices_parser_prefers_best_back_and_lay() {
+        let prices = json!({
+            "prices": [
+                {"side": "back", "decimal-odds": 3.10, "available-amount": 40.0},
+                {"side": "back", "decimal-odds": 3.25, "available-amount": 12.0},
+                {"side": "lay", "decimal-odds": 3.40, "available-amount": 28.0},
+                {"side": "lay", "decimal-odds": 3.32, "available-amount": 9.0}
+            ]
+        });
+
+        let (back, lay) = matchbook_best_prices_from_value(&prices);
+
+        assert_eq!(back, (Some(3.25), Some(12.0)));
+        assert_eq!(lay, (Some(3.32), Some(9.0)));
+    }
+
+    #[test]
+    fn matchbook_loader_reports_partial_failure_instead_of_silent_empty_success() {
+        let server = spawn_matchbook_test_server(vec![
+            http_ok(r#"{"name":"Test Account"}"#),
+            http_ok(r#"{"available-balance":128.42,"currency":"GBP"}"#),
+            http_error(500, "boom"),
+        ]);
+        let client = MatchbookApiClient {
+            client: Client::builder()
+                .connect_timeout(Duration::from_secs(1))
+                .timeout(Duration::from_secs(1))
+                .build()
+                .expect("client"),
+            base_url: server,
+            token: String::from("test-token"),
+        };
+
+        let result = load_matchbook_account_state_with_client(&client);
+
+        assert!(result.is_err());
+        let error = result.expect_err("partial failure should error");
+        assert!(error.to_string().contains("Matchbook current offers"));
+    }
+
     fn sample_intent() -> TradingActionIntent {
         let seed = TradingActionSeed {
             source: crate::trading_actions::TradingActionSource::OddsMatcher,
@@ -895,6 +1408,7 @@ mod tests {
             selection_name: String::from("Arsenal"),
             event_url: Some(String::from("https://matchbook.example/event")),
             deep_link_url: Some(String::from("https://matchbook.example/bet")),
+            betslip_event_id: Some(String::from("event-1")),
             betslip_market_id: Some(String::from("market-1")),
             betslip_selection_id: Some(String::from("runner-7")),
             buy_price: Some(2.14),
@@ -927,6 +1441,7 @@ mod tests {
             expected_price: 2.16,
             event_url: Some(String::from("https://matchbook.example/event")),
             deep_link_url: Some(String::from("https://matchbook.example/bet")),
+            betslip_event_id: Some(String::from("event-1")),
             betslip_market_id: Some(String::from("market-1")),
             betslip_selection_id: Some(String::from("runner-7")),
             execution_policy: TradingExecutionPolicy::new(TradingTimeInForce::GoodTilCancel),
@@ -934,5 +1449,39 @@ mod tests {
             source_context: Default::default(),
             notes: vec![String::from("runner_id:runner-7")],
         })
+    }
+
+    fn spawn_matchbook_test_server(responses: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept connection");
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer);
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+                stream.flush().expect("flush response");
+            }
+        });
+        format!("http://{}", address)
+    }
+
+    fn http_ok(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    fn http_error(status: u16, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {} ERROR\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            status,
+            body.len(),
+            body
+        )
     }
 }

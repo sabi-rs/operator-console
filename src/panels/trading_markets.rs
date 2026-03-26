@@ -15,7 +15,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let selected = app.selected_owls_endpoint().cloned();
     render_overview(frame, layout[0], app, selected.as_ref());
     render_endpoint_table(frame, body[0], app);
-    render_preview(
+    render_overlay_preview(
         frame,
         body[1],
         app.active_trading_section(),
@@ -28,16 +28,25 @@ pub fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    let popup = popup_area(area, 86, 78);
+    let popup = popup_area(area, 92, 84);
     frame.render_widget(Clear, popup);
     let block = section_block(section_title(app.active_trading_section()), accent_gold());
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let layout = Layout::vertical([Constraint::Length(9), Constraint::Min(10)]).split(inner);
+    let layout = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Length(9),
+        Constraint::Min(14),
+    ])
+    .split(inner);
+    let body = Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(layout[1]);
     let selected = app.selected_owls_endpoint();
-    render_selection_detail(frame, layout[0], selected);
-    render_preview(frame, layout[1], app.active_trading_section(), selected);
+    render_overlay_summary(frame, layout[0], app, selected);
+    render_selection_meta(frame, body[0], selected);
+    render_selection_request(frame, body[1], selected);
+    render_overlay_preview(frame, layout[2], app.active_trading_section(), selected);
 }
 
 fn render_overview(
@@ -66,11 +75,12 @@ fn render_overview(
     let selected_line = selected
         .map(|endpoint| {
             format!(
-                "{} {} [{}] rows {} polls {} Δ{}",
+                "{} {} [{}] rows {} quotes {} polls {} Δ{}",
                 endpoint.method,
                 endpoint.path,
                 endpoint.status,
                 endpoint.count,
+                endpoint.quotes.len(),
                 endpoint.poll_count,
                 endpoint.change_count
             )
@@ -89,6 +99,20 @@ fn render_overview(
             badge("Wait", &waiting.to_string(), accent_gold()),
             Span::raw("  "),
             badge("Err", &errors.to_string(), accent_red()),
+            Span::raw("  "),
+            badge(
+                "Books",
+                &selected
+                    .map(|endpoint| {
+                        if endpoint.books_returned.is_empty() {
+                            String::from("-")
+                        } else {
+                            endpoint.books_returned.len().to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| String::from("-")),
+                accent_gold(),
+            ),
             Span::raw("  "),
             badge("Chk", &owls.sync_checks.to_string(), accent_cyan()),
             Span::raw("  "),
@@ -177,60 +201,207 @@ fn render_endpoint_table(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_stateful_widget(table, area, app.owls_endpoint_table_state());
 }
 
-fn render_selection_detail(
+fn render_overlay_summary(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    selected: Option<&OwlsEndpointSummary>,
+) {
+    let Some(endpoint) = selected else {
+        let body = Paragraph::new("Select an endpoint to inspect the route, filters, and preview.")
+            .block(section_block("Inspect", accent_gold()))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(body, area);
+        return;
+    };
+
+    let body = Paragraph::new(vec![
+        Line::from(vec![
+            badge("Sport", app.owls_dashboard().sport.as_str(), accent_blue()),
+            Span::raw("  "),
+            badge("Group", endpoint.group.label(), group_color(endpoint.group)),
+            Span::raw("  "),
+            badge("State", &endpoint.status, status_color(&endpoint.status)),
+            Span::raw("  "),
+            badge("Rows", &endpoint.count.to_string(), accent_green()),
+            Span::raw("  "),
+            badge("Polls", &endpoint.poll_count.to_string(), accent_cyan()),
+            Span::raw("  "),
+            badge("Δ", &endpoint.change_count.to_string(), accent_pink()),
+        ]),
+        Line::from(vec![
+            Span::styled("Endpoint ", Style::default().fg(accent_cyan())),
+            Span::styled(
+                endpoint.label.as_str(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("Updated ", Style::default().fg(accent_gold())),
+            Span::raw(endpoint.updated_at.as_str().if_empty("-")),
+            Span::raw("  "),
+            Span::styled("Quotes ", Style::default().fg(accent_green())),
+            Span::raw(endpoint.quotes.len().to_string()),
+        ]),
+    ])
+    .block(section_block("Inspect", accent_gold()))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(body, area);
+}
+
+fn render_selection_meta(
     frame: &mut Frame<'_>,
     area: Rect,
     selected: Option<&OwlsEndpointSummary>,
 ) {
     let Some(endpoint) = selected else {
         let body = Paragraph::new("Select an endpoint to inspect the route and filters.")
-            .block(section_block("Endpoint Detail", accent_gold()))
+            .block(section_block("Overview", accent_gold()))
             .wrap(Wrap { trim: true });
         frame.render_widget(body, area);
         return;
     };
 
     let lines = vec![
+        Line::from(vec![Span::styled(
+            "About",
+            Style::default()
+                .fg(accent_cyan())
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::raw(truncate(&endpoint.description, 92)),
+        Line::raw(""),
+        Line::from(vec![Span::styled(
+            "Detail",
+            Style::default()
+                .fg(accent_cyan())
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::raw(truncate(&endpoint.detail, 92)),
+        Line::raw(""),
         Line::from(vec![
-            badge("Group", endpoint.group.label(), group_color(endpoint.group)),
-            Span::raw("  "),
-            badge("Rows", &endpoint.count.to_string(), accent_green()),
-            Span::raw("  "),
-            badge("Poll", &endpoint.poll_count.to_string(), accent_cyan()),
-            Span::raw("  "),
-            badge("Δ", &endpoint.change_count.to_string(), accent_pink()),
-            Span::raw("  "),
-            badge(
-                "Updated",
-                &endpoint.updated_at.as_str().if_empty("-"),
-                accent_gold(),
-            ),
+            Span::styled("Group", Style::default().fg(accent_cyan())),
+            Span::raw(format!(" {}", endpoint.group.label())),
         ]),
         Line::from(vec![
-            Span::styled("Route ", Style::default().fg(accent_cyan())),
-            Span::raw(format!("{} {}", endpoint.method, endpoint.path)),
+            Span::styled("Board", Style::default().fg(accent_cyan())),
+            Span::raw(format!(" {}", endpoint.label)),
         ]),
         Line::from(vec![
-            Span::styled("Filters ", Style::default().fg(accent_cyan())),
-            Span::raw(endpoint.query_hint.clone()),
+            Span::styled("Rows", Style::default().fg(accent_cyan())),
+            Span::raw(format!(" {}", endpoint.count)),
         ]),
         Line::from(vec![
-            Span::styled("Detail ", Style::default().fg(accent_cyan())),
-            Span::raw(truncate(&endpoint.detail, 84)),
+            Span::styled("Quotes", Style::default().fg(accent_cyan())),
+            Span::raw(format!(" {}", endpoint.quotes.len())),
         ]),
         Line::from(vec![
-            Span::styled("About ", Style::default().fg(accent_cyan())),
-            Span::raw(truncate(&endpoint.description, 82)),
+            Span::styled("Books", Style::default().fg(accent_cyan())),
+            Span::raw(format!(
+                " {} / {} returned",
+                endpoint.books_returned.len(),
+                endpoint
+                    .available_books
+                    .len()
+                    .max(endpoint.books_returned.len())
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled("Requested", Style::default().fg(accent_cyan())),
+            Span::raw(format!(
+                " {}",
+                endpoint.requested_books.join(", ").if_empty("all books")
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled("Freshness", Style::default().fg(accent_cyan())),
+            Span::raw(format!(
+                " age {}s{}",
+                endpoint
+                    .freshness_age_seconds
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| String::from("-")),
+                if endpoint.freshness_stale.unwrap_or(false) {
+                    " stale"
+                } else {
+                    ""
+                }
+            )),
         ]),
     ];
 
     let body = Paragraph::new(lines)
-        .block(section_block("Endpoint Detail", accent_gold()))
+        .block(section_block("Overview", accent_gold()))
         .wrap(Wrap { trim: true });
     frame.render_widget(body, area);
 }
 
-fn render_preview(
+fn render_selection_request(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    selected: Option<&OwlsEndpointSummary>,
+) {
+    let Some(endpoint) = selected else {
+        let body =
+            Paragraph::new("Request metadata will appear here once an endpoint is selected.")
+                .block(section_block("Request", accent_cyan()))
+                .wrap(Wrap { trim: true });
+        frame.render_widget(body, area);
+        return;
+    };
+
+    let lines = vec![
+        Line::from(vec![Span::styled(
+            "Route",
+            Style::default()
+                .fg(accent_cyan())
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::styled(
+            format!("{} {}", endpoint.method, endpoint.path),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::from(vec![Span::styled(
+            "Filters",
+            Style::default()
+                .fg(accent_cyan())
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::raw(endpoint.query_hint.as_str().if_empty("No query hints")),
+        Line::raw(""),
+        Line::from(vec![Span::styled(
+            "Resolved books",
+            Style::default()
+                .fg(accent_cyan())
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::raw(
+            endpoint
+                .books_returned
+                .join(", ")
+                .if_empty("No per-book metadata on this endpoint"),
+        ),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("Status", Style::default().fg(accent_cyan())),
+            Span::raw(format!(" {}", endpoint.status)),
+            Span::raw("   "),
+            Span::styled("Updated", Style::default().fg(accent_cyan())),
+            Span::raw(format!(" {}", endpoint.updated_at.as_str().if_empty("-"))),
+        ]),
+    ];
+
+    let body = Paragraph::new(lines)
+        .block(section_block("Request", accent_cyan()))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(body, area);
+}
+
+fn render_overlay_preview(
     frame: &mut Frame<'_>,
     area: Rect,
     section: TradingSection,
@@ -239,19 +410,71 @@ fn render_preview(
     let mut lines = Vec::new();
 
     match selected {
+        Some(endpoint) if !endpoint.quotes.is_empty() => {
+            for (index, quote) in endpoint.quotes.iter().take(8).enumerate() {
+                if index > 0 {
+                    lines.push(Line::raw(""));
+                }
+                let price = quote
+                    .decimal_price
+                    .map(|value| format!("{value:.2}"))
+                    .unwrap_or_else(|| String::from("-"));
+                let point = quote
+                    .point
+                    .map(|value| format!(" {value:+}"))
+                    .unwrap_or_default();
+                let limit = quote
+                    .limit_amount
+                    .map(|value| format!(" • limit {value:.0}"))
+                    .unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        truncate(&quote.event, 72),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{}{} @ {}", quote.selection, point, price),
+                        Style::default()
+                            .fg(accent_green())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("Book ", Style::default().fg(accent_cyan())),
+                    Span::raw(truncate(
+                        &format!("{} • {}{}", quote.book, quote.market_key, limit),
+                        108,
+                    )),
+                ]));
+            }
+        }
         Some(endpoint) if !endpoint.preview.is_empty() => {
-            for row in endpoint.preview.iter().take(10) {
-                lines.push(Line::styled(
-                    truncate(&row.label, 40),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                lines.push(Line::raw(format!(
-                    "{} | {}",
-                    truncate(&row.detail, 32),
-                    truncate(&row.metric, 24)
-                )));
+            for (index, row) in endpoint.preview.iter().take(8).enumerate() {
+                if index > 0 {
+                    lines.push(Line::raw(""));
+                }
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        truncate(&row.label, 72),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        row.metric.as_str().if_empty("-"),
+                        Style::default()
+                            .fg(accent_green())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("Context ", Style::default().fg(accent_cyan())),
+                    Span::raw(truncate(&row.detail, 108)),
+                ]));
             }
         }
         Some(endpoint) => lines.push(Line::raw(format!(
@@ -371,10 +594,13 @@ fn group_color(group: OwlsEndpointGroup) -> Color {
 }
 
 fn truncate(value: &str, limit: usize) -> String {
-    if value.len() <= limit {
+    if value.chars().count() <= limit {
         return value.to_string();
     }
-    format!("{}...", &value[..limit.saturating_sub(3)])
+
+    let cutoff = limit.saturating_sub(3);
+    let truncated = value.chars().take(cutoff).collect::<String>();
+    format!("{truncated}...")
 }
 
 fn accent_blue() -> Color {

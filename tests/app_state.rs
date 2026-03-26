@@ -274,6 +274,8 @@ fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {
             worst_case_pnl: 3.2,
             cash_out_venue: Some(String::from("smarkets")),
         }],
+        external_quotes: Vec::new(),
+        external_live_events: Vec::new(),
         horse_matcher: None,
     }
 }
