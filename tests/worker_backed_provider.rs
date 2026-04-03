@@ -17,26 +17,113 @@ use operator_console::trading_actions::{
 };
 use operator_console::transport::WorkerConfig;
 use operator_console::worker_client::{
-    BetRecorderWorkerClient, WorkerClient, WorkerClientExchangeProvider, WorkerRequest,
-    WorkerResponse,
+    WorkerClient, WorkerClientExchangeProvider, WorkerRequest, WorkerResponse,
 };
 
-fn project_root() -> PathBuf {
-    PathBuf::from("/home/thomas/projects/sabi/bet-recorder")
+fn fixture_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join(name)
+}
+
+fn sample_exchange_snapshot() -> ExchangePanelSnapshot {
+    let fixture = r#"{
+      "worker": {
+        "name": "bet-recorder",
+        "status": "ready",
+        "detail": "Loaded richer snapshot"
+      },
+      "venues": [
+        {
+          "id": "smarkets",
+          "label": "Smarkets",
+          "status": "ready",
+          "detail": "Richer snapshot loaded",
+          "event_count": 3,
+          "market_count": 2
+        }
+      ],
+      "selected_venue": "smarkets",
+      "events": [],
+      "markets": [],
+      "preflight": null,
+      "status_line": "Loaded richer snapshot",
+      "runtime": {
+        "updated_at": "2026-03-11T12:05:00Z",
+        "source": "watcher-state",
+        "decision_count": 2,
+        "watcher_iteration": 7,
+        "stale": false
+      },
+      "account_stats": {
+        "available_balance": 120.45,
+        "exposure": 41.63,
+        "unrealized_pnl": -0.49,
+        "currency": "GBP"
+      },
+      "open_positions": [
+        {
+          "event": "West Ham vs Man City",
+          "event_status": "27'|Premier League",
+          "event_url": "https://smarkets.com/football/england-premier-league/2026/03/14/20-00/west-ham-vs-manchester-city/44919693/",
+          "contract": "Draw",
+          "market": "Full-time result",
+          "price": 3.35,
+          "stake": 9.91,
+          "liability": 23.29,
+          "current_value": 9.60,
+          "pnl_amount": -0.31,
+          "current_back_odds": 2.80,
+          "current_implied_probability": 0.3571428571,
+          "current_implied_percentage": 35.71428571,
+          "current_score": "0-0",
+          "current_score_home": 0,
+          "current_score_away": 0,
+          "can_trade_out": true
+        }
+      ],
+      "historical_positions": [],
+      "other_open_bets": [
+        {
+          "label": "Arsenal",
+          "market": "Full-time result",
+          "side": "back",
+          "odds": 2.12,
+          "stake": 5.00,
+          "status": "Open"
+        }
+      ],
+      "decisions": [],
+      "watch": {
+        "position_count": 3,
+        "watch_count": 2,
+        "commission_rate": 0.0,
+        "target_profit": 1.0,
+        "stop_loss": 1.0,
+        "watches": []
+      },
+      "tracked_bets": [],
+      "exit_policy": {
+        "target_profit": 1.0,
+        "stop_loss": 1.0,
+        "hard_margin_call_profit_floor": null,
+        "warn_only_default": true
+      }
+    }"#;
+
+    serde_json::from_str(fixture).expect("sample exchange snapshot")
 }
 
 #[test]
 fn worker_backed_provider_maps_bet_recorder_snapshot() {
-    let client = BetRecorderWorkerClient::new(
-        PathBuf::from("/home/thomas/projects/sabi/bet-recorder/.venv/bin/python"),
-        project_root(),
-    );
+    let client = FixtureWorkerClient {
+        last_request: Arc::new(Mutex::new(None)),
+        snapshot: sample_exchange_snapshot(),
+    };
     let mut provider = WorkerClientExchangeProvider::new(
         client,
         WorkerConfig {
-            positions_payload_path: Some(PathBuf::from(
-                "/home/thomas/projects/sabi/console/operator-console/fixtures/smarkets-open-positions.json",
-            )),
+            positions_payload_path: Some(fixture_path("smarkets-open-positions.json")),
             run_dir: None,
             account_payload_path: None,
             open_bets_payload_path: None,
@@ -63,36 +150,28 @@ fn worker_backed_provider_maps_bet_recorder_snapshot() {
             .currency,
         "GBP"
     );
-    assert_eq!(snapshot.open_positions.len(), 3);
-    assert_eq!(snapshot.other_open_bets.len(), 2);
+    assert_eq!(snapshot.open_positions.len(), 1);
+    assert_eq!(snapshot.other_open_bets.len(), 1);
     assert_eq!(
         snapshot.watch.as_ref().expect("watch snapshot").watch_count,
         2
     );
-    assert!(snapshot.status_line.contains("bet-recorder"));
+    assert_eq!(snapshot.status_line, "Loaded richer snapshot");
 }
 
 #[test]
 fn worker_backed_provider_loads_latest_positions_snapshot_from_run_dir() {
     let run_dir = temp_run_dir("operator-console-run-dir");
-    fs::write(
-        run_dir.join("events.jsonl"),
-        concat!(
-            "{\"captured_at\":\"2026-03-11T11:00:00Z\",\"source\":\"smarkets_exchange\",\"kind\":\"positions_snapshot\",\"page\":\"open_positions\",\"url\":\"https://smarkets.com/open-positions\",\"document_title\":\"Open positions\",\"body_text\":\"Available balance £120.45 Exposure £41.63 Unrealized P/L -£0.49 Open Bets Back Arsenal Full-time result 2.12 £5.00 Open Lazio vs Sassuolo Sell Draw Full-time result 3.35 £9.91 £23.29 £33.20 £9.60 -£0.31 (3.13%) Order filled Trade out\",\"interactive_snapshot\":[],\"links\":[],\"inputs\":{},\"visible_actions\":[\"Trade out\"],\"resource_hosts\":[\"smarkets.com\"],\"local_storage_keys\":[],\"screenshot_path\":null,\"notes\":[]}\n",
-            "{\"captured_at\":\"2026-03-11T11:05:00Z\",\"source\":\"smarkets_exchange\",\"kind\":\"positions_snapshot\",\"page\":\"open_positions\",\"url\":\"https://smarkets.com/open-positions\",\"document_title\":\"Open positions\",\"body_text\":\"Available balance £150.00 Exposure £23.29 Unrealized P/L £2.10 Open Bets Back Arsenal Full-time result 2.12 £5.00 Open Back Both Teams To Score Bet Builder 1.74 £3.50 Open Lazio vs Sassuolo Sell 1 - 1 Correct score 7.2 £2.55 £15.81 £18.36 £2.46 -£0.09 (3.53%) Order filled Trade out Sell Draw Full-time result 3.35 £9.91 £23.29 £33.20 £9.60 -£0.31 (3.13%) Order filled Trade out\",\"interactive_snapshot\":[],\"links\":[],\"inputs\":{},\"visible_actions\":[\"Trade out\"],\"resource_hosts\":[\"smarkets.com\"],\"local_storage_keys\":[],\"screenshot_path\":null,\"notes\":[]}\n"
-        ),
-    )
-    .expect("events");
-
-    let client = BetRecorderWorkerClient::new(
-        PathBuf::from("/home/thomas/projects/sabi/bet-recorder/.venv/bin/python"),
-        project_root(),
-    );
+    let last_request = Arc::new(Mutex::new(None));
+    let client = FixtureWorkerClient {
+        last_request: last_request.clone(),
+        snapshot: sample_exchange_snapshot(),
+    };
     let mut provider = WorkerClientExchangeProvider::new(
         client,
         WorkerConfig {
             positions_payload_path: None,
-            run_dir: Some(run_dir),
+            run_dir: Some(run_dir.clone()),
             account_payload_path: None,
             open_bets_payload_path: None,
             companion_legs_path: None,
@@ -116,13 +195,31 @@ fn worker_backed_provider_loads_latest_positions_snapshot_from_run_dir() {
             .as_ref()
             .expect("account stats")
             .available_balance,
-        150.0
+        120.45
     );
-    assert_eq!(snapshot.open_positions.len(), 2);
-    assert_eq!(snapshot.other_open_bets.len(), 2);
+    assert_eq!(snapshot.open_positions.len(), 1);
+    assert_eq!(snapshot.other_open_bets.len(), 1);
     assert_eq!(
         snapshot.watch.as_ref().expect("watch snapshot").watch_count,
         2
+    );
+    assert_eq!(
+        *last_request.lock().expect("lock"),
+        Some(WorkerRequest::LoadDashboard {
+            config: WorkerConfig {
+                positions_payload_path: None,
+                run_dir: Some(run_dir),
+                account_payload_path: None,
+                open_bets_payload_path: None,
+                companion_legs_path: None,
+                agent_browser_session: None,
+                commission_rate: 0.0,
+                target_profit: 1.0,
+                stop_loss: 1.0,
+                hard_margin_call_profit_floor: None,
+                warn_only_default: true,
+            }
+        })
     );
 }
 
@@ -148,6 +245,21 @@ impl WorkerClient for RecordingWorkerClient {
                 exit_policy: ExitPolicySummary::default(),
                 ..ExchangePanelSnapshot::default()
             },
+            request_error: None,
+        })
+    }
+}
+
+struct FixtureWorkerClient {
+    last_request: Arc<Mutex<Option<WorkerRequest>>>,
+    snapshot: ExchangePanelSnapshot,
+}
+
+impl WorkerClient for FixtureWorkerClient {
+    fn send(&mut self, request: WorkerRequest) -> Result<WorkerResponse> {
+        *self.last_request.lock().expect("lock") = Some(request);
+        Ok(WorkerResponse {
+            snapshot: self.snapshot.clone(),
             request_error: None,
         })
     }
