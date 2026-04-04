@@ -239,15 +239,13 @@ impl HorseMatcherField {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HorseMatcherEditorState {
     selected_field_index: usize,
     pub editing: bool,
     pub buffer: String,
     pub replace_on_input: bool,
 }
-
 
 impl HorseMatcherEditorState {
     pub fn selected_field(&self) -> HorseMatcherField {

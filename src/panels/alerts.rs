@@ -67,7 +67,7 @@ fn render_summary(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ];
     frame.render_widget(
         Paragraph::new(lines)
-            .block(section_block("󰀨 Alerts", accent_blue()).padding(Padding::horizontal(1)))
+            .block(section_block("󰀨 Alerts", accent_blue()))
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -96,8 +96,8 @@ fn render_config_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ])
         .style(if field == selected {
             Style::default()
-                .fg(Color::Black)
-                .bg(accent_cyan())
+                .fg(selected_text())
+                .bg(selected_background())
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(text_color())
@@ -206,7 +206,7 @@ fn render_field_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ];
     frame.render_widget(
         Paragraph::new(lines)
-            .block(section_block("󰏬 Alert Detail", accent_gold()).padding(Padding::horizontal(1)))
+            .block(section_block("󰏬 Alert Detail", accent_gold()))
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -248,7 +248,7 @@ fn accent(value: bool) -> Color {
 fn section_block(title: &'static str, color: Color) -> Block<'static> {
     Block::default()
         .title(Span::styled(
-            title,
+            format!(" {} ", title),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -257,37 +257,45 @@ fn section_block(title: &'static str, color: Color) -> Block<'static> {
 }
 
 fn panel_background() -> Color {
-    Color::Rgb(16, 22, 30)
+    crate::theme::panel_background()
 }
 
 fn text_color() -> Color {
-    Color::Rgb(234, 240, 246)
+    crate::theme::text_color()
 }
 
 fn muted_text() -> Color {
-    Color::Rgb(152, 166, 181)
+    crate::theme::muted_text()
 }
 
 fn border_color() -> Color {
-    Color::Rgb(74, 88, 104)
+    crate::theme::border_color()
 }
 
 fn accent_blue() -> Color {
-    Color::Rgb(109, 180, 255)
+    crate::theme::accent_blue()
 }
 
 fn accent_cyan() -> Color {
-    Color::Rgb(94, 234, 212)
+    crate::theme::accent_cyan()
 }
 
 fn accent_green() -> Color {
-    Color::Rgb(134, 239, 172)
+    crate::theme::accent_green()
 }
 
 fn accent_gold() -> Color {
-    Color::Rgb(248, 208, 119)
+    crate::theme::accent_gold()
 }
 
 fn accent_red() -> Color {
-    Color::Rgb(248, 113, 113)
+    crate::theme::accent_red()
+}
+
+fn selected_background() -> Color {
+    crate::theme::selected_background()
+}
+
+fn selected_text() -> Color {
+    crate::theme::selected_text()
 }

@@ -369,8 +369,8 @@ fn render_table(
     ])
     .style(
         Style::default()
-            .fg(Color::Black)
-            .bg(accent_cyan())
+            .fg(selected_text())
+            .bg(selected_background())
             .add_modifier(Modifier::BOLD),
     );
 
@@ -434,8 +434,8 @@ fn render_table(
     ))
     .row_highlight_style(
         Style::default()
-            .bg(accent_blue())
-            .fg(Color::Black)
+            .bg(selected_background())
+            .fg(selected_text())
             .add_modifier(Modifier::BOLD),
     )
     .highlight_symbol(if rows.is_empty() { "  " } else { "● " });
@@ -615,12 +615,12 @@ fn preset_chip_line(app: &App, field: OddsMatcherField) -> Line<'static> {
 fn preset_chip_span(label: String, selected: bool, active: bool) -> Span<'static> {
     let style = if active && selected {
         Style::default()
-            .fg(Color::Black)
+            .fg(on_color(accent_gold()))
             .bg(accent_gold())
             .add_modifier(Modifier::BOLD)
     } else if active {
         Style::default()
-            .fg(Color::Black)
+            .fg(on_color(accent_blue()))
             .bg(accent_blue())
             .add_modifier(Modifier::BOLD)
     } else {
@@ -658,7 +658,7 @@ fn displayed_field_value(app: &App, field: OddsMatcherField) -> String {
 fn selected_filter_style(app: &App) -> Style {
     if app.oddsmatcher_focus() == OddsMatcherFocus::Filters {
         Style::default()
-            .fg(Color::Black)
+            .fg(on_color(accent_gold()))
             .bg(accent_gold())
             .add_modifier(Modifier::BOLD)
     } else {
@@ -670,7 +670,7 @@ fn badge<'a>(label: &'a str, value: &'a str, accent: Color) -> Span<'a> {
     Span::styled(
         format!(" {label}: {value} "),
         Style::default()
-            .fg(Color::Black)
+            .fg(on_color(accent))
             .bg(accent)
             .add_modifier(Modifier::BOLD),
     )
@@ -722,7 +722,7 @@ fn timeframe_span(app: &App, seconds: u64, label: &'static str) -> Span<'static>
         Span::styled(
             label,
             Style::default()
-                .fg(Color::Black)
+                .fg(on_color(accent_blue()))
                 .bg(accent_blue())
                 .add_modifier(Modifier::BOLD),
         )
@@ -743,19 +743,22 @@ fn short_bookmaker_name(name: &str) -> String {
 
 fn rating_style(rating: f64) -> Style {
     if rating >= 99.0 {
+        let bg = accent_red();
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(214, 69, 65))
+            .fg(on_color(bg))
+            .bg(bg)
             .add_modifier(Modifier::BOLD)
     } else if rating >= 97.0 {
+        let bg = accent_gold();
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(248, 208, 119))
+            .fg(on_color(bg))
+            .bg(bg)
             .add_modifier(Modifier::BOLD)
     } else {
+        let bg = accent_green();
         Style::default()
-            .fg(Color::Black)
-            .bg(accent_green())
+            .fg(on_color(bg))
+            .bg(bg)
             .add_modifier(Modifier::BOLD)
     }
 }
@@ -768,7 +771,7 @@ fn card_block(title: &'static str, accent: Color, selected: bool) -> Block<'stat
     };
     Block::default()
         .title(Span::styled(
-            title,
+            format!(" {} ", title),
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -779,7 +782,7 @@ fn card_block(title: &'static str, accent: Color, selected: bool) -> Block<'stat
 fn section_block(title: &'static str, accent: Color) -> Block<'static> {
     Block::default()
         .title(Span::styled(
-            title,
+            format!(" {} ", title),
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -828,41 +831,57 @@ fn parse_isoish_start(value: &str) -> Option<(String, String)> {
 }
 
 fn panel_background() -> Color {
-    Color::Rgb(16, 22, 30)
+    crate::theme::panel_background()
 }
 
 fn elevated_background() -> Color {
-    Color::Rgb(21, 29, 39)
+    crate::theme::elevated_background()
 }
 
 fn text_color() -> Color {
-    Color::Rgb(234, 240, 246)
+    crate::theme::text_color()
 }
 
 fn muted_text() -> Color {
-    Color::Rgb(156, 171, 188)
+    crate::theme::muted_text()
 }
 
 fn border_color() -> Color {
-    Color::Rgb(74, 88, 104)
+    crate::theme::border_color()
 }
 
 fn accent_blue() -> Color {
-    Color::Rgb(109, 180, 255)
+    crate::theme::accent_blue()
 }
 
 fn accent_cyan() -> Color {
-    Color::Rgb(94, 234, 212)
+    crate::theme::accent_cyan()
 }
 
 fn accent_green() -> Color {
-    Color::Rgb(134, 239, 172)
+    crate::theme::accent_green()
 }
 
 fn accent_gold() -> Color {
-    Color::Rgb(248, 208, 119)
+    crate::theme::accent_gold()
 }
 
 fn accent_pink() -> Color {
-    Color::Rgb(244, 143, 177)
+    crate::theme::accent_pink()
+}
+
+fn accent_red() -> Color {
+    crate::theme::accent_red()
+}
+
+fn selected_background() -> Color {
+    crate::theme::selected_background()
+}
+
+fn selected_text() -> Color {
+    crate::theme::selected_text()
+}
+
+fn on_color(color: Color) -> Color {
+    crate::theme::contrast_text(color)
 }

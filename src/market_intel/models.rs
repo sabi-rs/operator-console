@@ -1,31 +1,49 @@
 use crate::market_normalization::normalize_key;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[derive(Default)]
-pub enum MarketIntelSourceId {
-    #[default]
-    Oddsentry,
-    FairOdds,
-}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MarketIntelSourceId(String);
 
 impl MarketIntelSourceId {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Oddsentry => "Oddsentry",
-            Self::FairOdds => "FairOdds",
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(normalize_market_intel_source_key(&value.into()))
+    }
+
+    pub fn oddsentry() -> Self {
+        Self::new("oddsentry")
+    }
+
+    pub fn fair_odds() -> Self {
+        Self::new("fair_odds")
+    }
+
+    pub fn odds_api() -> Self {
+        Self::new("odds_api")
+    }
+
+    pub fn label(&self) -> &str {
+        match self.key() {
+            "oddsentry" => "Oddsentry",
+            "fair_odds" => "FairOdds",
+            "odds_api" => "The Odds API",
+            other => other,
         }
     }
 
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Oddsentry => "oddsentry",
-            Self::FairOdds => "fairodds",
-        }
+    pub fn key(&self) -> &str {
+        &self.0
     }
 }
 
+fn normalize_market_intel_source_key(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "oddsapi" | "odds_api" | "the-odds-api" => String::from("odds_api"),
+        "fairodds" | "fair_odds" => String::from("fair_odds"),
+        "oddsentry" => String::from("oddsentry"),
+        other => other.to_string(),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,7 +69,6 @@ impl OpportunityKind {
     }
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
@@ -69,7 +86,6 @@ impl SourceLoadMode {
         }
     }
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -91,7 +107,6 @@ impl SourceHealthStatus {
     }
 }
 
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceHealth {
     pub source: MarketIntelSourceId,
@@ -99,6 +114,22 @@ pub struct SourceHealth {
     pub status: SourceHealthStatus,
     pub detail: String,
     pub refreshed_at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SportDashboard {
+    pub sport_key: String,
+    pub sport_title: String,
+    pub group_name: String,
+    pub active: bool,
+    pub primary_source: MarketIntelSourceId,
+    pub primary_refreshed_at: Option<String>,
+    pub fallback_available: bool,
+    pub event_count: usize,
+    pub quote_count: usize,
+    pub arbitrage_count: usize,
+    pub positive_ev_count: usize,
+    pub value_count: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -334,6 +365,12 @@ pub struct MarketIntelDashboard {
     pub refreshed_at: String,
     pub status_line: String,
     pub sources: Vec<SourceHealth>,
+    #[serde(default)]
+    pub sports: Vec<SportDashboard>,
+    #[serde(default)]
+    pub total_events: usize,
+    #[serde(default)]
+    pub total_opportunities: usize,
     pub markets: Vec<MarketOpportunityRow>,
     pub arbitrages: Vec<MarketOpportunityRow>,
     pub plus_ev: Vec<MarketOpportunityRow>,

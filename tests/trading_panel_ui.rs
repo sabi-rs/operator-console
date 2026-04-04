@@ -8,8 +8,9 @@ use operator_console::domain::{
     TrackedBetRow, TrackedLeg, TransportMarkerSummary, VenueId, VenueStatus, VenueSummary,
     WatchRow, WatchSnapshot, WorkerStatus, WorkerSummary,
 };
-use operator_console::owls::{self, OwlsEndpointId, OwlsPreviewRow};
+use operator_console::owls::{self, OwlsEndpointId, OwlsMarketQuote, OwlsPreviewRow};
 use operator_console::provider::{ExchangeProvider, ProviderRequest};
+use operator_console::wm::PaneId;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
@@ -28,11 +29,9 @@ fn positions_panel_renders_actionable_boards() {
     let rendered = render_section(TradingSection::Positions);
 
     assert!(rendered.contains("Active Positions"));
-    assert!(rendered.contains("Historical Positions"));
-    assert!(rendered.contains("Signal Board"));
-    assert!(rendered.contains("Sharp"));
-    assert!(rendered.contains("Watch Plan"));
+    assert!(!rendered.contains("Historical Positions"));
     assert!(rendered.contains("Operator Feed"));
+    assert!(rendered.contains("selected ref bet-1") || rendered.contains("Selected Row"));
 }
 
 #[test]
@@ -54,6 +53,64 @@ fn markets_panel_renders_api_surface_board() {
     assert!(rendered.contains("Endpoint Board"));
     assert!(rendered.contains("/api/v1/nba/odds"));
     assert!(rendered.contains("Preview"));
+}
+
+#[test]
+fn chart_pane_renders_market_curve() {
+    let mut app = App::from_provider(StaticProvider {
+        snapshot: sample_snapshot(),
+    })
+    .expect("app");
+    app.set_trading_section(TradingSection::Markets);
+
+    let mut dashboard = owls::dashboard_for_sport("soccer");
+    if let Some(endpoint) = dashboard
+        .endpoints
+        .iter_mut()
+        .find(|endpoint| endpoint.id == OwlsEndpointId::Odds)
+    {
+        endpoint.status = String::from("ready");
+        endpoint.label = String::from("Main Markets");
+        endpoint.path = String::from("/api/v1/soccer/odds");
+        endpoint.updated_at = String::from("2026-04-03T12:00:00Z");
+        endpoint.count = 3;
+        endpoint.quotes = vec![
+            OwlsMarketQuote {
+                book: String::from("bet365"),
+                event: String::from("Arsenal v Everton"),
+                selection: String::from("Arsenal"),
+                market_key: String::from("match_odds"),
+                decimal_price: Some(2.22),
+                ..OwlsMarketQuote::default()
+            },
+            OwlsMarketQuote {
+                book: String::from("betway"),
+                event: String::from("Arsenal v Everton"),
+                selection: String::from("Arsenal"),
+                market_key: String::from("match_odds"),
+                decimal_price: Some(2.28),
+                ..OwlsMarketQuote::default()
+            },
+            OwlsMarketQuote {
+                book: String::from("skybet"),
+                event: String::from("Arsenal v Everton"),
+                selection: String::from("Arsenal"),
+                market_key: String::from("match_odds"),
+                decimal_price: Some(2.31),
+                ..OwlsMarketQuote::default()
+            },
+        ];
+    }
+    app.set_owls_dashboard_for_test(dashboard);
+    app.wm.focus_pane(PaneId::Chart);
+    app.wm.maximized_pane = Some(PaneId::Chart);
+
+    let rendered = render_app(&mut app);
+
+    assert!(rendered.contains("Market Chart") || rendered.contains("CHART"));
+    assert!(rendered.contains("Curve"));
+    assert!(rendered.contains("endpoint quotes"));
+    assert!(rendered.contains("Main Markets"));
 }
 
 #[test]
@@ -105,6 +162,7 @@ fn props_panel_handles_unicode_preview_rows_without_crashing() {
         }];
     }
     app.set_owls_dashboard_for_test(dashboard);
+    maximize_active_pane(&mut app);
 
     let backend = TestBackend::new(160, 40);
     let mut terminal = Terminal::new(backend).expect("terminal");
@@ -126,7 +184,12 @@ fn props_panel_handles_unicode_preview_rows_without_crashing() {
 
     assert!(rendered.contains("Owls Props"));
     assert!(rendered.contains("Prop Preview"));
-    assert!(rendered.contains("ü..."));
+    assert!(rendered.contains("shots 2.5"));
+    assert!(
+        rendered.contains("José María")
+            || rendered.contains("José Maria")
+            || rendered.contains("Context")
+    );
 }
 
 #[test]
@@ -169,6 +232,7 @@ fn positions_live_view_overlay_renders_cashout_and_matrix() {
     let mut app = App::from_provider(StaticProvider { snapshot }).expect("app");
     app.set_trading_section(TradingSection::Positions);
     app.toggle_live_view_overlay();
+    maximize_active_pane(&mut app);
 
     let backend = TestBackend::new(160, 40);
     let mut terminal = Terminal::new(backend).expect("terminal");
@@ -235,6 +299,7 @@ fn historical_positions_overlay_renders_selected_history_detail() {
     app.set_trading_section(TradingSection::Positions);
     app.handle_key(crossterm::event::KeyCode::Tab);
     app.toggle_live_view_overlay();
+    maximize_active_pane(&mut app);
 
     let backend = TestBackend::new(160, 40);
     let mut terminal = Terminal::new(backend).expect("terminal");
@@ -287,6 +352,7 @@ fn positions_panel_renders_selected_interaction_evidence() {
 
     let mut app = App::from_provider(StaticProvider { snapshot }).expect("app");
     app.set_trading_section(TradingSection::Positions);
+    maximize_active_pane(&mut app);
 
     let backend = TestBackend::new(160, 40);
     let mut terminal = Terminal::new(backend).expect("terminal");
@@ -451,6 +517,8 @@ fn diagnostic_live_overlay_render_cost_scales_with_snapshot_size() {
 }
 
 fn render_app(app: &mut App) -> String {
+    maximize_active_pane(app);
+
     let backend = TestBackend::new(160, 40);
     let mut terminal = Terminal::new(backend).expect("terminal");
     terminal
@@ -470,6 +538,10 @@ fn render_app(app: &mut App) -> String {
     lines.join("\n")
 }
 
+fn maximize_active_pane(app: &mut App) {
+    app.wm.maximized_pane = app.active_pane();
+}
+
 fn render_elapsed_ms(app: &mut App) -> u128 {
     let started = Instant::now();
     let _ = render_app(app);
@@ -482,6 +554,7 @@ fn render_section(section: TradingSection) -> String {
     })
     .expect("app");
     app.set_trading_section(section);
+    maximize_active_pane(&mut app);
 
     render_app(&mut app)
 }

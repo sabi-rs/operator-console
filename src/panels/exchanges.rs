@@ -141,8 +141,8 @@ fn render_venue_list(
         .highlight_symbol("● ")
         .highlight_style(
             Style::default()
-                .fg(Color::Black)
-                .bg(accent_cyan())
+                .fg(selected_text())
+                .bg(selected_background())
                 .add_modifier(Modifier::BOLD),
         )
         .repeat_highlight_symbol(true);
@@ -438,11 +438,10 @@ fn ratio(numerator: f64, denominator: f64) -> f64 {
 fn section_block(title: &'static str, color: Color) -> Block<'static> {
     Block::default()
         .title(Span::styled(
-            title,
+            format!(" {} ", title),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
-        .padding(Padding::horizontal(1))
         .style(Style::default().bg(panel_background()).fg(text_color()))
         .border_style(Style::default().fg(border_color()))
 }
@@ -456,41 +455,49 @@ fn venue_status_color(status: VenueStatus) -> Color {
 }
 
 fn panel_background() -> Color {
-    Color::Rgb(16, 22, 30)
+    crate::theme::panel_background()
 }
 
 fn border_color() -> Color {
-    Color::Rgb(48, 64, 86)
+    crate::theme::border_color()
 }
 
 fn text_color() -> Color {
-    Color::Rgb(234, 240, 246)
+    crate::theme::text_color()
 }
 
 fn muted_text() -> Color {
-    Color::Rgb(148, 163, 184)
+    crate::theme::muted_text()
 }
 
 fn accent_blue() -> Color {
-    Color::Rgb(104, 179, 255)
+    crate::theme::accent_blue()
 }
 
 fn accent_cyan() -> Color {
-    Color::Rgb(110, 231, 255)
+    crate::theme::accent_cyan()
 }
 
 fn accent_green() -> Color {
-    Color::Rgb(90, 214, 154)
+    crate::theme::accent_green()
 }
 
 fn accent_gold() -> Color {
-    Color::Rgb(245, 196, 89)
+    crate::theme::accent_gold()
 }
 
 fn accent_pink() -> Color {
-    Color::Rgb(255, 122, 162)
+    crate::theme::accent_pink()
 }
 
 fn accent_red() -> Color {
-    Color::Rgb(255, 107, 107)
+    crate::theme::accent_red()
+}
+
+fn selected_background() -> Color {
+    crate::theme::selected_background()
+}
+
+fn selected_text() -> Color {
+    crate::theme::selected_text()
 }

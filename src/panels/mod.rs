@@ -1,5 +1,6 @@
 pub mod alerts;
 pub mod calculator;
+pub mod chart;
 pub mod exchanges;
 pub mod horse_matcher;
 pub mod intel;

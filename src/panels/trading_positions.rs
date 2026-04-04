@@ -3,9 +3,7 @@ use std::collections::BTreeSet;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
 use crate::app::PositionsFocus;
@@ -58,8 +56,8 @@ pub fn render(
     let selected_signal_action = selected_active
         .map(active_action_label)
         .unwrap_or_else(|| String::from("-"));
-    let layout = Layout::vertical([Constraint::Length(6), Constraint::Min(18)]).split(area);
-    let body = Layout::horizontal([Constraint::Percentage(71), Constraint::Percentage(29)])
+    let layout = Layout::vertical([Constraint::Length(5), Constraint::Min(18)]).split(area);
+    let body = Layout::horizontal([Constraint::Percentage(76), Constraint::Percentage(24)])
         .split(layout[1]);
     let (active_height, historical_height) =
         position_section_heights(snapshot, body[0].height.max(14));
@@ -68,12 +66,7 @@ pub fn render(
         Constraint::Length(historical_height),
     ])
     .split(body[0]);
-    let right = Layout::vertical([
-        Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Min(6),
-    ])
-    .split(body[1]);
+    let right = Layout::vertical([Constraint::Length(11), Constraint::Min(8)]).split(body[1]);
 
     render_summary(
         frame,
@@ -94,22 +87,18 @@ pub fn render(
         left[0],
         &active_title,
         vec![
-            Constraint::Percentage(18),
-            Constraint::Percentage(21),
-            Constraint::Length(10),
-            Constraint::Length(5),
-            Constraint::Length(11),
-            Constraint::Length(11),
-            Constraint::Length(3),
-            Constraint::Length(10),
-            Constraint::Length(8),
-            Constraint::Min(12),
+            Constraint::Percentage(20), // Event
+            Constraint::Percentage(25), // Position
+            Constraint::Length(8),      // Hold
+            Constraint::Length(6),      // Lock
+            Constraint::Length(10),     // Prob
+            Constraint::Length(10),     // Trigger
+            Constraint::Length(8),      // Action
+            Constraint::Length(10),     // Interaction
+            Constraint::Min(10),        // Metadata
         ],
         active_position_rows(snapshot, &active_views),
-        empty_row(
-            "No active positions are loaded. Start the recorder or refresh the provider.",
-            10,
-        ),
+        empty_row("No active positions are loaded.", 9),
         active_table_state,
     );
     let historical_title = positions_table_title(
@@ -149,32 +138,9 @@ pub fn render(
         &selected_signal_action,
         &selected_signal_sharp,
     );
-    render_table(
-        frame,
-        right[1],
-        &format!(
-            "󰄦 Watch Plan ({})",
-            snapshot
-                .watch
-                .as_ref()
-                .map(|watch| watch.watch_count)
-                .unwrap_or(0)
-        ),
-        vec![
-            Constraint::Percentage(26),
-            Constraint::Percentage(24),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Length(8),
-        ],
-        watch_rows(snapshot),
-        empty_row("No grouped watch plan is loaded.", 6),
-        None,
-    );
     render_operator_log(
         frame,
-        right[2],
+        right[1],
         snapshot,
         selected_active,
         status_message,
@@ -195,6 +161,158 @@ pub fn render(
                 selected_active,
             );
         }
+    }
+}
+
+pub fn render_live_pane(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &ExchangePanelSnapshot,
+    owls_dashboard: &OwlsDashboard,
+    matchbook_account_state: Option<&MatchbookAccountState>,
+    active_table_state: &mut TableState,
+    historical_table_state: &mut TableState,
+    positions_focus: PositionsFocus,
+    show_live_view_overlay: bool,
+    status_message: &str,
+    status_scroll: u16,
+) {
+    let active_views = active_position_views(snapshot);
+    let exit_recommendations = derived_exit_recommendations(snapshot);
+    let selected_active = selected_active_position(&active_views, active_table_state);
+    let selected_active_quotes = selected_active
+        .map(|view| active_matching_external_quotes(snapshot, view))
+        .unwrap_or_default();
+    let selected_signal_sharp = selected_active
+        .map(|view| {
+            active_sharp_quote_label_from_quotes(
+                &selected_active_quotes,
+                view,
+                &owls_dashboard.sport,
+            )
+        })
+        .unwrap_or_else(|| String::from("-"));
+    let selected_active_rows_cache = selected_active
+        .map(|view| selected_active_rows(snapshot, view, &selected_signal_sharp))
+        .unwrap_or_else(empty_selected_rows);
+
+    let layout = Layout::vertical([
+        Constraint::Length(5),
+        Constraint::Min(8),
+        Constraint::Length(8),
+    ])
+    .split(area);
+    render_summary(
+        frame,
+        layout[0],
+        snapshot,
+        &exit_recommendations,
+        selected_active_rows_cache,
+        selected_historical_position(snapshot, historical_table_state),
+        PositionsFocus::Active,
+    );
+    let active_title = positions_table_title(
+        "󰞇 Active Positions",
+        active_views.len(),
+        positions_focus == PositionsFocus::Active,
+    );
+    render_stateful_table(
+        frame,
+        layout[1],
+        &active_title,
+        vec![
+            Constraint::Percentage(20),
+            Constraint::Percentage(25),
+            Constraint::Length(8),
+            Constraint::Length(6),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Min(10),
+        ],
+        active_position_rows(snapshot, &active_views),
+        empty_row("No active positions are loaded.", 9),
+        active_table_state,
+    );
+    render_operator_log(
+        frame,
+        layout[2],
+        snapshot,
+        selected_active,
+        status_message,
+        PositionsFocus::Active,
+        status_scroll,
+    );
+
+    if show_live_view_overlay && positions_focus == PositionsFocus::Active {
+        render_live_view_overlay(
+            frame,
+            area,
+            snapshot,
+            owls_dashboard,
+            matchbook_account_state,
+            selected_active,
+        );
+    }
+}
+
+pub fn render_history_pane(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &ExchangePanelSnapshot,
+    _owls_dashboard: &OwlsDashboard,
+    _matchbook_account_state: Option<&MatchbookAccountState>,
+    _active_table_state: &mut TableState,
+    historical_table_state: &mut TableState,
+    positions_focus: PositionsFocus,
+    show_live_view_overlay: bool,
+    _status_message: &str,
+    _status_scroll: u16,
+) {
+    let selected_historical = selected_historical_position(snapshot, historical_table_state);
+    let layout = Layout::vertical([Constraint::Length(5), Constraint::Min(8)]).split(area);
+    render_summary(
+        frame,
+        layout[0],
+        snapshot,
+        &derived_exit_recommendations(snapshot),
+        empty_selected_rows(),
+        selected_historical,
+        PositionsFocus::Historical,
+    );
+    let historical_title = positions_table_title(
+        "󰋪 Historical Positions",
+        snapshot.historical_positions.len(),
+        positions_focus == PositionsFocus::Historical,
+    );
+    let history_empty = if snapshot.historical_positions.is_empty() {
+        "No historical positions are loaded. Import ledger history to populate this section."
+    } else {
+        "Historical selection is out of range."
+    };
+    render_table(
+        frame,
+        layout[1],
+        &historical_title,
+        vec![
+            Constraint::Percentage(18),
+            Constraint::Percentage(22),
+            Constraint::Length(10),
+            Constraint::Length(5),
+            Constraint::Length(5),
+            Constraint::Length(8),
+            Constraint::Length(3),
+            Constraint::Length(8),
+            Constraint::Min(12),
+        ],
+        historical_position_rows(snapshot),
+        empty_row(history_empty, 9),
+        Some(historical_table_state),
+    );
+
+    if show_live_view_overlay && positions_focus == PositionsFocus::Historical {
+        render_historical_view_overlay(frame, area, snapshot, selected_historical);
     }
 }
 
@@ -786,10 +904,20 @@ fn render_signal_board(
         .unwrap_or_else(|| String::from("no exit trigger"));
     let (recent_interactions, pending_interactions, issue_interactions) =
         active_interaction_summary(snapshot);
+    let watch_count = snapshot
+        .watch
+        .as_ref()
+        .map(|watch| watch.watch_count)
+        .unwrap_or(0);
     let rows = vec![
         ("󰘳 Next", next_action, accent_gold()),
         ("󱂬 Selected", selected_action.to_string(), accent_green()),
         ("󰇚 Sharp", selected_sharp.to_string(), accent_blue()),
+        (
+            "󰄦 Watch",
+            format!("{} grouped rows", watch_count),
+            accent_cyan(),
+        ),
         (
             "󰐊 I/O",
             format!(
@@ -961,16 +1089,15 @@ fn active_position_rows(
         .copied()
         .map(|view| {
             Row::new(vec![
-                Cell::from(truncate_text(&active_event_label(view), 28)),
-                Cell::from(truncate_text(&active_position_label(view), 34)),
-                Cell::from(active_date_label(view)),
-                Cell::from(active_time_label(view)),
+                Cell::from(truncate_text(&active_event_label(view), 24)),
+                Cell::from(truncate_text(&active_position_label(view), 30)),
                 Cell::from(active_hold_label(view)),
                 Cell::from(active_lock_label(view)),
-                active_action_cell(view),
-                active_interaction_cell(snapshot, view),
                 Cell::from(active_probability_label(view)),
                 Cell::from(active_trigger_label(view)),
+                active_action_cell(view),
+                active_interaction_cell(snapshot, view),
+                Cell::from(""), // Metadata placeholder
             ])
         })
         .collect()
@@ -1081,6 +1208,7 @@ fn watch_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'static>> {
     rows
 }
 
+#[allow(dead_code)]
 fn watch_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
     let active_views = active_position_views(snapshot);
     if active_views.is_empty() {
@@ -1115,6 +1243,7 @@ fn watch_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
         .collect()
 }
 
+#[allow(dead_code)]
 fn has_paired_active_position(active_views: &[ActivePositionView<'_>]) -> bool {
     active_views
         .iter()
@@ -1175,6 +1304,7 @@ fn legacy_watch_lines(snapshot: &ExchangePanelSnapshot) -> Vec<Line<'static>> {
     rows
 }
 
+#[allow(dead_code)]
 fn legacy_watch_rows(snapshot: &ExchangePanelSnapshot) -> Vec<Row<'static>> {
     let Some(watch) = &snapshot.watch else {
         return Vec::new();
@@ -2710,8 +2840,8 @@ fn render_table(
             Row::new(table_header(title))
                 .style(
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(accent_cyan())
+                        .fg(selected_text())
+                        .bg(selected_background())
                         .add_modifier(Modifier::BOLD),
                 )
                 .bottom_margin(1),
@@ -2723,8 +2853,8 @@ fn render_table(
             table
                 .row_highlight_style(
                     Style::default()
-                        .bg(Color::Rgb(28, 39, 52))
-                        .fg(Color::Rgb(255, 255, 255))
+                        .bg(selected_background())
+                        .fg(selected_text())
                         .add_modifier(Modifier::BOLD),
                 )
                 .highlight_symbol("● "),
@@ -2963,7 +3093,7 @@ fn render_live_view_overlay(
             Span::styled("Position ", Style::default().fg(muted_text())),
             Span::styled(
                 active_position_label(view),
-                Style::default().fg(Color::White),
+                Style::default().fg(text_color()),
             ),
             Span::raw("   "),
             Span::styled("Action ", Style::default().fg(muted_text())),
@@ -3406,7 +3536,7 @@ fn render_live_decision_matrix(
         Row::new(vec!["Scenario", "Hold", "Half", "Best Exit"])
             .style(
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(on_color(accent_cyan()))
                     .bg(accent_cyan())
                     .add_modifier(Modifier::BOLD),
             )
@@ -3507,23 +3637,18 @@ fn render_stateful_table(
     let table = Table::new(rows, widths)
         .header(
             Row::new(table_header(title))
-                .style(
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(accent_cyan())
-                        .add_modifier(Modifier::BOLD),
-                )
+                .style(Style::default().fg(muted_text()))
                 .bottom_margin(1),
         )
-        .block(section_block(title, accent_blue()))
+        .block(section_block(title, muted_text()))
         .column_spacing(1)
         .row_highlight_style(
             Style::default()
-                .bg(Color::Rgb(28, 39, 52))
-                .fg(Color::Rgb(255, 255, 255))
+                .bg(Color::Rgb(20, 20, 20))
+                .fg(text_color())
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("● ");
+        .highlight_symbol("  ");
     frame.render_stateful_widget(table, area, table_state);
 }
 
@@ -3968,17 +4093,12 @@ fn pnl_color(value: f64) -> Color {
 fn section_block(title: &str, accent: Color) -> Block<'_> {
     Block::default()
         .title(Span::styled(
-            title.to_string(),
+            format!(" {} ", title),
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
-        .padding(Padding::horizontal(1))
-        .style(
-            Style::default()
-                .bg(Color::Rgb(16, 22, 30))
-                .fg(Color::Rgb(234, 240, 246)),
-        )
-        .border_style(Style::default().fg(Color::Rgb(74, 88, 104)))
+        .style(Style::default().bg(panel_background()).fg(text_color()))
+        .border_style(Style::default().fg(border_color()))
 }
 
 fn positions_table_title(label: &str, count: usize, focused: bool) -> String {
@@ -3987,31 +4107,55 @@ fn positions_table_title(label: &str, count: usize, focused: bool) -> String {
 }
 
 fn muted_text() -> Color {
-    Color::Rgb(152, 166, 181)
+    crate::theme::muted_text()
+}
+
+fn panel_background() -> Color {
+    crate::theme::panel_background()
+}
+
+fn border_color() -> Color {
+    crate::theme::border_color()
+}
+
+fn text_color() -> Color {
+    crate::theme::text_color()
+}
+
+fn selected_background() -> Color {
+    crate::theme::selected_background()
+}
+
+fn selected_text() -> Color {
+    crate::theme::selected_text()
 }
 
 fn accent_blue() -> Color {
-    Color::Rgb(109, 180, 255)
+    crate::theme::accent_blue()
 }
 
 fn accent_cyan() -> Color {
-    Color::Rgb(94, 234, 212)
+    crate::theme::accent_cyan()
 }
 
 fn accent_green() -> Color {
-    Color::Rgb(134, 239, 172)
+    crate::theme::accent_green()
 }
 
 fn accent_gold() -> Color {
-    Color::Rgb(248, 208, 119)
+    crate::theme::accent_gold()
 }
 
 fn accent_pink() -> Color {
-    Color::Rgb(244, 143, 177)
+    crate::theme::accent_pink()
 }
 
 fn accent_red() -> Color {
-    Color::Rgb(248, 113, 113)
+    crate::theme::accent_red()
+}
+
+fn on_color(color: Color) -> Color {
+    crate::theme::contrast_text(color)
 }
 
 #[cfg(test)]

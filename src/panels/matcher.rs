@@ -21,8 +21,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .style(Style::default().fg(muted_text()).bg(panel_background()))
         .highlight_style(
             Style::default()
-                .fg(Color::Black)
-                .bg(accent_cyan())
+                .fg(selected_text())
+                .bg(selected_background())
                 .add_modifier(Modifier::BOLD),
         )
         .divider("│");
@@ -66,7 +66,7 @@ fn register_tab_targets(area: Rect, titles: &[&str]) -> Vec<Rect> {
 fn section_block(title: &'static str, accent: Color) -> Block<'static> {
     Block::default()
         .title(Span::styled(
-            title,
+            format!(" {} ", title),
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -75,29 +75,33 @@ fn section_block(title: &'static str, accent: Color) -> Block<'static> {
 }
 
 fn panel_background() -> Color {
-    Color::Rgb(11, 17, 24)
+    crate::theme::panel_background()
 }
 
 fn text_color() -> Color {
-    Color::Rgb(230, 235, 245)
+    crate::theme::text_color()
 }
 
 fn muted_text() -> Color {
-    Color::Rgb(129, 147, 169)
+    crate::theme::muted_text()
 }
 
 fn border_color() -> Color {
-    Color::Rgb(58, 71, 89)
+    crate::theme::border_color()
 }
 
 fn accent_blue() -> Color {
-    Color::Rgb(90, 169, 255)
-}
-
-fn accent_cyan() -> Color {
-    Color::Rgb(78, 201, 176)
+    crate::theme::accent_blue()
 }
 
 fn accent_gold() -> Color {
-    Color::Rgb(229, 192, 123)
+    crate::theme::accent_gold()
+}
+
+fn selected_background() -> Color {
+    crate::theme::selected_background()
+}
+
+fn selected_text() -> Color {
+    crate::theme::selected_text()
 }

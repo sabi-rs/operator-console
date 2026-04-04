@@ -56,11 +56,11 @@ fn render_tool_tabs(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let tabs = Tabs::new(titles.to_vec())
         .select(selected)
         .block(section_block("Calculator Tools", accent_blue()))
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(text_color()))
         .highlight_style(
             Style::default()
-                .fg(Color::Black)
-                .bg(accent_cyan())
+                .fg(selected_text())
+                .bg(selected_background())
                 .add_modifier(Modifier::BOLD),
         )
         .divider("│");
@@ -150,8 +150,8 @@ fn render_inputs(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .map(|(field, value, selected)| {
             let style = if selected {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(accent_cyan())
+                    .fg(selected_text())
+                    .bg(selected_background())
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(text_color())
@@ -270,7 +270,7 @@ fn render_placeholder(frame: &mut Frame<'_>, area: Rect, title: &str, detail: &s
         .block(
             Block::default()
                 .title(Span::styled(
-                    title,
+                    format!(" {} ", title),
                     Style::default()
                         .fg(accent_gold())
                         .add_modifier(Modifier::BOLD),
@@ -332,7 +332,7 @@ fn metric(label: &'static str, accent: Color) -> Span<'static> {
 fn section_block(title: &'static str, accent: Color) -> Block<'static> {
     Block::default()
         .title(Span::styled(
-            title,
+            format!(" {} ", title),
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -353,37 +353,45 @@ fn format_signed_currency(value: f64) -> String {
 }
 
 fn panel_background() -> Color {
-    Color::Rgb(16, 22, 30)
+    crate::theme::panel_background()
 }
 
 fn text_color() -> Color {
-    Color::Rgb(234, 240, 246)
+    crate::theme::text_color()
 }
 
 fn border_color() -> Color {
-    Color::Rgb(74, 88, 104)
+    crate::theme::border_color()
 }
 
 fn accent_blue() -> Color {
-    Color::Rgb(109, 180, 255)
+    crate::theme::accent_blue()
 }
 
 fn accent_cyan() -> Color {
-    Color::Rgb(94, 234, 212)
+    crate::theme::accent_cyan()
 }
 
 fn accent_green() -> Color {
-    Color::Rgb(134, 239, 172)
+    crate::theme::accent_green()
 }
 
 fn accent_gold() -> Color {
-    Color::Rgb(248, 208, 119)
+    crate::theme::accent_gold()
 }
 
 fn accent_pink() -> Color {
-    Color::Rgb(244, 143, 177)
+    crate::theme::accent_pink()
 }
 
 fn accent_red() -> Color {
-    Color::Rgb(248, 113, 113)
+    crate::theme::accent_red()
+}
+
+fn selected_background() -> Color {
+    crate::theme::selected_background()
+}
+
+fn selected_text() -> Color {
+    crate::theme::selected_text()
 }

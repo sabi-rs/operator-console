@@ -17,7 +17,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let block = Block::default()
         .title(Span::styled(
-            "󰍹 Trading Action",
+            " 󰍹 Trading Action ",
             Style::default()
                 .fg(accent_blue())
                 .add_modifier(Modifier::BOLD),
@@ -121,7 +121,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Span::styled(
                     " Submit Ticket ",
                     Style::default()
-                        .fg(Color::Black)
+                        .fg(on_color(accent_gold()))
                         .bg(accent_gold())
                         .add_modifier(Modifier::BOLD),
                 )
@@ -211,7 +211,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .block(
             Block::default()
                 .title(Span::styled(
-                    "Bet Slip",
+                    " Bet Slip ",
                     Style::default()
                         .fg(accent_cyan())
                         .add_modifier(Modifier::BOLD),
@@ -223,7 +223,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .style(Style::default().bg(panel_background()).fg(text_color()))
         .block(
             Block::default().title(Span::styled(
-                "Risk Tape",
+                " Risk Tape ",
                 Style::default()
                     .fg(accent_gold())
                     .add_modifier(Modifier::BOLD),
@@ -388,7 +388,7 @@ fn price_summary(app: &App) -> String {
 fn field_value(selected: bool, label_text: &str, value_text: &str) -> Span<'static> {
     let style = if selected {
         Style::default()
-            .fg(Color::Black)
+            .fg(on_color(accent_cyan()))
             .bg(accent_cyan())
             .add_modifier(Modifier::BOLD)
     } else {
@@ -411,41 +411,45 @@ fn value(value: &str) -> Span<'static> {
 }
 
 fn accent_blue() -> Color {
-    Color::Rgb(94, 188, 255)
+    crate::theme::accent_blue()
 }
 
 fn accent_cyan() -> Color {
-    Color::Rgb(84, 214, 208)
+    crate::theme::accent_cyan()
 }
 
 fn accent_gold() -> Color {
-    Color::Rgb(255, 205, 96)
+    crate::theme::accent_gold()
 }
 
 fn accent_green() -> Color {
-    Color::Rgb(108, 214, 158)
+    crate::theme::accent_green()
 }
 
 fn accent_red() -> Color {
-    Color::Rgb(255, 118, 118)
+    crate::theme::accent_red()
 }
 
 fn panel_background() -> Color {
-    Color::Rgb(16, 22, 30)
+    crate::theme::panel_background()
 }
 
 fn elevated_background() -> Color {
-    Color::Rgb(28, 36, 48)
+    crate::theme::elevated_background()
 }
 
 fn border_color() -> Color {
-    Color::Rgb(57, 72, 89)
+    crate::theme::border_color()
 }
 
 fn text_color() -> Color {
-    Color::Rgb(236, 241, 246)
+    crate::theme::text_color()
 }
 
 fn muted_text() -> Color {
-    Color::Rgb(138, 152, 168)
+    crate::theme::muted_text()
+}
+
+fn on_color(color: Color) -> Color {
+    crate::theme::contrast_text(color)
 }

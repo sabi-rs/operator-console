@@ -1,56 +1,437 @@
 {
-  "snapshot": {
-    "worker": {
-      "name": "exchange-browser-worker",
-      "status": "idle",
-      "detail": "Stub demo snapshot loaded from fixture"
-    },
-    "venues": [
-      {
-        "id": "smarkets",
-        "label": "Smarkets",
-        "status": "planned",
-        "detail": "Stub/demo only; not a live session",
-        "event_count": 3,
-        "market_count": 18
-      },
-      {
-        "id": "betfair",
-        "label": "Betfair",
-        "status": "planned",
-        "detail": "Adapter not implemented yet",
-        "event_count": 0,
-        "market_count": 0
-      }
-    ],
-    "selected_venue": null,
-    "events": [
-      {
-        "id": "arsenal-v-everton",
-        "label": "Arsenal v Everton",
-        "competition": "Premier League",
-        "start_time": "2026-03-14T17:30:00Z",
-        "url": "https://smarkets.com/football/england-premier-league/2026/03/14/17-30/arsenal-vs-everton/44919794/"
-      }
-    ],
-    "markets": [
-      {
-        "name": "Full-time result",
-        "contract_count": 3
-      },
-      {
-        "name": "Double chance",
-        "contract_count": 3
-      }
-    ],
-    "preflight": {
-      "venue": "smarkets",
-      "event": "Arsenal v Everton",
-      "market": "Full-time result",
-      "contract": "Arsenal",
-      "side": "buy",
-      "stake": 10.0
-    },
-    "status_line": "Stub demo data loaded. Open Trading > Recorder and press s for live data."
-  }
+	"snapshot": {
+		"worker": {
+			"name": "exchange-browser-worker",
+			"status": "ready",
+			"detail": "Sample pre-recorder snapshot loaded from fixture"
+		},
+		"venues": [
+			{
+				"id": "smarkets",
+				"label": "Smarkets",
+				"status": "connected",
+				"detail": "Sample exchange venue with demo liquidity",
+				"event_count": 3,
+				"market_count": 18
+			},
+			{
+				"id": "matchbook",
+				"label": "Matchbook",
+				"status": "planned",
+				"detail": "Prepared sample venue for ladder and execution flows",
+				"event_count": 2,
+				"market_count": 9
+			},
+			{
+				"id": "betfair",
+				"label": "Betfair",
+				"status": "planned",
+				"detail": "Adapter not implemented yet",
+				"event_count": 0,
+				"market_count": 0
+			}
+		],
+		"selected_venue": "smarkets",
+		"events": [
+			{
+				"id": "arsenal-v-everton",
+				"label": "Arsenal v Everton",
+				"competition": "Premier League",
+				"start_time": "2026-03-14T17:30:00Z",
+				"url": "https://smarkets.com/football/england-premier-league/2026/03/14/17-30/arsenal-vs-everton/44919794/"
+			},
+			{
+				"id": "chelsea-v-liverpool",
+				"label": "Chelsea v Liverpool",
+				"competition": "Premier League",
+				"start_time": "2026-03-15T16:30:00Z",
+				"url": "https://example.com/events/chelsea-liverpool"
+			}
+		],
+		"markets": [
+			{
+				"name": "Full-time result",
+				"contract_count": 3
+			},
+			{
+				"name": "Double chance",
+				"contract_count": 3
+			},
+			{
+				"name": "Over/Under 2.5 Goals",
+				"contract_count": 2
+			}
+		],
+		"preflight": {
+			"venue": "smarkets",
+			"event": "Arsenal v Everton",
+			"market": "Full-time result",
+			"contract": "Arsenal",
+			"side": "buy",
+			"stake": 10.0
+		},
+		"status_line": "Sample demo data loaded. Open Trading > Recorder and press s to switch to live recorder-backed data.",
+		"runtime": {
+			"updated_at": "2026-04-04T12:00:00Z",
+			"source": "stub-fixture",
+			"refresh_kind": "cached",
+			"worker_reconnect_count": 0,
+			"decision_count": 2,
+			"watcher_iteration": 1,
+			"stale": false
+		},
+		"account_stats": {
+			"available_balance": 512.35,
+			"exposure": 96.2,
+			"unrealized_pnl": 12.44,
+			"cumulative_pnl": 148.73,
+			"cumulative_pnl_label": "Last 30d",
+			"currency": "GBP"
+		},
+		"open_positions": [
+			{
+				"event": "Arsenal v Everton",
+				"event_status": "In Play",
+				"event_url": "https://smarkets.com/football/england-premier-league/2026/03/14/17-30/arsenal-vs-everton/44919794/",
+				"contract": "Arsenal",
+				"market": "Full-time result",
+				"status": "open",
+				"market_status": "trading",
+				"is_in_play": true,
+				"price": 2.18,
+				"stake": 25.0,
+				"liability": 29.5,
+				"current_value": 37.44,
+				"pnl_amount": 12.44,
+				"overall_pnl_known": true,
+				"current_back_odds": 1.86,
+				"current_implied_probability": 0.5376,
+				"current_implied_percentage": 53.76,
+				"current_buy_odds": 1.85,
+				"current_buy_implied_probability": 0.5405,
+				"current_sell_odds": 1.86,
+				"current_sell_implied_probability": 0.5376,
+				"current_score": "1-0",
+				"current_score_home": 1,
+				"current_score_away": 0,
+				"live_clock": "67'",
+				"can_trade_out": true
+			}
+		],
+		"historical_positions": [
+			{
+				"event": "Roma v Napoli",
+				"event_status": "Settled",
+				"event_url": "https://example.com/events/roma-napoli",
+				"contract": "Over 2.5 Goals",
+				"market": "Goals",
+				"status": "settled",
+				"market_status": "closed",
+				"is_in_play": false,
+				"price": 2.04,
+				"stake": 12.0,
+				"liability": 12.0,
+				"current_value": 0.0,
+				"pnl_amount": 8.4,
+				"overall_pnl_known": true,
+				"current_back_odds": null,
+				"current_implied_probability": null,
+				"current_implied_percentage": null,
+				"current_buy_odds": null,
+				"current_buy_implied_probability": null,
+				"current_sell_odds": null,
+				"current_sell_implied_probability": null,
+				"current_score": "2-1",
+				"current_score_home": 2,
+				"current_score_away": 1,
+				"live_clock": "FT",
+				"can_trade_out": false
+			}
+		],
+		"ledger_pnl_summary": {
+			"realised_total": 148.73,
+			"exchange_total": 121.18,
+			"sportsbook_total": 20.05,
+			"promo_total": 7.5,
+			"settled_count": 14,
+			"standard_count": 11,
+			"promo_count": 3,
+			"unknown_count": 0,
+			"points": [
+				{
+					"occurred_at": "2026-04-02T18:30:00Z",
+					"entry_id": "ledger-1",
+					"platform": "smarkets",
+					"platform_kind": "exchange",
+					"delta": 8.4,
+					"total": 140.33,
+					"promo_total": 7.5,
+					"funding_kind": "cash"
+				},
+				{
+					"occurred_at": "2026-04-04T19:45:00Z",
+					"entry_id": "ledger-2",
+					"platform": "smarkets",
+					"platform_kind": "exchange",
+					"delta": 8.4,
+					"total": 148.73,
+					"promo_total": 7.5,
+					"funding_kind": "cash"
+				}
+			]
+		},
+		"other_open_bets": [
+			{
+				"venue": "Bet365",
+				"event": "Chelsea v Liverpool",
+				"label": "Chelsea",
+				"market": "Match Odds",
+				"side": "back",
+				"odds": 2.8,
+				"stake": 10.0,
+				"status": "open",
+				"funding_kind": "cash",
+				"current_cashout_value": 11.3,
+				"supports_cash_out": true
+			}
+		],
+		"decisions": [
+			{
+				"contract": "Arsenal",
+				"market": "Full-time result",
+				"status": "watch",
+				"reason": "Hold unless sell price trades below 1.82",
+				"current_pnl_amount": 12.44,
+				"current_back_odds": 1.86,
+				"profit_take_back_odds": 1.8,
+				"stop_loss_back_odds": 2.15
+			},
+			{
+				"contract": "Over 2.5 Goals",
+				"market": "Goals",
+				"status": "closed",
+				"reason": "Settled in profit",
+				"current_pnl_amount": 8.4,
+				"current_back_odds": null,
+				"profit_take_back_odds": 0.0,
+				"stop_loss_back_odds": 0.0
+			}
+		],
+		"watch": {
+			"position_count": 1,
+			"watch_count": 1,
+			"commission_rate": 0.02,
+			"target_profit": 10.0,
+			"stop_loss": -6.0,
+			"watches": [
+				{
+					"contract": "Arsenal",
+					"market": "Full-time result",
+					"position_count": 1,
+					"can_trade_out": true,
+					"total_stake": 25.0,
+					"total_liability": 29.5,
+					"current_pnl_amount": 12.44,
+					"current_back_odds": 1.86,
+					"average_entry_lay_odds": 2.18,
+					"entry_implied_probability": 0.4587,
+					"cash_out_back_odds": 1.85,
+					"cash_out_value": 37.44,
+					"profit_take_back_odds": 1.8,
+					"profit_take_implied_probability": 0.5556,
+					"stop_loss_back_odds": 2.15,
+					"stop_loss_implied_probability": 0.4651
+				}
+			]
+		},
+		"tracked_bets": [
+			{
+				"bet_id": "tb-1001",
+				"group_id": "g-arsenal-everton",
+				"event": "Arsenal v Everton",
+				"market": "Full-time result",
+				"selection": "Arsenal",
+				"status": "open",
+				"placed_at": "2026-04-04T17:05:00Z",
+				"settled_at": "",
+				"platform": "Smarkets",
+				"platform_kind": "exchange",
+				"exchange": "smarkets",
+				"sport_key": "soccer_epl",
+				"sport_name": "Premier League",
+				"bet_type": "qualifier",
+				"market_family": "match_odds",
+				"funding_kind": "cash",
+				"selection_line": null,
+				"currency": "GBP",
+				"stake_gbp": 25.0,
+				"potential_returns_gbp": 54.5,
+				"payout_gbp": null,
+				"realised_pnl_gbp": null,
+				"back_price": 2.18,
+				"lay_price": 1.86,
+				"spread": 0.32,
+				"expected_ev": {
+					"gbp": 2.31,
+					"pct": 9.24,
+					"method": "price-delta",
+					"source": "stub-fixture",
+					"status": "sample"
+				},
+				"realised_ev": {
+					"gbp": null,
+					"pct": null,
+					"method": "pending",
+					"source": "",
+					"status": "open"
+				},
+				"activities": [
+					{
+						"occurred_at": "2026-04-04T17:05:00Z",
+						"activity_type": "bet_placed",
+						"amount_gbp": 25.0,
+						"balance_after_gbp": 512.35,
+						"source_file": "stub-fixture",
+						"raw_text": "Back Arsenal 25 @ 2.18"
+					}
+				],
+				"parse_confidence": "high",
+				"notes": "Sample open tracked bet before recorder session exists.",
+				"legs": [
+					{
+						"venue": "Smarkets",
+						"outcome": "Arsenal",
+						"side": "buy",
+						"odds": 2.18,
+						"stake": 25.0,
+						"status": "open",
+						"market": "Full-time result",
+						"market_family": "match_odds",
+						"line": null,
+						"liability": 29.5,
+						"commission_rate": 0.02,
+						"exchange": "smarkets",
+						"placed_at": "2026-04-04T17:05:00Z",
+						"settled_at": ""
+					}
+				]
+			}
+		],
+		"exit_policy": {
+			"target_profit": 10.0,
+			"stop_loss": -6.0,
+			"hard_margin_call_profit_floor": -12.0,
+			"warn_only_default": true
+		},
+		"exit_recommendations": [
+			{
+				"bet_id": "tb-1001",
+				"action": "hold",
+				"reason": "Current pnl is above target band but market still supports a better exit.",
+				"worst_case_pnl": 3.8,
+				"cash_out_venue": "smarkets"
+			}
+		],
+		"external_quotes": [
+			{
+				"provider": "owls:realtime",
+				"venue": "Pinnacle",
+				"event": "Arsenal v Everton",
+				"market": "Match Odds",
+				"selection": "Arsenal",
+				"side": "back",
+				"event_url": "https://example.com/owls/arsenal-everton",
+				"deep_link_url": "https://example.com/owls/arsenal-everton#arsenal",
+				"event_id": "owls-e1",
+				"market_id": "owls-m1",
+				"selection_id": "owls-s1",
+				"price": 1.88,
+				"liquidity": 25000.0,
+				"captured_at": "2026-04-04T18:12:00Z",
+				"notes": ["sample quote"]
+			}
+		],
+		"external_live_events": [
+			{
+				"provider": "owls:scores_live",
+				"sport": "soccer_epl",
+				"event": "Arsenal v Everton",
+				"event_id": "owls-live-e1",
+				"source_match_id": "match-1001",
+				"home_team": "Arsenal",
+				"away_team": "Everton",
+				"home_score": 1,
+				"away_score": 0,
+				"status_state": "live",
+				"status_detail": "Second Half",
+				"display_clock": "67'",
+				"last_updated": "2026-04-04T18:12:00Z",
+				"stats": [
+					{
+						"label": "xG",
+						"home_value": "1.14",
+						"away_value": "0.42"
+					}
+				],
+				"incidents": [
+					{
+						"minute": 54,
+						"incident_type": "goal",
+						"team_side": "home",
+						"player_name": "Saka",
+						"detail": "Left-foot finish"
+					}
+				],
+				"player_ratings": [
+					{
+						"player_name": "Odegaard",
+						"team_side": "home",
+						"rating": 7.8
+					}
+				]
+			}
+		],
+		"horse_matcher": {
+			"captured_at": "2026-04-04T12:00:00Z",
+			"source_count": 2,
+			"ready_source_count": 1,
+			"sources": [
+				{
+					"venue": "smarkets",
+					"venue_label": "Smarkets",
+					"kind": "exchange",
+					"status": "ready",
+					"detail": "Sample win market ladder",
+					"page_url": "https://example.com/racing/cheltenham",
+					"page_title": "Cheltenham 15:20",
+					"event_name": "Cheltenham 15:20",
+					"market_name": "Win",
+					"start_hint": "15:20",
+					"captured_at": "2026-04-04T12:00:00Z",
+					"quotes": [
+						{
+							"selection_name": "Runner A",
+							"side": "lay",
+							"odds": 4.6,
+							"liquidity": 1200.0
+						}
+					]
+				},
+				{
+					"venue": "bet365",
+					"venue_label": "Bet365",
+					"kind": "sportsbook",
+					"status": "planned",
+					"detail": "Sample source shown before recorder starts",
+					"page_url": "",
+					"page_title": "",
+					"event_name": "",
+					"market_name": "",
+					"start_hint": "",
+					"captured_at": "",
+					"quotes": []
+				}
+			]
+		}
+	}
 }

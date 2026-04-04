@@ -71,23 +71,23 @@ pub fn render(
     let runtime = snapshot.runtime.as_ref();
 
     let layout = Layout::vertical([
-        Constraint::Length(8),
-        Constraint::Length(5),
-        Constraint::Min(12),
+        Constraint::Length(4),
+        Constraint::Length(3), // row 1
+        Constraint::Length(3), // row 2
+        Constraint::Min(12),   // lower
     ])
     .split(area);
-    let ratios = Layout::horizontal([
-        Constraint::Percentage(34),
-        Constraint::Percentage(33),
-        Constraint::Percentage(33),
-    ])
-    .split(layout[1]);
-    let lower = Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
-        .split(layout[2]);
+
+    let ratios = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(layout[1]);
+    let action_queue_area = Layout::horizontal([Constraint::Percentage(100)]).split(layout[2])[0];
+
+    let lower = Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)])
+        .split(layout[3]);
     let left = Layout::vertical([Constraint::Length(12), Constraint::Min(8)]).split(lower[0]);
     let right = Layout::vertical([
-        Constraint::Length(8),
-        Constraint::Length(8),
+        Constraint::Length(7),
+        Constraint::Length(7),
         Constraint::Min(8),
     ])
     .split(lower[1]);
@@ -151,14 +151,18 @@ pub fn render(
             snapshot.open_positions.len()
         ),
     );
+    // Gauge 3 now in its own dedicated row constraint
     render_gauge(
         frame,
-        ratios[2],
+        action_queue_area,
         "Action Queue",
         action_ratio,
         accent_gold(),
         format!("{}/{}", actionable_decisions, snapshot.decisions.len()),
     );
+
+    // Remaining rendering needs to shift to lower constraints or layout rows
+    // ... need to adjust lower/left/right layouts if they rely on layout[2] ...
 
     render_running_pnl_chart(frame, left[0], &running_pnl);
     render_capital_table(
@@ -188,10 +192,9 @@ fn render_summary_cards(
     runtime: Option<&crate::domain::RuntimeSummary>,
 ) {
     let cards = Layout::horizontal([
-        Constraint::Percentage(25),
-        Constraint::Percentage(25),
-        Constraint::Percentage(25),
-        Constraint::Percentage(25),
+        Constraint::Percentage(34),
+        Constraint::Percentage(33),
+        Constraint::Percentage(33),
     ])
     .split(area);
 
@@ -255,32 +258,17 @@ fn render_summary_cards(
                 .unwrap_or(0),
             tracked_source_count,
         )),
+        Line::raw(format!(
+            "mtm {:+.2} • {}",
+            total_open_pnl,
+            runtime
+                .map(|summary| summary.updated_at.as_str())
+                .unwrap_or("unknown")
+        )),
     ])
     .block(section_block("󰆼 Flow", accent_gold()))
     .wrap(Wrap { trim: true });
     frame.render_widget(flow, cards[2]);
-
-    let runtime_card = Paragraph::new(vec![
-        Line::styled("󱂬 mark-to-market", Style::default().fg(muted_text())),
-        Line::styled(
-            format!("{:+.2}", total_open_pnl),
-            Style::default()
-                .fg(pnl_color(total_open_pnl))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Line::raw(format!(
-            "{} • ev {}",
-            runtime
-                .map(|summary| summary.updated_at.as_str())
-                .unwrap_or("unknown"),
-            total_market_ev(snapshot)
-                .map(|value| format!("{value:.2}"))
-                .unwrap_or_else(|| String::from("-")),
-        )),
-    ])
-    .block(section_block("󱎆 Runtime", accent_green()))
-    .wrap(Wrap { trim: true });
-    frame.render_widget(runtime_card, cards[3]);
 }
 
 fn render_venue_table(frame: &mut Frame<'_>, area: Rect, snapshot: &ExchangePanelSnapshot) {
@@ -844,6 +832,7 @@ fn ratio(numerator: f64, denominator: f64) -> f64 {
     }
 }
 
+#[allow(dead_code)]
 fn total_market_ev(snapshot: &ExchangePanelSnapshot) -> Option<f64> {
     let watch = snapshot.watch.as_ref()?;
     let values = watch
@@ -1257,11 +1246,10 @@ fn compact_label(value: &str) -> String {
 fn section_block(title: &'static str, color: Color) -> Block<'static> {
     Block::default()
         .title(Span::styled(
-            title,
+            format!(" {} ", title),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
-        .padding(Padding::horizontal(1))
         .style(Style::default().bg(panel_background()).fg(text_color()))
         .border_style(Style::default().fg(border_color()))
 }
@@ -1285,43 +1273,43 @@ fn pnl_color(value: f64) -> Color {
 }
 
 fn panel_background() -> Color {
-    Color::Rgb(16, 22, 30)
+    crate::theme::panel_background()
 }
 
 fn border_color() -> Color {
-    Color::Rgb(48, 64, 86)
+    crate::theme::border_color()
 }
 
 fn text_color() -> Color {
-    Color::Rgb(234, 240, 246)
+    crate::theme::text_color()
 }
 
 fn muted_text() -> Color {
-    Color::Rgb(148, 163, 184)
+    crate::theme::muted_text()
 }
 
 fn accent_blue() -> Color {
-    Color::Rgb(104, 179, 255)
+    crate::theme::accent_blue()
 }
 
 fn accent_cyan() -> Color {
-    Color::Rgb(110, 231, 255)
+    crate::theme::accent_cyan()
 }
 
 fn accent_green() -> Color {
-    Color::Rgb(90, 214, 154)
+    crate::theme::accent_green()
 }
 
 fn accent_gold() -> Color {
-    Color::Rgb(245, 196, 89)
+    crate::theme::accent_gold()
 }
 
 fn accent_pink() -> Color {
-    Color::Rgb(255, 122, 162)
+    crate::theme::accent_pink()
 }
 
 fn accent_red() -> Color {
-    Color::Rgb(255, 107, 107)
+    crate::theme::accent_red()
 }
 
 #[cfg(test)]

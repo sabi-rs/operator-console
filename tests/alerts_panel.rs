@@ -24,6 +24,7 @@ fn alerts_panel_renders_rules_and_recent_notifications() {
     })
     .expect("app");
     app.set_trading_section(TradingSection::Alerts);
+    app.wm.maximized_pane = app.active_pane();
     app.toggle_notifications_overlay();
     app.toggle_notifications_overlay();
 
@@ -78,8 +79,8 @@ fn notifications_overlay_renders_when_toggled() {
     }
     let rendered = lines.join("\n");
 
-    assert!(rendered.contains("Notifications"));
-    assert!(rendered.contains("No notifications yet."));
+    assert!(rendered.contains("Error Console"));
+    assert!(rendered.contains("No warnings or critical failures captured."));
 }
 
 fn sample_snapshot() -> ExchangePanelSnapshot {

@@ -374,15 +374,13 @@ impl OddsMatcherField {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OddsMatcherEditorState {
     selected_field_index: usize,
     pub editing: bool,
     pub buffer: String,
     pub replace_on_input: bool,
 }
-
 
 impl OddsMatcherEditorState {
     pub fn selected_field(&self) -> OddsMatcherField {

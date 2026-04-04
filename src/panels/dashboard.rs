@@ -207,18 +207,14 @@ fn render_block(frame: &mut Frame<'_>, area: Rect, title: &str, rows: Vec<Line<'
         .block(
             Block::default()
                 .title(Span::styled(
-                    title.to_string(),
+                    format!(" {} ", title),
                     Style::default()
                         .fg(block_accent(title))
                         .add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
-                .style(
-                    Style::default()
-                        .bg(Color::Rgb(16, 22, 30))
-                        .fg(Color::Rgb(234, 240, 246)),
-                )
-                .border_style(Style::default().fg(Color::Rgb(74, 88, 104))),
+                .style(Style::default().bg(panel_background()).fg(text_color()))
+                .border_style(Style::default().fg(border_color())),
         )
         .wrap(Wrap { trim: true });
     frame.render_widget(body, area);
@@ -226,13 +222,45 @@ fn render_block(frame: &mut Frame<'_>, area: Rect, title: &str, rows: Vec<Line<'
 
 fn block_accent(title: &str) -> Color {
     match title {
-        "Operator" => Color::Rgb(109, 180, 255),
-        "Trading" => Color::Rgb(94, 234, 212),
-        "Runtime" => Color::Rgb(134, 239, 172),
-        "Attention" => Color::Rgb(248, 113, 113),
-        "Modules" => Color::Rgb(244, 143, 177),
-        _ => Color::Rgb(234, 240, 246),
+        "Operator" => accent_blue(),
+        "Trading" => accent_cyan(),
+        "Runtime" => accent_green(),
+        "Attention" => accent_red(),
+        "Modules" => accent_pink(),
+        _ => text_color(),
     }
+}
+
+fn panel_background() -> Color {
+    crate::theme::panel_background()
+}
+
+fn text_color() -> Color {
+    crate::theme::text_color()
+}
+
+fn border_color() -> Color {
+    crate::theme::border_color()
+}
+
+fn accent_blue() -> Color {
+    crate::theme::accent_blue()
+}
+
+fn accent_cyan() -> Color {
+    crate::theme::accent_cyan()
+}
+
+fn accent_green() -> Color {
+    crate::theme::accent_green()
+}
+
+fn accent_pink() -> Color {
+    crate::theme::accent_pink()
+}
+
+fn accent_red() -> Color {
+    crate::theme::accent_red()
 }
 
 fn yes_no(value: bool) -> &'static str {

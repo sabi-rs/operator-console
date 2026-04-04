@@ -1,5 +1,6 @@
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::Line;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
@@ -499,7 +500,22 @@ fn recommended_action_lines(app: &App) -> Vec<Line<'static>> {
 
 fn render_block(frame: &mut Frame<'_>, area: Rect, title: &str, rows: Vec<Line<'static>>) {
     let body = Paragraph::new(rows)
-        .block(Block::default().title(title).borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    format!(" {} ", title),
+                    Style::default()
+                        .fg(crate::theme::accent_blue())
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .style(
+                    Style::default()
+                        .bg(crate::theme::panel_background())
+                        .fg(crate::theme::text_color()),
+                )
+                .border_style(Style::default().fg(crate::theme::border_color())),
+        )
         .wrap(Wrap { trim: true });
     frame.render_widget(body, area);
 }

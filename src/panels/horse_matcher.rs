@@ -177,7 +177,7 @@ fn render_filter_card(
                         value
                     },
                     if app.horse_matcher_selected_field() == *field {
-                        Style::default().fg(Color::Black).bg(accent)
+                        Style::default().fg(on_color(accent)).bg(accent)
                     } else {
                         Style::default().fg(text_color())
                     },
@@ -240,7 +240,7 @@ fn render_table(
     .block(section_block("Racing Rows", accent_green()))
     .row_highlight_style(if focus == OddsMatcherFocus::Results {
         Style::default()
-            .fg(Color::Black)
+            .fg(on_color(accent_gold()))
             .bg(accent_gold())
             .add_modifier(Modifier::BOLD)
     } else {
@@ -291,7 +291,7 @@ fn badge(label: &str, value: &str, color: Color) -> Span<'static> {
     Span::styled(
         format!(" {label}: {value} "),
         Style::default()
-            .fg(Color::Black)
+            .fg(on_color(color))
             .bg(color)
             .add_modifier(Modifier::BOLD),
     )
@@ -320,7 +320,7 @@ fn value(text: &str) -> Span<'static> {
 fn section_block(title: &'static str, color: Color) -> Block<'static> {
     Block::default()
         .title(Span::styled(
-            title,
+            format!(" {} ", title),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -331,7 +331,7 @@ fn section_block(title: &'static str, color: Color) -> Block<'static> {
 fn card_block(title: &'static str, accent: Color, selected: bool) -> Block<'static> {
     Block::default()
         .title(Span::styled(
-            title,
+            format!(" {} ", title),
             Style::default()
                 .fg(if selected { accent } else { muted_text() })
                 .add_modifier(Modifier::BOLD),
@@ -342,35 +342,39 @@ fn card_block(title: &'static str, accent: Color, selected: bool) -> Block<'stat
 }
 
 fn panel_background() -> Color {
-    Color::Rgb(18, 24, 33)
+    crate::theme::panel_background()
 }
 
 fn border_color() -> Color {
-    Color::Rgb(45, 55, 72)
+    crate::theme::border_color()
 }
 
 fn text_color() -> Color {
-    Color::Rgb(235, 239, 244)
+    crate::theme::text_color()
 }
 
 fn muted_text() -> Color {
-    Color::Rgb(148, 163, 184)
+    crate::theme::muted_text()
 }
 
 fn accent_blue() -> Color {
-    Color::Rgb(125, 211, 252)
+    crate::theme::accent_blue()
 }
 
 fn accent_green() -> Color {
-    Color::Rgb(134, 239, 172)
+    crate::theme::accent_green()
 }
 
 fn accent_gold() -> Color {
-    Color::Rgb(248, 208, 119)
+    crate::theme::accent_gold()
 }
 
 fn accent_pink() -> Color {
-    Color::Rgb(244, 143, 177)
+    crate::theme::accent_pink()
+}
+
+fn on_color(color: Color) -> Color {
+    crate::theme::contrast_text(color)
 }
 
 fn start_date_label(start_at: &str) -> String {

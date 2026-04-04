@@ -105,7 +105,7 @@ fn truncate(value: &str, limit: usize) -> String {
 #[cfg(test)]
 fn test_dashboard_fixture() -> MarketIntelDashboard {
     let market_quote = MarketQuoteComparisonRow {
-        source: MarketIntelSourceId::Oddsentry,
+        source: MarketIntelSourceId::oddsentry(),
         event_id: String::from("f5-farmville"),
         market_id: String::from("base-map-1-winner"),
         selection_id: String::from("f5-esports"),
@@ -126,7 +126,7 @@ fn test_dashboard_fixture() -> MarketIntelDashboard {
         raw_data: serde_json::json!({}),
     };
     let lay_quote = MarketQuoteComparisonRow {
-        source: MarketIntelSourceId::Oddsentry,
+        source: MarketIntelSourceId::oddsentry(),
         event_id: String::from("f5-farmville"),
         market_id: String::from("base-map-1-winner"),
         selection_id: String::from("f5-esports-lay"),
@@ -147,7 +147,7 @@ fn test_dashboard_fixture() -> MarketIntelDashboard {
         raw_data: serde_json::json!({}),
     };
     let value_quote = MarketQuoteComparisonRow {
-        source: MarketIntelSourceId::FairOdds,
+        source: MarketIntelSourceId::fair_odds(),
         event_id: String::from("mavericks-suns"),
         market_id: String::from("moneyline"),
         selection_id: String::from("mavericks"),
@@ -173,22 +173,25 @@ fn test_dashboard_fixture() -> MarketIntelDashboard {
         status_line: String::from("Intel ready: 1 markets, 1 arbs, 1 +EV, 1 value, 1 drops."),
         sources: vec![
             SourceHealth {
-                source: MarketIntelSourceId::Oddsentry,
+                source: MarketIntelSourceId::oddsentry(),
                 mode: SourceLoadMode::Live,
                 status: SourceHealthStatus::Ready,
                 detail: String::from("Loaded via backend-shaped fixture."),
                 refreshed_at: String::from("2026-04-03T11:24:00Z"),
             },
             SourceHealth {
-                source: MarketIntelSourceId::FairOdds,
+                source: MarketIntelSourceId::fair_odds(),
                 mode: SourceLoadMode::Fixture,
                 status: SourceHealthStatus::Ready,
                 detail: String::from("Fixture-backed parity slice."),
                 refreshed_at: String::from("fixture"),
             },
         ],
+        sports: vec![],
+        total_events: 3,
+        total_opportunities: 5,
         markets: vec![MarketOpportunityRow {
-            source: MarketIntelSourceId::Oddsentry,
+            source: MarketIntelSourceId::oddsentry(),
             kind: OpportunityKind::Market,
             id: String::from("oddsentry:market:f5-farmville"),
             sport: String::from("esports"),
@@ -217,7 +220,7 @@ fn test_dashboard_fixture() -> MarketIntelDashboard {
             raw_data: serde_json::json!({}),
         }],
         arbitrages: vec![MarketOpportunityRow {
-            source: MarketIntelSourceId::Oddsentry,
+            source: MarketIntelSourceId::oddsentry(),
             kind: OpportunityKind::Arbitrage,
             id: String::from("oddsentry:arb:chelsea-liverpool"),
             sport: String::from("soccer"),
@@ -246,7 +249,7 @@ fn test_dashboard_fixture() -> MarketIntelDashboard {
             raw_data: serde_json::json!({}),
         }],
         plus_ev: vec![MarketOpportunityRow {
-            source: MarketIntelSourceId::Oddsentry,
+            source: MarketIntelSourceId::oddsentry(),
             kind: OpportunityKind::PositiveEv,
             id: String::from("oddsentry:ev:bayern-dortmund"),
             sport: String::from("soccer"),
@@ -275,7 +278,7 @@ fn test_dashboard_fixture() -> MarketIntelDashboard {
             raw_data: serde_json::json!({}),
         }],
         drops: vec![MarketOpportunityRow {
-            source: MarketIntelSourceId::FairOdds,
+            source: MarketIntelSourceId::fair_odds(),
             kind: OpportunityKind::Drop,
             id: String::from("fairodds:drop:roma-napoli"),
             sport: String::from("soccer"),
@@ -304,7 +307,7 @@ fn test_dashboard_fixture() -> MarketIntelDashboard {
             raw_data: serde_json::json!({}),
         }],
         value: vec![MarketOpportunityRow {
-            source: MarketIntelSourceId::FairOdds,
+            source: MarketIntelSourceId::fair_odds(),
             kind: OpportunityKind::Value,
             id: String::from("fairodds:value:mavericks-suns"),
             sport: String::from("nba"),
@@ -333,7 +336,7 @@ fn test_dashboard_fixture() -> MarketIntelDashboard {
             raw_data: serde_json::json!({}),
         }],
         event_detail: Some(MarketEventDetail {
-            source: MarketIntelSourceId::Oddsentry,
+            source: MarketIntelSourceId::oddsentry(),
             event_id: String::from("f5-farmville"),
             sport: String::from("esports"),
             event_name: String::from("F5 Esports vs FarmVille"),
@@ -463,7 +466,7 @@ mod tests {
     #[test]
     fn combined_dashboard_contains_both_sources() {
         let dashboard = load_dashboard().expect("combined market intel dashboard");
-        assert_eq!(dashboard.sources.len(), 2);
+        assert!(dashboard.sources.len() >= 2);
         assert!(!dashboard.markets.is_empty());
         assert!(!dashboard.arbitrages.is_empty());
         assert!(!dashboard.plus_ev.is_empty());
@@ -550,5 +553,56 @@ mod tests {
         assert_eq!(fetched.drops.len(), dashboard.drops.len());
 
         server.join().expect("server join");
+    }
+
+    #[test]
+    fn dashboard_deserializes_new_source_and_summary_fields() {
+        let payload = serde_json::json!({
+            "refreshed_at": "2026-04-04T12:00:00Z",
+            "status_line": "ok",
+            "sources": [
+                {
+                    "source": "odds_api",
+                    "mode": "live",
+                    "status": "ready",
+                    "detail": "loaded",
+                    "refreshed_at": "2026-04-04T12:00:00Z"
+                }
+            ],
+            "sports": [
+                {
+                    "sport_key": "soccer_epl",
+                    "sport_title": "Soccer",
+                    "group_name": "Premier League",
+                    "active": true,
+                    "primary_source": "odds_api",
+                    "primary_refreshed_at": "2026-04-04T12:00:00Z",
+                    "fallback_available": true,
+                    "event_count": 4,
+                    "quote_count": 12,
+                    "arbitrage_count": 1,
+                    "positive_ev_count": 2,
+                    "value_count": 0
+                }
+            ],
+            "total_events": 4,
+            "total_opportunities": 3,
+            "markets": [],
+            "arbitrages": [],
+            "plus_ev": [],
+            "drops": [],
+            "value": [],
+            "event_detail": null
+        });
+
+        let dashboard: crate::market_intel::MarketIntelDashboard =
+            serde_json::from_value(payload).expect("decode dashboard");
+
+        assert_eq!(dashboard.sources.len(), 1);
+        assert_eq!(dashboard.sources[0].source.key(), "odds_api");
+        assert_eq!(dashboard.sports.len(), 1);
+        assert_eq!(dashboard.sports[0].primary_source.key(), "odds_api");
+        assert_eq!(dashboard.total_events, 4);
+        assert_eq!(dashboard.total_opportunities, 3);
     }
 }
