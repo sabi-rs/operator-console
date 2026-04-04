@@ -163,6 +163,7 @@ impl MarketIntelSyncReason {
 
 pub(crate) struct MarketIntelJob {
     pub(crate) reason: MarketIntelSyncReason,
+    pub(crate) sport_key: Option<String>,
 }
 
 pub(crate) struct MarketIntelResult {
@@ -1533,7 +1534,7 @@ impl App {
     }
 
     pub fn top_bar_ticker_parts(&self) -> (&'static str, String) {
-        top_bar_ticker_parts(&self.snapshot)
+        top_bar_ticker_parts(&self.snapshot, &self.owls_dashboard)
     }
 
     pub fn worker_reconnect_count(&self) -> usize {
@@ -2192,7 +2193,10 @@ impl App {
     }
 
     fn dispatch_market_intel_sync(&mut self, reason: MarketIntelSyncReason) {
-        match self.market_intel_tx.send(MarketIntelJob { reason }) {
+        match self.market_intel_tx.send(MarketIntelJob {
+            reason,
+            sport_key: self.current_market_intel_sport_key(),
+        }) {
             Ok(()) => {
                 self.market_intel_in_flight = true;
                 self.market_intel_resource_state.begin_refresh_now();
@@ -2204,6 +2208,15 @@ impl App {
                 self.record_event("Market intel worker unavailable.");
             }
         }
+    }
+
+    fn current_market_intel_sport_key(&self) -> Option<String> {
+        let sport = self.owls_dashboard.sport.trim();
+        if !sport.is_empty() {
+            return Some(sport.to_ascii_lowercase());
+        }
+
+        inferred_owls_sport(&self.snapshot).map(str::to_string)
     }
 
     fn drain_market_intel_results(&mut self) {
@@ -6349,7 +6362,10 @@ fn watch_row_event_name(
         })
 }
 
-fn top_bar_ticker_parts(snapshot: &ExchangePanelSnapshot) -> (&'static str, String) {
+fn top_bar_ticker_parts(
+    snapshot: &ExchangePanelSnapshot,
+    owls_dashboard: &OwlsDashboard,
+) -> (&'static str, String) {
     let watched = dedupe_ticker_items(
         snapshot
             .watch
@@ -6361,6 +6377,25 @@ fn top_bar_ticker_parts(snapshot: &ExchangePanelSnapshot) -> (&'static str, Stri
     );
     if !watched.is_empty() {
         return ("watch", watched.join("  •  "));
+    }
+
+    let live_soccer = dedupe_ticker_items(
+        owls_dashboard
+            .endpoints
+            .iter()
+            .flat_map(|endpoint| endpoint.live_scores.iter())
+            .filter(|event| event.sport.trim().eq_ignore_ascii_case("soccer"))
+            .map(|event| {
+                if event.name.trim().is_empty() {
+                    format!("{} vs {}", event.away_team.trim(), event.home_team.trim())
+                } else {
+                    event.name.clone()
+                }
+            }),
+        3,
+    );
+    if !live_soccer.is_empty() {
+        return ("live", live_soccer.join("  •  "));
     }
 
     let live = dedupe_ticker_items(
@@ -6968,7 +7003,11 @@ pub(crate) fn start_market_intel_worker() -> (Sender<MarketIntelJob>, Receiver<M
     let (result_tx, result_rx) = mpsc::channel::<MarketIntelResult>();
     thread::spawn(move || {
         while let Ok(job) = job_rx.recv() {
-            let dashboard = market_intel::load_dashboard().map_err(|error| error.to_string());
+            let dashboard = market_intel::load_dashboard_with_options(
+                matches!(job.reason, MarketIntelSyncReason::Manual),
+                job.sport_key.as_deref(),
+            )
+            .map_err(|error| error.to_string());
             if result_tx
                 .send(MarketIntelResult {
                     dashboard,

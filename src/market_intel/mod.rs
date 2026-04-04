@@ -24,16 +24,36 @@ pub fn load_dashboard() -> color_eyre::Result<MarketIntelDashboard> {
     }
 
     #[cfg(not(test))]
-    load_dashboard_via_backend()
+    load_dashboard_via_backend(true, None)
 }
 
 #[cfg_attr(test, allow(dead_code))]
-fn load_dashboard_via_backend() -> color_eyre::Result<MarketIntelDashboard> {
+pub fn load_dashboard_with_options(
+    refresh: bool,
+    sport_key: Option<&str>,
+) -> color_eyre::Result<MarketIntelDashboard> {
+    #[cfg(test)]
+    {
+        let _ = (refresh, sport_key);
+        Ok(test_dashboard_fixture())
+    }
+
+    #[cfg(not(test))]
+    load_dashboard_via_backend(refresh, sport_key)
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn load_dashboard_via_backend(
+    refresh: bool,
+    sport_key: Option<&str>,
+) -> color_eyre::Result<MarketIntelDashboard> {
     let client = build_backend_client()?;
     let base_url = market_intel_backend_base_url();
 
-    refresh_backend_dashboard(&client, &base_url)?;
-    query_backend_dashboard(&client, &base_url)
+    if refresh {
+        refresh_backend_dashboard(&client, &base_url)?;
+    }
+    query_backend_dashboard(&client, &base_url, sport_key)
 }
 
 #[cfg_attr(test, allow(dead_code))]
@@ -73,10 +93,14 @@ fn refresh_backend_dashboard(client: &Client, base_url: &str) -> color_eyre::Res
 fn query_backend_dashboard(
     client: &Client,
     base_url: &str,
+    sport_key: Option<&str>,
 ) -> color_eyre::Result<MarketIntelDashboard> {
     let path = "/api/v1/query/market-intel/dashboard";
-    let response = client
-        .get(format!("{}{}", base_url.trim_end_matches('/'), path))
+    let mut request = client.get(format!("{}{}", base_url.trim_end_matches('/'), path));
+    if let Some(sport_key) = sport_key.map(str::trim).filter(|value| !value.is_empty()) {
+        request = request.query(&[("sport_key", sport_key)]);
+    }
+    let response = request
         .send()
         .wrap_err_with(|| format!("request failed for {path}"))?;
     let status = response.status();
@@ -543,7 +567,8 @@ mod tests {
         let client = Client::builder().build().expect("client");
         let base_url = format!("http://{address}");
         super::refresh_backend_dashboard(&client, &base_url).expect("refresh via backend");
-        let fetched = super::query_backend_dashboard(&client, &base_url).expect("query backend");
+        let fetched =
+            super::query_backend_dashboard(&client, &base_url, None).expect("query backend");
 
         assert_eq!(fetched.sources.len(), dashboard.sources.len());
         assert_eq!(fetched.markets.len(), dashboard.markets.len());

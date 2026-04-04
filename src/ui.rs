@@ -77,7 +77,10 @@ fn render_layout_node(
             let chunks = Layout::default()
                 .direction(layout_dir)
                 .constraints(constraints)
-                .spacing(1)
+                .spacing(match direction {
+                    SplitDirection::Horizontal => 0,
+                    SplitDirection::Vertical => 1,
+                })
                 .split(area);
 
             for (i, child) in children.iter().enumerate() {

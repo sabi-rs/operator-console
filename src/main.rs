@@ -1,6 +1,9 @@
 use std::env;
 use std::io::{self, stdout};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 use color_eyre::eyre::Result;
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
@@ -19,6 +22,7 @@ use operator_console::worker_client::{BetRecorderWorkerClient, WorkerClientExcha
 fn main() -> Result<()> {
     color_eyre::install()?;
     let _ = init_tracing();
+    ensure_local_sabisabi_backend()?;
 
     let options = match CliOptions::parse(env::args().skip(1)) {
         Ok(options) => options,
@@ -92,6 +96,72 @@ fn enable_mouse_capture() -> io::Result<()> {
 
 fn disable_mouse_capture() -> io::Result<()> {
     execute!(stdout(), DisableMouseCapture)
+}
+
+fn ensure_local_sabisabi_backend() -> Result<()> {
+    let base_url =
+        env::var("SABISABI_BASE_URL").unwrap_or_else(|_| String::from("http://127.0.0.1:4080"));
+    if !is_local_default_sabisabi(&base_url) || sabisabi_is_healthy(&base_url) {
+        return Ok(());
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .ok_or_else(|| color_eyre::eyre::eyre!("failed to resolve sabi repo root"))?
+        .to_path_buf();
+    let sabisabi_dir = repo_root.join("sabisabi");
+    let sabisabi_bin = sabisabi_dir.join("target/debug/sabisabi");
+
+    let build_status = Command::new("cargo")
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(sabisabi_dir.join("Cargo.toml"))
+        .status()?;
+    if !build_status.success() {
+        return Err(color_eyre::eyre::eyre!("failed to build sabisabi backend"));
+    }
+
+    Command::new(&sabisabi_bin)
+        .current_dir(&sabisabi_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    for _ in 0..20 {
+        if sabisabi_is_healthy(&base_url) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    Err(color_eyre::eyre::eyre!(
+        "sabisabi backend did not become healthy at {base_url}"
+    ))
+}
+
+fn is_local_default_sabisabi(base_url: &str) -> bool {
+    matches!(
+        base_url.trim_end_matches('/'),
+        "http://127.0.0.1:4080" | "http://localhost:4080"
+    )
+}
+
+fn sabisabi_is_healthy(base_url: &str) -> bool {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_millis(300))
+        .timeout(Duration::from_millis(500))
+        .build()
+        .ok()
+        .and_then(|client| {
+            client
+                .get(format!("{}/health", base_url.trim_end_matches('/')))
+                .send()
+                .ok()
+        })
+        .is_some_and(|response| response.status().is_success())
 }
 
 fn help_text() -> String {
