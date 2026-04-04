@@ -10,6 +10,7 @@ use operator_console::market_intel::{
     OpportunityKind, SourceHealth, SourceHealthStatus, SourceLoadMode,
 };
 use operator_console::provider::{ExchangeProvider, ProviderRequest};
+use operator_console::wm::PaneId;
 use std::time::Duration;
 
 struct StaticProvider {
@@ -24,7 +25,7 @@ impl ExchangeProvider for StaticProvider {
 
 fn sample_market_intel_dashboard() -> MarketIntelDashboard {
     let executable_market = MarketOpportunityRow {
-        source: MarketIntelSourceId::Oddsentry,
+        source: MarketIntelSourceId::oddsentry(),
         kind: OpportunityKind::Market,
         id: String::from("intel-executable"),
         sport: String::from("Soccer"),
@@ -39,7 +40,7 @@ fn sample_market_intel_dashboard() -> MarketIntelDashboard {
         deep_link_url: String::from("https://smarkets.example/events/arsenal-everton"),
         quotes: vec![
             MarketQuoteComparisonRow {
-                source: MarketIntelSourceId::Oddsentry,
+                source: MarketIntelSourceId::oddsentry(),
                 event_id: String::from("event-1"),
                 event_name: String::from("Arsenal v Everton"),
                 market_name: String::from("Match Odds"),
@@ -53,7 +54,7 @@ fn sample_market_intel_dashboard() -> MarketIntelDashboard {
                 ..MarketQuoteComparisonRow::default()
             },
             MarketQuoteComparisonRow {
-                source: MarketIntelSourceId::Oddsentry,
+                source: MarketIntelSourceId::oddsentry(),
                 event_id: String::from("event-1"),
                 event_name: String::from("Arsenal v Everton"),
                 market_name: String::from("Match Odds"),
@@ -72,7 +73,7 @@ fn sample_market_intel_dashboard() -> MarketIntelDashboard {
     };
 
     let missing_lay_value = MarketOpportunityRow {
-        source: MarketIntelSourceId::FairOdds,
+        source: MarketIntelSourceId::fair_odds(),
         kind: OpportunityKind::Value,
         id: String::from("intel-missing-lay"),
         sport: String::from("Basketball"),
@@ -84,7 +85,7 @@ fn sample_market_intel_dashboard() -> MarketIntelDashboard {
         venue: String::from("fanduel"),
         event_url: String::from("https://fairodds.example/value/mavericks-suns"),
         quotes: vec![MarketQuoteComparisonRow {
-            source: MarketIntelSourceId::FairOdds,
+            source: MarketIntelSourceId::fair_odds(),
             event_id: String::from("event-2"),
             event_name: String::from("Mavericks v Suns"),
             market_name: String::from("Moneyline"),
@@ -105,14 +106,14 @@ fn sample_market_intel_dashboard() -> MarketIntelDashboard {
         status_line: String::from("test dashboard"),
         sources: vec![
             SourceHealth {
-                source: MarketIntelSourceId::Oddsentry,
+                source: MarketIntelSourceId::oddsentry(),
                 mode: SourceLoadMode::Live,
                 status: SourceHealthStatus::Ready,
                 detail: String::from("live"),
                 refreshed_at: String::from("2026-04-03T11:24:30Z"),
             },
             SourceHealth {
-                source: MarketIntelSourceId::FairOdds,
+                source: MarketIntelSourceId::fair_odds(),
                 mode: SourceLoadMode::Fixture,
                 status: SourceHealthStatus::Ready,
                 detail: String::from("fixture"),
@@ -169,6 +170,32 @@ fn trading_section_navigation_cycles_inside_trading_module() {
 }
 
 #[test]
+fn set_trading_section_syncs_workspace_and_focused_pane() {
+    let mut app = App::default();
+
+    app.set_trading_section(TradingSection::Markets);
+    assert_eq!(app.active_pane(), Some(PaneId::Markets));
+    assert_eq!(app.wm.active_workspace, 1);
+
+    app.set_trading_section(TradingSection::Recorder);
+    assert_eq!(app.active_pane(), Some(PaneId::Recorder));
+    assert_eq!(app.wm.active_workspace, 2);
+}
+
+#[test]
+fn plain_horizontal_arrows_do_not_switch_sections() {
+    let mut app = App::default();
+
+    assert_eq!(app.active_trading_section(), TradingSection::Positions);
+
+    app.handle_key(KeyCode::Right);
+    assert_eq!(app.active_trading_section(), TradingSection::Positions);
+
+    app.handle_key(KeyCode::Left);
+    assert_eq!(app.active_trading_section(), TradingSection::Positions);
+}
+
+#[test]
 fn tab_switches_positions_focus_to_historical_when_history_exists() {
     let mut app = App::from_provider(StaticProvider {
         snapshot: positions_snapshot(),
@@ -203,22 +230,21 @@ fn historical_focus_uses_historical_selection_state() {
 }
 
 #[test]
-fn j_and_k_follow_the_same_navigation_paths_as_arrows() {
+fn vim_keys_move_between_panes_not_within_tables() {
     let mut app = App::from_provider(StaticProvider {
         snapshot: positions_snapshot(),
     })
     .expect("app");
     app.set_active_panel(Panel::Trading);
     app.set_trading_section(TradingSection::Positions);
-    app.handle_key(KeyCode::Tab);
 
-    assert_eq!(app.selected_historical_position_row(), Some(0));
+    assert_eq!(app.active_pane(), Some(PaneId::Positions));
+    assert_eq!(app.selected_open_position_row(), Some(0));
 
-    app.handle_key(KeyCode::Char('j'));
-    assert_eq!(app.selected_historical_position_row(), Some(1));
+    app.handle_key(KeyCode::Char('h'));
 
-    app.handle_key(KeyCode::Char('k'));
-    assert_eq!(app.selected_historical_position_row(), Some(0));
+    assert_ne!(app.active_pane(), Some(PaneId::Positions));
+    assert_eq!(app.selected_open_position_row(), Some(0));
 }
 
 #[test]
@@ -360,6 +386,7 @@ fn intel_enter_preloads_calculator_and_p_opens_action_overlay() {
     app.handle_key(KeyCode::Enter);
     assert_eq!(app.active_trading_section(), TradingSection::Calculator);
     assert!(app.calculator_source().is_some());
+    assert_eq!(app.wm.maximized_pane, Some(PaneId::Calculator));
 
     app.set_trading_section(TradingSection::Intel);
     app.handle_key(KeyCode::Char('p'));

@@ -35,7 +35,9 @@ fn help_text_mentions_core_operator_keys() {
     assert!(help.contains("esc"));
     assert!(help.contains("u"));
     assert!(help.contains("D"));
-    assert!(help.contains("j/k"));
+    assert!(help.contains("h/j/k/l panes"));
+    assert!(help.contains("alt+1-3 workspaces"));
+    assert!(help.contains("ctrl+left/right"));
     assert!(help.contains("[/] cycle sport or suggestions"));
 }
 
@@ -90,12 +92,11 @@ fn keymap_overlay_renders_guidance_when_toggled() {
     }
     let rendered = lines.join("\n");
     assert!(rendered.contains("Keymap"));
-    assert!(rendered.contains("? toggle keymap"));
-    assert!(rendered.contains("n toggle alerts"));
-    assert!(rendered.contains("q quit"));
+    assert!(rendered.contains("? keymap"));
+    assert!(rendered.contains("n error console"));
+    assert!(rendered.contains("Controls"));
     assert!(rendered.contains("R live"));
-    assert!(rendered.contains("s start"));
-    assert!(rendered.contains("cycle Owls sport"));
+    assert!(rendered.contains("Data"));
 }
 
 fn sample_snapshot(status_line: &str) -> ExchangePanelSnapshot {

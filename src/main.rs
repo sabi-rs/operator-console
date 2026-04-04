@@ -11,6 +11,7 @@ use operator_console::recorder::{
     default_bet_recorder_command, default_bet_recorder_python, default_bet_recorder_root,
 };
 use operator_console::stub_provider::StubExchangeProvider;
+use operator_console::theme::{self, Name as ThemeName};
 use operator_console::tracing_setup::init_tracing;
 use operator_console::transport::WorkerConfig;
 use operator_console::worker_client::{BetRecorderWorkerClient, WorkerClientExchangeProvider};
@@ -19,56 +20,59 @@ fn main() -> Result<()> {
     color_eyre::install()?;
     let _ = init_tracing();
 
-    let launch_mode = match LaunchMode::parse(env::args().skip(1)) {
-        Ok(mode) => mode,
+    let options = match CliOptions::parse(env::args().skip(1)) {
+        Ok(options) => options,
         Err(message) => {
             println!("{message}");
             return Ok(());
         }
     };
 
-    let should_autostart = matches!(launch_mode, LaunchMode::Stub);
-    let provider: Box<dyn operator_console::provider::ExchangeProvider + Send> = match launch_mode {
-        LaunchMode::Stub => Box::new(StubExchangeProvider::default()),
-        LaunchMode::BetRecorder {
-            positions_payload_path,
-            run_dir,
-            account_payload_path,
-            open_bets_payload_path,
-            agent_browser_session,
-            bet_recorder_command,
-            python_executable,
-            bet_recorder_root,
-            commission_rate,
-            target_profit,
-            stop_loss,
-        } => {
-            let worker_config = WorkerConfig {
+    theme::set_theme(options.theme);
+
+    let should_autostart = matches!(options.launch_mode, LaunchMode::Stub);
+    let provider: Box<dyn operator_console::provider::ExchangeProvider + Send> =
+        match options.launch_mode {
+            LaunchMode::Stub => Box::new(StubExchangeProvider::default()),
+            LaunchMode::BetRecorder {
                 positions_payload_path,
                 run_dir,
                 account_payload_path,
                 open_bets_payload_path,
-                companion_legs_path: None,
                 agent_browser_session,
+                bet_recorder_command,
+                python_executable,
+                bet_recorder_root,
                 commission_rate,
                 target_profit,
                 stop_loss,
-                hard_margin_call_profit_floor: None,
-                warn_only_default: true,
-            };
-            Box::new(HybridExchangeProvider::new(
-                Box::new(NativeExchangeProvider::new(worker_config.clone())),
-                Box::new(WorkerClientExchangeProvider::new(
-                    if bet_recorder_command.exists() {
-                        BetRecorderWorkerClient::new_command(bet_recorder_command)
-                    } else {
-                        BetRecorderWorkerClient::new(python_executable, bet_recorder_root)
-                    },
-                    worker_config,
-                )),
-            ))
-        }
-    };
+            } => {
+                let worker_config = WorkerConfig {
+                    positions_payload_path,
+                    run_dir,
+                    account_payload_path,
+                    open_bets_payload_path,
+                    companion_legs_path: None,
+                    agent_browser_session,
+                    commission_rate,
+                    target_profit,
+                    stop_loss,
+                    hard_margin_call_profit_floor: None,
+                    warn_only_default: true,
+                };
+                Box::new(HybridExchangeProvider::new(
+                    Box::new(NativeExchangeProvider::new(worker_config.clone())),
+                    Box::new(WorkerClientExchangeProvider::new(
+                        if bet_recorder_command.exists() {
+                            BetRecorderWorkerClient::new_command(bet_recorder_command)
+                        } else {
+                            BetRecorderWorkerClient::new(python_executable, bet_recorder_root)
+                        },
+                        worker_config,
+                    )),
+                ))
+            }
+        };
 
     let mut app = App::from_provider(provider)?;
     if should_autostart {
@@ -90,8 +94,24 @@ fn disable_mouse_capture() -> io::Result<()> {
     execute!(stdout(), DisableMouseCapture)
 }
 
-fn help_text() -> &'static str {
-    "operator-console\n\nUsage:\n  operator-console [options]\n\nOptions:\n  --bet-recorder-payload-path <path>       Load positions from a captured payload\n  --bet-recorder-run-dir <path>            Load the latest exchange snapshot from a bet-recorder run bundle\n  --bet-recorder-account-path <path>       Optional account stats payload\n  --bet-recorder-open-bets-path <path>     Optional open bets payload\n  --bet-recorder-session <name>            agent-browser session to capture before refresh\n  --bet-recorder-command <path>            bet-recorder executable to run\n  --bet-recorder-python <path>             Python executable override for bet-recorder\n  --bet-recorder-root <path>               bet-recorder checkout root override\n  --commission-rate <value>                Exchange commission rate for worker calculations\n  --target-profit <value>                  Target profit for worker calculations\n  --stop-loss <value>                      Stop-loss for worker calculations\n  -h, --help                               Show this help\n"
+fn help_text() -> String {
+    format!(
+        "operator-console\n\nUsage:\n  operator-console [options]\n\nOptions:\n  --theme <name>                           Select UI theme (default: {})\n  --list-themes                            Print available theme names\n  --bet-recorder-payload-path <path>       Load positions from a captured payload\n  --bet-recorder-run-dir <path>            Load the latest exchange snapshot from a bet-recorder run bundle\n  --bet-recorder-account-path <path>       Optional account stats payload\n  --bet-recorder-open-bets-path <path>     Optional open bets payload\n  --bet-recorder-session <name>            agent-browser session to capture before refresh\n  --bet-recorder-command <path>            bet-recorder executable to run\n  --bet-recorder-python <path>             Python executable override for bet-recorder\n  --bet-recorder-root <path>               bet-recorder checkout root override\n  --commission-rate <value>                Exchange commission rate for worker calculations\n  --target-profit <value>                  Target profit for worker calculations\n  --stop-loss <value>                      Stop-loss for worker calculations\n  -h, --help                               Show this help\n\nRun `--list-themes` to see the available theme names.\n",
+        theme::default_theme().slug(),
+    )
+}
+
+fn list_themes_text() -> String {
+    let mut lines = vec![String::from("Available themes:")];
+    for theme in ThemeName::all() {
+        lines.push(format!("  {:<20} {}", theme.slug(), theme.display_name()));
+    }
+    lines.join("\n")
+}
+
+struct CliOptions {
+    launch_mode: LaunchMode,
+    theme: ThemeName,
 }
 
 enum LaunchMode {
@@ -111,8 +131,8 @@ enum LaunchMode {
     },
 }
 
-impl LaunchMode {
-    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
+impl CliOptions {
+    fn parse(args: impl IntoIterator<Item = String>) -> Result<CliOptions, String> {
         let mut positions_payload_path = None;
         let mut run_dir = None;
         let mut account_payload_path = None;
@@ -124,11 +144,16 @@ impl LaunchMode {
         let mut commission_rate = 0.0;
         let mut target_profit = 1.0;
         let mut stop_loss = 1.0;
+        let mut theme = theme::default_theme();
 
         let mut iter = args.into_iter();
         while let Some(argument) = iter.next() {
             match argument.as_str() {
-                "-h" | "--help" => return Err(help_text().to_string()),
+                "-h" | "--help" => return Err(help_text()),
+                "--list-themes" => return Err(list_themes_text()),
+                "--theme" => {
+                    theme = parse_theme(&mut iter)?;
+                }
                 "--bet-recorder-payload-path" => {
                     positions_payload_path = Some(PathBuf::from(next_value(
                         &mut iter,
@@ -176,11 +201,11 @@ impl LaunchMode {
                 "--stop-loss" => {
                     stop_loss = parse_f64(&mut iter, "--stop-loss")?;
                 }
-                _ => return Err(help_text().to_string()),
+                _ => return Err(help_text()),
             }
         }
 
-        Ok(match (positions_payload_path, run_dir) {
+        let launch_mode = match (positions_payload_path, run_dir) {
             (Some(positions_payload_path), run_dir) => LaunchMode::BetRecorder {
                 positions_payload_path: Some(positions_payload_path),
                 run_dir,
@@ -208,7 +233,9 @@ impl LaunchMode {
                 stop_loss,
             },
             (None, None) => LaunchMode::Stub,
-        })
+        };
+
+        Ok(CliOptions { launch_mode, theme })
     }
 }
 
@@ -223,5 +250,12 @@ fn next_value(
 fn parse_f64(iter: &mut impl Iterator<Item = String>, option_name: &str) -> Result<f64, String> {
     next_value(iter, option_name)?
         .parse::<f64>()
-        .map_err(|_| help_text().to_string())
+        .map_err(|_| help_text())
+}
+
+fn parse_theme(iter: &mut impl Iterator<Item = String>) -> Result<ThemeName, String> {
+    let value = next_value(iter, "--theme")?;
+    value
+        .parse::<ThemeName>()
+        .map_err(|error| format!("{error}\n\n{}\n\n{}", help_text(), list_themes_text(),))
 }

@@ -20,10 +20,12 @@ pub mod resource_state;
 pub mod runtime;
 pub mod snapshot_projection;
 pub mod stub_provider;
+pub mod theme;
 pub mod tracing_setup;
 pub mod trading_actions;
 pub mod transport;
 pub mod ui;
+pub mod wm;
 pub mod worker_client;
 
 pub fn version() -> &'static str {

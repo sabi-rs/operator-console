@@ -157,11 +157,42 @@ pub fn load_recorder_config_or_default(path: &Path) -> Result<(RecorderConfig, S
     }
 
     let content = fs::read_to_string(path)?;
-    let config = serde_json::from_str::<RecorderConfig>(&content)?;
+    let mut config = serde_json::from_str::<RecorderConfig>(&content)?;
+    repair_stale_machine_specific_paths(&mut config);
     Ok((
         config,
         format!("Loaded recorder config from {}.", path.display()),
     ))
+}
+
+fn repair_stale_machine_specific_paths(config: &mut RecorderConfig) {
+    if should_replace_stale_default_command(&config.command) {
+        config.command = default_bet_recorder_command();
+    }
+
+    if config
+        .profile_path
+        .as_ref()
+        .is_some_and(|path| should_replace_stale_default_profile(path))
+    {
+        config.profile_path = default_profile_path();
+    }
+}
+
+fn should_replace_stale_default_command(path: &Path) -> bool {
+    path.is_absolute()
+        && !path.exists()
+        && path.ends_with(Path::new("bet-recorder").join("bin").join("bet-recorder"))
+}
+
+fn should_replace_stale_default_profile(path: &Path) -> bool {
+    path.is_absolute()
+        && !path.exists()
+        && path.ends_with(
+            Path::new(".config")
+                .join("smarkets-automation")
+                .join("profile"),
+        )
 }
 
 pub fn save_recorder_config(path: &Path, config: &RecorderConfig) -> Result<String> {
@@ -378,15 +409,13 @@ impl RecorderField {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RecorderEditorState {
     pub selected_field_index: usize,
     pub editing: bool,
     pub buffer: String,
     pub replace_on_input: bool,
 }
-
 
 impl RecorderEditorState {
     pub fn selected_field(&self) -> RecorderField {
@@ -418,7 +447,6 @@ pub struct ProcessRecorderSupervisor {
     attached_pid: Option<u32>,
     attached_run_dir: Option<PathBuf>,
 }
-
 
 impl RecorderSupervisor for ProcessRecorderSupervisor {
     fn start(&mut self, config: &RecorderConfig) -> Result<()> {

@@ -71,6 +71,7 @@ use crate::trading_actions::{
 };
 use crate::transport::WorkerConfig;
 use crate::ui;
+use crate::wm::{NavDirection, PaneId};
 use crate::worker_client::{BetRecorderWorkerClient, WorkerClientExchangeProvider};
 
 type ProviderFactory = dyn Fn(&RecorderConfig) -> Box<dyn ExchangeProvider + Send>;
@@ -170,10 +171,17 @@ pub(crate) struct MarketIntelResult {
 
 #[derive(Clone, Copy)]
 enum MouseTargetKind {
+    Workspace(usize),
+    Pane(PaneId),
+    PaneMinimize(PaneId),
+    PaneToggleMaximize(PaneId),
     TradingSection(TradingSection),
     IntelView(IntelView),
     MatcherView(MatcherView),
     CalculatorTool(CalculatorTool),
+    MinimizedPane(PaneId),
+    MinimizeActivePane,
+    ToggleMaximize,
 }
 
 #[derive(Clone, Copy)]
@@ -275,8 +283,10 @@ pub struct App {
     running: bool,
     status_message: String,
     status_scroll: u16,
+    last_problem_console_message: Option<String>,
     recorder_startup_alerts_pending: bool,
     recorder_startup_alerts_muted_until: Option<Instant>,
+    pub wm: crate::wm::WindowManager,
 }
 
 const MAX_EVENT_HISTORY: usize = 25;
@@ -526,10 +536,7 @@ impl App {
             matchbook_sync_pending_reason: None,
             last_matchbook_sync_dispatch_at: None,
             matchbook_account_state: None,
-            owls_dashboard: {
-                
-                OwlsDashboard::default()
-            },
+            owls_dashboard: { OwlsDashboard::default() },
             owls_endpoint_table_state: {
                 let mut state = TableState::default();
                 state.select(Some(0));
@@ -577,9 +584,12 @@ impl App {
             running: true,
             status_message,
             status_scroll: 0,
-            recorder_startup_alerts_pending: false,
+            last_problem_console_message: None,
+            recorder_startup_alerts_pending: true,
             recorder_startup_alerts_muted_until: None,
+            wm: crate::wm::WindowManager::default(),
         };
+        app.sync_workspace_context();
         app.refresh_snapshot_enrichment();
         app.request_market_intel_sync(MarketIntelSyncReason::Background);
         app.record_event(format!(
@@ -745,7 +755,8 @@ impl App {
         self.trading_section
     }
 
-    pub fn set_trading_section(&mut self, section: TradingSection) {
+    fn apply_trading_section_state(&mut self, section: TradingSection) {
+        self.set_active_panel(Panel::Trading);
         self.trading_section = section;
         if section != TradingSection::Positions {
             self.live_view_overlay_visible = false;
@@ -770,12 +781,30 @@ impl App {
         }
     }
 
+    pub fn set_trading_section(&mut self, section: TradingSection) {
+        self.apply_trading_section_state(section);
+        let pane = pane_for_trading_section(section);
+        if let Some(workspace_index) = self.wm.workspace_index_for_pane(pane) {
+            self.wm.switch_workspace(workspace_index);
+            self.wm.focus_pane(pane);
+            self.wm.maximized_pane = self
+                .wm
+                .current_workspace()
+                .is_minimized(pane)
+                .then_some(pane);
+        }
+    }
+
     pub fn active_observability_section(&self) -> ObservabilitySection {
         self.observability_section
     }
 
+    pub fn active_pane(&self) -> Option<PaneId> {
+        self.wm.active_pane
+    }
+
     pub fn help_text(&self) -> &'static str {
-        "? keymap | n alerts | q quit | o observability | h/l sections | arrows or j/k nav | tab rotate pane/tool | r refresh cache | R recapture live\nenter edit/open | p place action | a manual entry | esc cancel | [/] cycle sport or suggestions | u reload | D defaults | s start recorder | x stop recorder | c cash out | v live view | b cycle type | m toggle mode"
+        "? keymap | n alerts | q quit | o observability | alt+1-3 workspaces | ctrl+left/right sections | h/j/k/l panes | arrows nav inside pane | tab rotate pane/tool | r refresh cache | R recapture live\nenter edit/open | p place action | a manual entry | esc cancel | [/] cycle sport or suggestions | u reload | D defaults | s start recorder | x stop recorder | c cash out | v live view | b cycle type | m toggle mode"
     }
 
     pub fn live_view_overlay_visible(&self) -> bool {
@@ -827,6 +856,32 @@ impl App {
             .iter()
             .filter(|entry| entry.unread)
             .count()
+    }
+
+    pub fn latest_problem_notification(&self) -> Option<&NotificationEntry> {
+        self.notifications.iter().rev().find(|entry| {
+            matches!(
+                entry.level,
+                NotificationLevel::Warning | NotificationLevel::Critical
+            )
+        })
+    }
+
+    pub fn problem_notifications(&self) -> Vec<&NotificationEntry> {
+        self.notifications
+            .iter()
+            .rev()
+            .filter(|entry| {
+                matches!(
+                    entry.level,
+                    NotificationLevel::Warning | NotificationLevel::Critical
+                )
+            })
+            .collect()
+    }
+
+    pub fn current_minimized_panes(&self) -> &[PaneId] {
+        &self.wm.current_workspace().minimized
     }
 
     pub fn trading_action_overlay(&self) -> Option<&TradingActionOverlayState> {
@@ -1096,6 +1151,34 @@ impl App {
         self.mouse_targets.clear();
     }
 
+    pub fn register_workspace_target(&mut self, rect: Rect, index: usize) {
+        self.mouse_targets.push(MouseTarget {
+            rect,
+            kind: MouseTargetKind::Workspace(index),
+        });
+    }
+
+    pub fn register_pane_target(&mut self, rect: Rect, pane: PaneId) {
+        self.mouse_targets.push(MouseTarget {
+            rect,
+            kind: MouseTargetKind::Pane(pane),
+        });
+    }
+
+    pub fn register_pane_minimize_target(&mut self, rect: Rect, pane: PaneId) {
+        self.mouse_targets.push(MouseTarget {
+            rect,
+            kind: MouseTargetKind::PaneMinimize(pane),
+        });
+    }
+
+    pub fn register_pane_toggle_maximize_target(&mut self, rect: Rect, pane: PaneId) {
+        self.mouse_targets.push(MouseTarget {
+            rect,
+            kind: MouseTargetKind::PaneToggleMaximize(pane),
+        });
+    }
+
     pub fn register_trading_section_target(&mut self, rect: Rect, section: TradingSection) {
         self.mouse_targets.push(MouseTarget {
             rect,
@@ -1122,6 +1205,88 @@ impl App {
             rect,
             kind: MouseTargetKind::CalculatorTool(tool),
         });
+    }
+
+    pub fn register_minimized_pane_target(&mut self, rect: Rect, pane: PaneId) {
+        self.mouse_targets.push(MouseTarget {
+            rect,
+            kind: MouseTargetKind::MinimizedPane(pane),
+        });
+    }
+
+    pub fn register_minimize_active_pane_target(&mut self, rect: Rect) {
+        self.mouse_targets.push(MouseTarget {
+            rect,
+            kind: MouseTargetKind::MinimizeActivePane,
+        });
+    }
+
+    pub fn register_toggle_maximize_target(&mut self, rect: Rect) {
+        self.mouse_targets.push(MouseTarget {
+            rect,
+            kind: MouseTargetKind::ToggleMaximize,
+        });
+    }
+
+    pub fn can_minimize_active_pane(&self) -> bool {
+        self.wm
+            .active_pane
+            .map(|pane| self.wm.can_minimize_pane(pane))
+            .unwrap_or(false)
+    }
+
+    pub fn can_minimize_pane(&self, pane: PaneId) -> bool {
+        self.wm.can_minimize_pane(pane)
+    }
+
+    pub fn minimize_active_pane(&mut self) -> bool {
+        let Some(pane) = self.wm.active_pane else {
+            return false;
+        };
+
+        if self.wm.minimize_pane(pane) {
+            self.status_message = format!("Minimized {} to strip.", pane.title());
+            self.status_scroll = 0;
+            true
+        } else {
+            self.status_message = format!("{} cannot be minimized here.", pane.title());
+            self.status_scroll = 0;
+            false
+        }
+    }
+
+    fn toggle_maximize_with_status(&mut self) {
+        self.wm.toggle_maximize();
+        if self.wm.maximized_pane.is_some() {
+            self.status_message = "Pane maximized (click restore or Alt+f)".to_string();
+        } else {
+            self.status_message = "Pane restored".to_string();
+        }
+        self.status_scroll = 0;
+    }
+
+    fn toggle_pane_maximize_with_status(&mut self, pane: PaneId) {
+        self.wm.active_pane = Some(pane);
+        if self.wm.maximized_pane == Some(pane) {
+            self.wm.maximized_pane = None;
+            self.status_message = format!("{} restored.", pane.title());
+        } else {
+            self.wm.maximized_pane = Some(pane);
+            self.apply_pane_context(pane);
+            self.status_message = format!("{} maximized.", pane.title());
+        }
+        self.status_scroll = 0;
+    }
+
+    fn minimize_pane_with_status(&mut self, pane: PaneId) {
+        self.wm.active_pane = Some(pane);
+        if self.wm.minimize_pane(pane) {
+            self.apply_pane_context(self.wm.active_pane.unwrap_or(pane));
+            self.status_message = format!("Minimized {} to strip.", pane.title());
+        } else {
+            self.status_message = format!("{} cannot be minimized here.", pane.title());
+        }
+        self.status_scroll = 0;
     }
 
     pub fn selected_open_position_row(&self) -> Option<usize> {
@@ -2223,8 +2388,7 @@ impl App {
         });
         self.status_message = String::from("Recorder started; waiting for first snapshot.");
         self.status_scroll = 0;
-        self.active_panel = Panel::Trading;
-        self.trading_section = TradingSection::Positions;
+        self.set_trading_section(TradingSection::Positions);
         Ok(())
     }
 
@@ -2362,7 +2526,7 @@ impl App {
     pub fn next_section(&mut self) {
         match self.active_panel {
             Panel::Trading => {
-                self.trading_section = next_from(self.trading_section, &TradingSection::ALL)
+                self.focus_trading_section(next_from(self.trading_section, &TradingSection::ALL))
             }
             Panel::Observability => {
                 self.observability_section =
@@ -2386,9 +2550,8 @@ impl App {
 
     pub fn previous_section(&mut self) {
         match self.active_panel {
-            Panel::Trading => {
-                self.trading_section = previous_from(self.trading_section, &TradingSection::ALL)
-            }
+            Panel::Trading => self
+                .focus_trading_section(previous_from(self.trading_section, &TradingSection::ALL)),
             Panel::Observability => {
                 self.observability_section =
                     previous_from(self.observability_section, &ObservabilitySection::ALL)
@@ -2413,6 +2576,7 @@ impl App {
     where
         <B as ratatui::backend::Backend>::Error: std::marker::Send + std::marker::Sync + 'static,
     {
+        use crossterm::event::KeyModifiers;
         while self.running {
             self.poll_recorder();
             self.drain_provider_results();
@@ -2420,12 +2584,19 @@ impl App {
             self.poll_market_intel();
             self.poll_owls_dashboard();
             self.poll_matchbook_account();
+            self.sync_problem_console_from_status();
             terminal.draw(|frame| self.render(frame))?;
 
             if event::poll(Duration::from_millis(250))? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        self.handle_key_code(key.code)
+                        if key.modifiers.contains(KeyModifiers::ALT) {
+                            self.handle_alt_key(key.code);
+                        } else if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            self.handle_ctrl_key(key.code);
+                        } else {
+                            self.handle_key_code(key.code);
+                        }
                     }
                     Event::Mouse(mouse) => self.handle_mouse(mouse.kind, mouse.column, mouse.row),
                     _ => {}
@@ -2626,7 +2797,7 @@ impl App {
                     }
                     return;
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     if let Some(overlay) = self.manual_position_overlay.as_mut() {
                         if !overlay.editing {
                             overlay.select_previous_field();
@@ -2634,7 +2805,7 @@ impl App {
                     }
                     return;
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     if let Some(overlay) = self.manual_position_overlay.as_mut() {
                         if !overlay.editing {
                             overlay.select_next_field();
@@ -2676,19 +2847,19 @@ impl App {
                     }
                     return;
                 }
-                KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('[') => {
+                KeyCode::Left | KeyCode::Char('[') => {
                     if let Err(error) = self.trading_action_shift(false) {
                         self.status_message = format!("Trading action failed: {error}");
                     }
                     return;
                 }
-                KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(']') => {
+                KeyCode::Right | KeyCode::Char(']') => {
                     if let Err(error) = self.trading_action_shift(true) {
                         self.status_message = format!("Trading action failed: {error}");
                     }
                     return;
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     if let Some(overlay) = self.trading_action_overlay.as_mut() {
                         overlay.select_previous_field();
                         self.status_message = format!(
@@ -2698,7 +2869,7 @@ impl App {
                     }
                     return;
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     if let Some(overlay) = self.trading_action_overlay.as_mut() {
                         overlay.select_next_field();
                         self.status_message = format!(
@@ -2893,17 +3064,21 @@ impl App {
             }
         }
 
-        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Matcher
-            && key_code == KeyCode::Tab {
-                self.cycle_matcher_view(true);
-                return;
-            }
+        if self.active_panel == Panel::Trading
+            && self.trading_section == TradingSection::Matcher
+            && key_code == KeyCode::Tab
+        {
+            self.cycle_matcher_view(true);
+            return;
+        }
 
-        if self.active_panel == Panel::Trading && self.trading_section == TradingSection::Intel
-            && key_code == KeyCode::Tab {
-                self.cycle_intel_view(true);
-                return;
-            }
+        if self.active_panel == Panel::Trading
+            && self.trading_section == TradingSection::Intel
+            && key_code == KeyCode::Tab
+        {
+            self.cycle_intel_view(true);
+            return;
+        }
 
         if self.is_calculator_context() && key_code == KeyCode::Tab {
             self.cycle_calculator_tool(true);
@@ -2924,8 +3099,10 @@ impl App {
                 }
             }
             KeyCode::Char('o') => self.toggle_observability_panel(),
-            KeyCode::Right | KeyCode::Char('l') => self.next_section(),
-            KeyCode::Left | KeyCode::Char('h') => self.previous_section(),
+            KeyCode::Char('h') => self.navigate_pane(NavDirection::Left),
+            KeyCode::Char('j') => self.navigate_pane(NavDirection::Down),
+            KeyCode::Char('k') => self.navigate_pane(NavDirection::Up),
+            KeyCode::Char('l') => self.navigate_pane(NavDirection::Right),
             KeyCode::Enter => {
                 if self.is_oddsmatcher_filters_context() {
                     self.begin_oddsmatcher_edit();
@@ -3128,7 +3305,7 @@ impl App {
                     self.status_scroll = 0;
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => match (self.active_panel, self.trading_section) {
+            KeyCode::Down => match (self.active_panel, self.trading_section) {
                 (Panel::Trading, TradingSection::Positions) => self.select_next_positions_row(),
                 (Panel::Trading, TradingSection::Markets)
                 | (Panel::Trading, TradingSection::Live)
@@ -3144,7 +3321,7 @@ impl App {
                 }
                 _ => {}
             },
-            KeyCode::Up | KeyCode::Char('k') => match (self.active_panel, self.trading_section) {
+            KeyCode::Up => match (self.active_panel, self.trading_section) {
                 (Panel::Trading, TradingSection::Positions) => self.select_previous_positions_row(),
                 (Panel::Trading, TradingSection::Markets)
                 | (Panel::Trading, TradingSection::Live)
@@ -3168,6 +3345,102 @@ impl App {
 
     fn handle_key_code(&mut self, key_code: KeyCode) {
         self.handle_key(key_code);
+    }
+
+    fn handle_ctrl_key(&mut self, key_code: KeyCode) {
+        match key_code {
+            KeyCode::Left => self.previous_section(),
+            KeyCode::Right => self.next_section(),
+            _ => {}
+        }
+    }
+
+    fn handle_alt_key(&mut self, key_code: KeyCode) {
+        match key_code {
+            KeyCode::Char('1') => {
+                self.switch_workspace_with_status(0);
+            }
+            KeyCode::Char('2') => {
+                if self.wm.workspaces.len() > 1 {
+                    self.switch_workspace_with_status(1);
+                }
+            }
+            KeyCode::Char('3') => {
+                if self.wm.workspaces.len() > 2 {
+                    self.switch_workspace_with_status(2);
+                }
+            }
+            KeyCode::Char('f') => {
+                self.toggle_maximize_with_status();
+            }
+            KeyCode::Up => {
+                self.navigate_pane(NavDirection::Up);
+            }
+            KeyCode::Down => {
+                self.navigate_pane(NavDirection::Down);
+            }
+            KeyCode::Left => {
+                self.navigate_pane(NavDirection::Left);
+            }
+            KeyCode::Right => {
+                self.navigate_pane(NavDirection::Right);
+            }
+            _ => {}
+        }
+    }
+
+    fn switch_workspace_with_status(&mut self, index: usize) {
+        if let Some(pane) = self.wm.switch_workspace(index) {
+            self.apply_pane_context(pane);
+            self.status_message = format!(
+                "Switched to {} / {}",
+                self.wm.current_workspace().name,
+                pane.title()
+            );
+        }
+    }
+
+    fn navigate_pane(&mut self, direction: NavDirection) {
+        if let Some(next) = self.wm.focus_neighbor(direction) {
+            self.apply_pane_context(next);
+            self.status_message = format!("Focused {}", next.title());
+        }
+    }
+
+    fn sync_workspace_context(&mut self) {
+        if let Some(pane) = self.wm.active_pane {
+            self.apply_pane_context(pane);
+        }
+    }
+
+    fn focus_trading_section(&mut self, section: TradingSection) {
+        let pane = pane_for_trading_section(section);
+        if let Some(workspace_index) = self.wm.workspace_index_for_pane(pane) {
+            self.wm.switch_workspace(workspace_index);
+            self.wm.focus_pane(pane);
+        }
+
+        self.apply_pane_context(pane);
+    }
+
+    fn apply_pane_context(&mut self, pane: PaneId) {
+        match pane {
+            PaneId::Observability => {
+                self.set_active_panel(Panel::Observability);
+            }
+            PaneId::History => {
+                self.positions_focus = PositionsFocus::Historical;
+                self.apply_trading_section_state(TradingSection::Positions);
+            }
+            PaneId::Positions => {
+                self.positions_focus = PositionsFocus::Active;
+                self.apply_trading_section_state(TradingSection::Positions);
+            }
+            _ => {
+                self.set_active_panel(Panel::Trading);
+                self.set_trading_section(trading_section_for_pane(pane));
+            }
+        }
     }
 
     fn is_recorder_context(&self) -> bool {
@@ -3544,6 +3817,7 @@ impl App {
 
         match self.positions_focus {
             PositionsFocus::Active => {
+                self.wm.focus_pane(PaneId::Positions);
                 if self.open_position_table_state.selected().is_none()
                     && active_position_row_count(&self.snapshot) > 0
                 {
@@ -3551,6 +3825,7 @@ impl App {
                 }
             }
             PositionsFocus::Historical => {
+                self.wm.focus_pane(PaneId::History);
                 if self.historical_position_table_state.selected().is_none()
                     && !self.snapshot.historical_positions.is_empty()
                 {
@@ -3804,6 +4079,31 @@ impl App {
                 });
                 if let Some(target) = selected_target {
                     match target.kind {
+                        MouseTargetKind::Workspace(index) => {
+                            self.switch_workspace_with_status(index)
+                        }
+                        MouseTargetKind::Pane(pane) => {
+                            if self.wm.active_pane == Some(pane) {
+                                let emphasized = self.wm.toggle_pane_emphasis(pane);
+                                self.apply_pane_context(pane);
+                                self.status_message = if emphasized {
+                                    format!("Expanded {}.", pane.title())
+                                } else {
+                                    format!("Reset {} sizing.", pane.title())
+                                };
+                            } else {
+                                self.wm.focus_pane(pane);
+                                self.apply_pane_context(pane);
+                                self.status_message = format!("Focused {}.", pane.title());
+                            }
+                            self.status_scroll = 0;
+                        }
+                        MouseTargetKind::PaneMinimize(pane) => {
+                            self.minimize_pane_with_status(pane);
+                        }
+                        MouseTargetKind::PaneToggleMaximize(pane) => {
+                            self.toggle_pane_maximize_with_status(pane);
+                        }
                         MouseTargetKind::TradingSection(section) => {
                             self.set_trading_section(section)
                         }
@@ -3813,6 +4113,19 @@ impl App {
                         }
                         MouseTargetKind::MatcherView(view) => self.matcher_view = view,
                         MouseTargetKind::CalculatorTool(tool) => self.calculator_tool = tool,
+                        MouseTargetKind::MinimizedPane(pane) => {
+                            if self.wm.restore_minimized_pane(pane) {
+                                self.apply_pane_context(pane);
+                                self.status_message = format!("Restored {} pane.", pane.title());
+                                self.status_scroll = 0;
+                            }
+                        }
+                        MouseTargetKind::MinimizeActivePane => {
+                            self.minimize_active_pane();
+                        }
+                        MouseTargetKind::ToggleMaximize => {
+                            self.toggle_maximize_with_status();
+                        }
                     }
                 }
             }
@@ -3826,12 +4139,14 @@ impl App {
         detail: &str,
         selected_venue: Option<VenueId>,
     ) {
+        let summary = context.to_string();
         let message = format!("{context}: {detail}");
         self.status_message = message.clone();
         self.status_scroll = 0;
+        self.last_problem_console_message = Some(message.clone());
         self.snapshot.status_line = message.clone();
         self.snapshot.worker.status = crate::domain::WorkerStatus::Error;
-        self.snapshot.worker.detail = message.clone();
+        self.snapshot.worker.detail = truncate_console_message(&message, 56);
         self.record_event(message.clone());
 
         if let Some(venue_id) = selected_venue {
@@ -3842,7 +4157,7 @@ impl App {
                 .find(|venue| venue.id == venue_id)
             {
                 venue.status = crate::domain::VenueStatus::Error;
-                venue.detail = message;
+                venue.detail = truncate_console_message(&summary, 40);
             }
         }
 
@@ -4924,7 +5239,7 @@ impl App {
             bookmaker_name: row.bookmaker.clone(),
             exchange_name: row.exchange.clone(),
         });
-        self.trading_section = TradingSection::Calculator;
+        self.set_trading_section(TradingSection::Calculator);
         self.status_message = format!(
             "Loaded calculator from Intel {}: {} @ {:.2} / {:.2}.",
             row.source.label(),
@@ -4974,7 +5289,7 @@ impl App {
                 ..TradingActionSourceContext::default()
             },
             notes: vec![
-                format!("intel_source:{}", row.source.label().to_lowercase()),
+                format!("intel_source:{}", row.source.key()),
                 format!("bookmaker:{}", row.bookmaker),
                 row.note.clone(),
             ],
@@ -4994,7 +5309,7 @@ impl App {
             bookmaker_name: row.back.bookmaker.display_name.clone(),
             exchange_name: row.lay.bookmaker.display_name.clone(),
         });
-        self.trading_section = TradingSection::Calculator;
+        self.set_trading_section(TradingSection::Calculator);
         self.status_message = format!(
             "Loaded calculator from {source_name}: {} @ {:.2} / {:.2}.",
             row.selection_name, row.back.odds, row.lay.odds
@@ -5030,22 +5345,117 @@ impl App {
     }
 
     fn toggle_observability_panel(&mut self) {
-        self.active_panel = match self.active_panel {
-            Panel::Trading => Panel::Observability,
-            Panel::Observability => Panel::Trading,
+        match self.active_panel {
+            Panel::Trading => {
+                if let Some(index) = self.wm.workspace_index_for_pane(PaneId::Observability) {
+                    self.wm.switch_workspace(index);
+                    self.wm.focus_pane(PaneId::Observability);
+                }
+                self.apply_pane_context(PaneId::Observability);
+            }
+            Panel::Observability => {
+                self.focus_trading_section(self.trading_section);
+            }
+        }
+    }
+
+    fn sync_problem_console_from_status(&mut self) {
+        let status = self.status_message.trim();
+        if status.is_empty() || !looks_like_problem_message(status) {
+            return;
+        }
+
+        if self.last_problem_console_message.as_deref() == Some(status) {
+            return;
+        }
+
+        if self.latest_problem_notification().is_some_and(|entry| {
+            entry.title == status
+                || entry.detail == status
+                || entry.detail.starts_with(status)
+                || status.starts_with(&entry.title)
+        }) {
+            self.last_problem_console_message = Some(status.to_string());
+            return;
+        }
+
+        let entry = NotificationEntry {
+            created_at: current_time_label(),
+            rule_key: String::from("error_console_status"),
+            level: infer_problem_level(status),
+            title: truncate_console_message(status, 32),
+            detail: status.to_string(),
+            unread: true,
         };
-        if self.active_panel != Panel::Trading || self.trading_section != TradingSection::Positions
-        {
-            self.live_view_overlay_visible = false;
+        if self.notifications.len() == MAX_NOTIFICATIONS {
+            self.notifications.pop_front();
         }
-        if self.active_panel != Panel::Trading
-            || !matches!(
-                self.trading_section,
-                TradingSection::Positions | TradingSection::Matcher | TradingSection::Intel
-            )
-        {
-            self.trading_action_overlay = None;
-        }
+        self.notifications.push_back(entry);
+        self.last_problem_console_message = Some(status.to_string());
+    }
+}
+
+fn truncate_console_message(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn looks_like_problem_message(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    normalized.contains("failed")
+        || normalized.contains("error")
+        || normalized.contains("unavailable")
+        || normalized.contains("timed out")
+        || normalized.contains("expired")
+}
+
+fn infer_problem_level(value: &str) -> NotificationLevel {
+    let normalized = value.to_ascii_lowercase();
+    if normalized.contains("unavailable")
+        || normalized.contains("timed out")
+        || normalized.contains("expired")
+    {
+        NotificationLevel::Critical
+    } else {
+        NotificationLevel::Warning
+    }
+}
+
+fn pane_for_trading_section(section: TradingSection) -> PaneId {
+    match section {
+        TradingSection::Positions => PaneId::Positions,
+        TradingSection::Markets => PaneId::Markets,
+        TradingSection::Live => PaneId::Live,
+        TradingSection::Props => PaneId::Props,
+        TradingSection::Intel => PaneId::Intel,
+        TradingSection::Matcher => PaneId::Matcher,
+        TradingSection::Stats => PaneId::Stats,
+        TradingSection::Alerts => PaneId::Alerts,
+        TradingSection::Calculator => PaneId::Calculator,
+        TradingSection::Recorder => PaneId::Recorder,
+    }
+}
+
+fn trading_section_for_pane(pane: PaneId) -> TradingSection {
+    match pane {
+        PaneId::Positions => TradingSection::Positions,
+        PaneId::History => TradingSection::Positions,
+        PaneId::Markets => TradingSection::Markets,
+        PaneId::Live => TradingSection::Live,
+        PaneId::Props => TradingSection::Props,
+        PaneId::Chart => TradingSection::Markets,
+        PaneId::Intel => TradingSection::Intel,
+        PaneId::Matcher => TradingSection::Matcher,
+        PaneId::Stats => TradingSection::Stats,
+        PaneId::Alerts => TradingSection::Alerts,
+        PaneId::Calculator => TradingSection::Calculator,
+        PaneId::Recorder => TradingSection::Recorder,
+        PaneId::Observability => TradingSection::Positions,
     }
 }
 
@@ -6236,7 +6646,14 @@ fn intel_source_statuses_for_view(
                 health: String::from("loading"),
                 freshness: String::from("pending"),
                 transport: String::from("worker"),
-                detail: String::from("Fixture-backed FairOdds parity slice is loading."),
+                detail: String::from("Fixture-backed parity slice is loading."),
+            },
+            IntelSourceStatus {
+                source: IntelSource::OddsApi,
+                health: String::from("loading"),
+                freshness: String::from("pending"),
+                transport: String::from("worker"),
+                detail: String::from("The Odds API fallback slice is loading."),
             },
         ];
     };
@@ -6245,7 +6662,7 @@ fn intel_source_statuses_for_view(
         .sources
         .iter()
         .map(|status| IntelSourceStatus {
-            source: intel_source_from_market_intel(status.source),
+            source: intel_source_from_market_intel(status.source.clone()),
             health: match (status.mode, status.status) {
                 (crate::market_intel::SourceLoadMode::Fixture, _) => String::from("fixture"),
                 (_, value) => value.as_str().to_string(),
@@ -6304,9 +6721,10 @@ fn intel_rows_for_view(view: IntelView, dashboard: Option<&MarketIntelDashboard>
 }
 
 fn intel_source_from_market_intel(source: crate::market_intel::MarketIntelSourceId) -> IntelSource {
-    match source {
-        crate::market_intel::MarketIntelSourceId::Oddsentry => IntelSource::OddsEntry,
-        crate::market_intel::MarketIntelSourceId::FairOdds => IntelSource::FairOdds,
+    match source.key() {
+        "fair_odds" => IntelSource::FairOdds,
+        "odds_api" => IntelSource::OddsApi,
+        _ => IntelSource::OddsEntry,
     }
 }
 
@@ -6317,10 +6735,12 @@ fn intel_rows_from_event_detail(detail: &crate::market_intel::MarketEventDetail)
         .enumerate()
         .map(|(index, quote)| IntelRow {
             id: format!("event:{}:{}", detail.event_id, index),
-            source: intel_source_from_market_intel(detail.source),
+            source: intel_source_from_market_intel(detail.source.clone()),
             event: detail.event_name.clone(),
             competition: if detail.sport.trim().is_empty() {
-                detail.source.label().to_string()
+                intel_source_from_market_intel(detail.source.clone())
+                    .label()
+                    .to_string()
             } else {
                 detail.sport.clone()
             },
@@ -6357,7 +6777,7 @@ fn intel_row_from_opportunity(row: &MarketOpportunityRow) -> IntelRow {
 
     IntelRow {
         id: row.id.clone(),
-        source: intel_source_from_market_intel(row.source),
+        source: intel_source_from_market_intel(row.source.clone()),
         event: row.event_name.clone(),
         competition: if row.competition_name.trim().is_empty() {
             row.sport.clone()
@@ -7653,7 +8073,13 @@ mod tests {
     fn replace_snapshot_alerts_when_tracked_bets_increase() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let mut app = App::with_dependencies_and_storage(
-            Box::new(StubExchangeProvider::default()),
+            Box::new(RefreshingProvider {
+                cached_refresh_count: Arc::new(Mutex::new(0)),
+                live_refresh_count: Arc::new(Mutex::new(0)),
+                load_snapshot: sample_snapshot("Initial dashboard"),
+                cached_refresh_snapshot: sample_snapshot("Initial dashboard"),
+                live_refresh_snapshot: sample_snapshot("Initial dashboard"),
+            }),
             Box::new(|| {
                 Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
             }),

@@ -117,6 +117,52 @@ fn recorder_config_preserves_explicit_null_profile_path() {
     assert_eq!(loaded.profile_path, None);
 }
 
+#[test]
+fn recorder_config_repairs_stale_machine_specific_default_paths() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let config_path = temp_dir.path().join("stale-machine-paths.json");
+    std::fs::write(
+        &config_path,
+        r#"{
+  "command": "/home/thomas/projects/sabi/bet-recorder/bin/bet-recorder",
+  "run_dir": "/tmp/sabi-live",
+  "session": "helium-live",
+  "companion_legs_path": null,
+  "profile_path": "/home/thomas/.config/smarkets-automation/profile",
+  "autostart": false,
+  "interval_seconds": 5,
+  "commission_rate": "0",
+  "target_profit": "1",
+  "stop_loss": "1",
+  "hard_margin_call_profit_floor": "",
+  "warn_only_default": true,
+  "disabled_venues": "bet365"
+}
+"#,
+    )
+    .expect("write stale config");
+
+    let (loaded, _) = load_recorder_config_or_default(&config_path).expect("load stale config");
+
+    assert_eq!(
+        loaded.command,
+        operator_console::recorder::default_bet_recorder_command()
+    );
+    assert_eq!(
+        loaded.profile_path,
+        Some(
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+                })
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join("smarkets-automation")
+                .join("profile"),
+        )
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn recorder_config_is_saved_with_private_permissions() {

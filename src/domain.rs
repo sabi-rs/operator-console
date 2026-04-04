@@ -710,8 +710,10 @@ pub struct WatchRow {
     pub average_entry_lay_odds: f64,
     pub entry_implied_probability: f64,
     pub profit_take_back_odds: f64,
+    #[serde(default)]
     pub profit_take_implied_probability: f64,
     pub stop_loss_back_odds: f64,
+    #[serde(default)]
     pub stop_loss_implied_probability: f64,
 }
 

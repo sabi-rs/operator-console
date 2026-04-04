@@ -102,6 +102,7 @@ impl IntelView {
 pub enum IntelSource {
     OddsEntry,
     FairOdds,
+    OddsApi,
 }
 
 impl IntelSource {
@@ -109,6 +110,15 @@ impl IntelSource {
         match self {
             Self::OddsEntry => "OddsEntry",
             Self::FairOdds => "FairOdds",
+            Self::OddsApi => "The Odds API",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::OddsEntry => "oddsentry",
+            Self::FairOdds => "fairodds",
+            Self::OddsApi => "odds_api",
         }
     }
 }
@@ -347,14 +357,12 @@ impl CalculatorEditorState {
     }
 }
 
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CalculatorState {
     pub input: CalculatorInput,
     pub editor: CalculatorEditorState,
     pub source: Option<CalculatorSourceContext>,
 }
-
 
 #[derive(Debug, Clone)]
 pub struct CalculatorSourceContext {
