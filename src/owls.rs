@@ -4,11 +4,14 @@ use std::fs;
 use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
+use futures_util::FutureExt;
 use reqwest::blocking::Client;
 use reqwest::Client as AsyncClient;
+use rust_socketio::{Payload, TransportType, asynchronous::ClientBuilder as SocketClientBuilder};
 use serde_json::Value;
 
 use crate::market_normalization::{
@@ -21,6 +24,7 @@ const DEFAULT_SPORT: &str = "nba";
 const DEFAULT_PLAYER: &str = "LeBron James";
 const DEFAULT_PROP_TYPE: &str = "points";
 const DEFAULT_BOOK_PROPS_PLAYER: &str = "LeBron";
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const HOT_SYNC_INTERVAL: Duration = Duration::from_secs(3);
 const WARM_SYNC_INTERVAL: Duration = Duration::from_secs(10);
 const COOL_SYNC_INTERVAL: Duration = Duration::from_secs(30);
@@ -407,7 +411,7 @@ pub fn dashboard_for_sport(sport: &str) -> OwlsDashboard {
     let groups = build_group_summaries(&endpoints);
     OwlsDashboard {
         sport: normalized_sport,
-        status_line: String::from("Owls catalog loaded. Press r to hydrate the API surface."),
+        status_line: startup_status_line(),
         refreshed_at: String::new(),
         last_sync_mode: String::from("idle"),
         sync_checks: 0,
@@ -437,8 +441,9 @@ pub fn sync_dashboard(
         Ok(value) => value,
         Err(error) => {
             let previous_dashboard = dashboard.clone();
-            mark_all_endpoints_error(&mut dashboard, &error.to_string());
-            dashboard.status_line = format!("Owls unavailable: {error}");
+            let detail = normalize_owls_error(&error.to_string());
+            mark_all_endpoints_error(&mut dashboard, &detail);
+            dashboard.status_line = format!("Owls unavailable: {detail}");
             dashboard.last_sync_mode = String::from(reason.label());
             dashboard.groups = build_group_summaries(&dashboard.endpoints);
             return OwlsSyncOutcome {
@@ -539,8 +544,9 @@ pub async fn sync_dashboard_async(
         Ok(value) => value,
         Err(error) => {
             let previous_dashboard = dashboard.clone();
-            mark_all_endpoints_error(&mut dashboard, &error.to_string());
-            dashboard.status_line = format!("Owls unavailable: {error}");
+            let detail = normalize_owls_error(&error.to_string());
+            mark_all_endpoints_error(&mut dashboard, &detail);
+            dashboard.status_line = format!("Owls unavailable: {detail}");
             dashboard.last_sync_mode = String::from(reason.label());
             dashboard.groups = build_group_summaries(&dashboard.endpoints);
             return OwlsSyncOutcome {
@@ -1547,14 +1553,7 @@ async fn fetch_endpoint_summary_async(
         ),
         OwlsEndpointId::Realtime => hydrate_result(
             id,
-            fetch_json_async(
-                client,
-                base_url,
-                api_key,
-                &format!("/api/v1/{sport}/realtime"),
-                &[],
-            )
-            .await,
+            fetch_realtime_payload_async(client, base_url, api_key, sport).await,
             parse_realtime_summary,
         ),
     }
@@ -2135,14 +2134,14 @@ fn hydrate_result(
 ) -> OwlsEndpointSummary {
     match payload {
         Ok(value) => parser(id, &value),
-        Err(error) => error_summary(id, &error.to_string()),
+        Err(error) => error_summary(id, &normalize_owls_error(&error.to_string())),
     }
 }
 
 fn error_summary(id: OwlsEndpointId, detail: &str) -> OwlsEndpointSummary {
     let mut summary = OwlsEndpointSummary::from_spec(spec_for(id));
     summary.status = String::from("error");
-    summary.detail = truncate(detail, 88);
+    summary.detail = truncate(&normalize_owls_error(detail), 88);
     summary
 }
 
@@ -2214,6 +2213,174 @@ async fn fetch_json_async(
         ));
     }
     serde_json::from_str(&payload).wrap_err("failed to decode Owls response")
+}
+
+async fn fetch_realtime_payload_async(
+    client: &AsyncClient,
+    base_url: &str,
+    api_key: &str,
+    sport: &str,
+) -> Result<Value> {
+    match fetch_socketio_realtime_payload(base_url, api_key, sport).await {
+        Ok(payload) => Ok(payload),
+        Err(error) => {
+            tracing::warn!("owls socket.io realtime fallback to REST: {error}");
+            fetch_json_async(
+                client,
+                base_url,
+                api_key,
+                &format!("/api/v1/{sport}/realtime"),
+                &[],
+            )
+            .await
+        }
+    }
+}
+
+async fn fetch_socketio_realtime_payload(
+    base_url: &str,
+    api_key: &str,
+    sport: &str,
+) -> Result<Value> {
+    let sport = sport.to_string();
+    let payload_cell = Arc::new(Mutex::new(None::<Value>));
+    let error_cell = Arc::new(Mutex::new(None::<String>));
+
+    let mut builder = SocketClientBuilder::new(format!(
+        "{}?apiKey={}",
+        base_url.trim_end_matches('/'),
+        api_key
+    ))
+    .transport_type(TransportType::Websocket)
+    .opening_header("Authorization", format!("Bearer {api_key}"))
+    .reconnect(false)
+    .namespace("/");
+
+    for event_name in ["odds-update", "pinnacle-realtime", "ps3838-realtime"] {
+        let payload_cell = Arc::clone(&payload_cell);
+        let event_sport = sport.clone();
+        builder = builder.on(event_name, move |payload: Payload, _| {
+            let payload_cell = Arc::clone(&payload_cell);
+            let event_sport = event_sport.clone();
+            async move {
+                if let Some(value) = first_json_value(payload)
+                    .and_then(|value| normalize_socketio_realtime_payload(&value, &event_sport))
+                {
+                    if let Ok(mut slot) = payload_cell.lock() {
+                        if slot.is_none() {
+                            *slot = Some(value);
+                        }
+                    }
+                }
+            }
+            .boxed()
+        });
+    }
+
+    for event_name in ["error", "connect_error"] {
+        let error_cell = Arc::clone(&error_cell);
+        builder = builder.on(event_name, move |payload: Payload, _| {
+            let error_cell = Arc::clone(&error_cell);
+            async move {
+                let detail = payload_debug_string(payload);
+                if let Ok(mut slot) = error_cell.lock() {
+                    if slot.is_none() {
+                        *slot = Some(detail);
+                    }
+                }
+            }
+            .boxed()
+        });
+    }
+
+    let socket = builder
+        .connect()
+        .await
+        .wrap_err("socket.io connect failed")?;
+
+    socket
+        .emit(
+                "subscribe",
+                serde_json::json!({
+                "sports": [sport],
+                "books": ["pinnacle", "ps3838"],
+                "alternates": true
+            }),
+        )
+        .await
+        .wrap_err("socket.io subscribe failed")?;
+
+    let started = Instant::now();
+    loop {
+        if started.elapsed() >= SOCKET_TIMEOUT {
+            break;
+        }
+        let maybe_payload = payload_cell.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(value) = maybe_payload {
+            let _ = socket.disconnect().await;
+            return Ok(value);
+        }
+        let maybe_error = error_cell.lock().ok().and_then(|slot| slot.clone());
+        if let Some(error) = maybe_error {
+            let _ = socket.disconnect().await;
+            return Err(eyre!(normalize_owls_error(&error)));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let _ = socket.disconnect().await;
+    Err(eyre!("socket.io timed out waiting for realtime payload"))
+}
+
+fn first_json_value(payload: Payload) -> Option<Value> {
+    match payload {
+        Payload::Text(values) => values.into_iter().next(),
+        Payload::String(value) => serde_json::from_str(&value).ok(),
+        Payload::Binary(_) => None,
+    }
+}
+
+fn payload_debug_string(payload: Payload) -> String {
+    match payload {
+        Payload::Text(values) => serde_json::to_string(&values).unwrap_or_else(|_| String::from("socket.io text payload")),
+        Payload::String(value) => value,
+        Payload::Binary(bytes) => format!("binary payload ({} bytes)", bytes.len()),
+    }
+}
+
+fn normalize_socketio_realtime_payload(value: &Value, sport: &str) -> Option<Value> {
+    if value.pointer("/data").is_some() {
+        return Some(value.clone());
+    }
+    if let Some(events) = value.pointer(&format!("/sports/{sport}")).and_then(Value::as_array) {
+        return Some(serde_json::json!({
+            "data": events,
+            "meta": {
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "freshness": {
+                    "ageSeconds": 0,
+                    "stale": false,
+                    "threshold": 3
+                },
+                "transport": "socket.io"
+            }
+        }));
+    }
+    if let Some(events) = value.as_array() {
+        return Some(serde_json::json!({
+            "data": events,
+            "meta": {
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "freshness": {
+                    "ageSeconds": 0,
+                    "stale": false,
+                    "threshold": 3
+                },
+                "transport": "socket.io"
+            }
+        }));
+    }
+    None
 }
 
 fn parse_book_market_summary(id: OwlsEndpointId, value: &Value) -> OwlsEndpointSummary {
@@ -2807,8 +2974,10 @@ fn parse_realtime_summary(id: OwlsEndpointId, value: &Value) -> OwlsEndpointSumm
         .pointer("/meta/freshness/stale")
         .and_then(Value::as_bool);
     summary.freshness_threshold_seconds = unsigned_number_at(value, "/meta/freshness/threshold");
+    let transport = first_pointer_string(value, &["/meta/transport"]).if_empty("rest");
     summary.detail = format!(
-        "pinnacle realtime • age {}s{}",
+        "pinnacle realtime via {} • age {}s{}",
+        transport,
         summary
             .freshness_age_seconds
             .map(|value| value.to_string())
@@ -3100,11 +3269,15 @@ fn truncate(value: &str, limit: usize) -> String {
 }
 
 fn load_api_key() -> Result<String> {
+    load_api_key_with_source().map(|(value, _)| value)
+}
+
+fn load_api_key_with_source() -> Result<(String, String)> {
     for name in API_KEY_ENV_NAMES {
         if let Some(value) = env::var_os(name) {
             let trimmed = value.to_string_lossy().trim().to_string();
             if !trimmed.is_empty() {
-                return Ok(trimmed);
+                return Ok((trimmed, format!("env:{name}")));
             }
         }
     }
@@ -3129,12 +3302,44 @@ fn load_api_key() -> Result<String> {
                     .trim_matches('\'')
                     .to_string();
                 if !parsed.is_empty() {
-                    return Ok(parsed);
+                    return Ok((parsed, path.display().to_string()));
                 }
             }
         }
     }
     Err(eyre!("missing OWLS_INSIGHT_API_KEY / OWLSINSIGHT_API_KEY"))
+}
+
+fn startup_status_line() -> String {
+    match load_api_key_with_source() {
+        Ok((key, source)) => format!(
+            "Owls catalog loaded. Key detected from {} ({}). Press r to hydrate the API surface.",
+            source,
+            mask_key_hint(&key)
+        ),
+        Err(error) => format!(
+            "Owls catalog loaded but auth is not configured: {}. Press r after adding a key.",
+            error
+        ),
+    }
+}
+
+fn mask_key_hint(key: &str) -> String {
+    let trimmed = key.trim();
+    if trimmed.len() <= 8 {
+        return String::from("********");
+    }
+    format!("{}...{}", &trimmed[..4], &trimmed[trimmed.len() - 4..])
+}
+
+fn normalize_owls_error(detail: &str) -> String {
+    let lowered = detail.to_ascii_lowercase();
+    if lowered.contains("error code: 1010") || (lowered.contains("http 403") && lowered.contains("1010")) {
+        return String::from(
+            "Cloudflare blocked this client (HTTP 403 / 1010). Verify Owls allowlisting or zone access for this machine.",
+        );
+    }
+    detail.to_string()
 }
 
 fn dotenv_candidates() -> Vec<PathBuf> {
