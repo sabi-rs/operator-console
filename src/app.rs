@@ -1,3 +1,4 @@
+use chrono::Local;
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 use ratatui::backend::Backend;
@@ -279,6 +280,7 @@ pub struct App {
     last_successful_snapshot_at: Option<String>,
     last_recorder_start_failure: Option<String>,
     event_history: VecDeque<String>,
+    last_event_at_label: Option<String>,
     mouse_targets: Vec<MouseTarget>,
     running: bool,
     status_message: String,
@@ -580,6 +582,7 @@ impl App {
             last_successful_snapshot_at,
             last_recorder_start_failure: None,
             event_history: VecDeque::with_capacity(MAX_EVENT_HISTORY),
+            last_event_at_label: None,
             mouse_targets: Vec::new(),
             running: true,
             status_message,
@@ -686,7 +689,12 @@ impl App {
     }
 
     pub fn intel_source_statuses(&self) -> Vec<IntelSourceStatus> {
-        intel_source_statuses_for_view(self.intel_view, self.market_intel_dashboard())
+        intel_source_statuses_for_view(
+            self.intel_view,
+            self.market_intel_dashboard(),
+            self.market_intel_phase(),
+            self.market_intel_last_error(),
+        )
     }
 
     pub fn intel_ready_sources(&self) -> usize {
@@ -697,6 +705,10 @@ impl App {
     }
 
     pub fn intel_freshness_label(&self) -> String {
+        if self.market_intel_dashboard().is_none() {
+            return self.market_intel_phase().to_string();
+        }
+
         let has_fixture = self
             .intel_source_statuses()
             .into_iter()
@@ -1516,6 +1528,14 @@ impl App {
             .collect()
     }
 
+    pub fn last_event_at_label(&self) -> Option<&str> {
+        self.last_event_at_label.as_deref()
+    }
+
+    pub fn top_bar_ticker_parts(&self) -> (&'static str, String) {
+        top_bar_ticker_parts(&self.snapshot)
+    }
+
     pub fn worker_reconnect_count(&self) -> usize {
         self.snapshot
             .runtime
@@ -2126,8 +2146,8 @@ impl App {
                 if matches!(result.reason, MatchbookSyncReason::Manual) || first_load {
                     self.status_message = state.status_line.clone();
                     self.status_scroll = 0;
+                    self.record_event(format!("Matchbook {} sync applied.", result.reason.label()));
                 }
-                self.record_event(format!("Matchbook {} sync applied.", result.reason.label()));
             }
             Err(error) => {
                 self.matchbook_resource_state.finish_error(error.clone());
@@ -2209,12 +2229,12 @@ impl App {
                 if matches!(result.reason, MarketIntelSyncReason::Manual) {
                     self.status_message = dashboard.status_line.clone();
                     self.status_scroll = 0;
+                    self.record_event(format!(
+                        "Market intel {} sync applied.",
+                        result.reason.label()
+                    ));
                 }
                 self.clamp_selected_intel_row();
-                self.record_event(format!(
-                    "Market intel {} sync applied.",
-                    result.reason.label()
-                ));
             }
             Err(error) => {
                 self.market_intel_resource_state.finish_error(error.clone());
@@ -2690,11 +2710,11 @@ impl App {
         self.clamp_selected_owls_endpoint();
         self.refresh_snapshot_enrichment();
 
-        if outcome.changed || matches!(result.reason, OwlsSyncReason::Manual) {
+        if matches!(result.reason, OwlsSyncReason::Manual) {
             self.status_message = self.owls_dashboard.status_line.clone();
             self.status_scroll = 0;
         }
-        if outcome.changed {
+        if outcome.changed && matches!(result.reason, OwlsSyncReason::Manual) {
             self.record_event(format!(
                 "Owls {} sync applied {} changes after {} checks.",
                 result.reason.label(),
@@ -4293,8 +4313,13 @@ impl App {
             self.recorder_startup_alerts_muted_until = None;
             self.record_event("Recorder startup alert mute cleared after first snapshot.");
         }
-        self.status_message = self.snapshot.status_line.clone();
-        self.status_scroll = 0;
+        if !had_successful_snapshot
+            || previous_stale != current_stale
+            || self.status_message.is_empty()
+        {
+            self.status_message = self.snapshot.status_line.clone();
+            self.status_scroll = 0;
+        }
         self.clamp_selected_exchange_row();
         self.clamp_selected_open_position_row();
         self.clamp_selected_intel_row();
@@ -4365,6 +4390,7 @@ impl App {
             self.event_history.pop_front();
         }
         self.event_history.push_back(message);
+        self.last_event_at_label = Some(Local::now().format("%H:%M:%S").to_string());
     }
 
     fn selected_venue_label(&self) -> String {
@@ -6323,6 +6349,69 @@ fn watch_row_event_name(
         })
 }
 
+fn top_bar_ticker_parts(snapshot: &ExchangePanelSnapshot) -> (&'static str, String) {
+    let watched = dedupe_ticker_items(
+        snapshot
+            .watch
+            .as_ref()
+            .into_iter()
+            .flat_map(|watch| watch.watches.iter())
+            .filter_map(|watch_row| watch_row_event_name(snapshot, watch_row)),
+        3,
+    );
+    if !watched.is_empty() {
+        return ("watch", watched.join("  •  "));
+    }
+
+    let live = dedupe_ticker_items(
+        snapshot
+            .open_positions
+            .iter()
+            .filter(|row| is_live_ticker_position(row))
+            .map(|row| row.event.clone()),
+        3,
+    );
+    if !live.is_empty() {
+        return ("live", live.join("  •  "));
+    }
+
+    let next = dedupe_ticker_items(snapshot.events.iter().map(|event| event.label.clone()), 3);
+    if !next.is_empty() {
+        return ("next", next.join("  •  "));
+    }
+
+    ("watch", String::from("clear"))
+}
+
+fn dedupe_ticker_items(items: impl IntoIterator<Item = String>, limit: usize) -> Vec<String> {
+    let mut unique = Vec::new();
+    let mut seen = HashSet::new();
+
+    for item in items {
+        let label = item.trim();
+        if label.is_empty() {
+            continue;
+        }
+        let key = normalize_manual_key(label);
+        if key.is_empty() || !seen.insert(key) {
+            continue;
+        }
+        unique.push(label.to_string());
+        if unique.len() >= limit {
+            break;
+        }
+    }
+
+    unique
+}
+
+fn is_live_ticker_position(row: &OpenPositionRow) -> bool {
+    row.is_in_play
+        || row.market_status.eq_ignore_ascii_case("live")
+        || !row.current_score.trim().is_empty()
+        || !row.live_clock.trim().is_empty()
+}
+
 fn find_owls_sharp_price(
     dashboard: &OwlsDashboard,
     event: &str,
@@ -6631,29 +6720,52 @@ fn exchange_venue_from_bookmaker(code: &str, display_name: &str) -> Option<Venue
 fn intel_source_statuses_for_view(
     view: IntelView,
     dashboard: Option<&MarketIntelDashboard>,
+    phase: &str,
+    last_error: Option<&str>,
 ) -> Vec<IntelSourceStatus> {
     let Some(dashboard) = dashboard else {
+        let health = match phase {
+            "error" => "error",
+            "stale" => "stale",
+            "loading" => "loading",
+            _ => "idle",
+        };
+        let freshness = match phase {
+            "error" | "stale" => "stale",
+            "loading" => "pending",
+            _ => "idle",
+        };
+        let detail = last_error
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| match phase {
+                "error" => format!("{} dashboard failed to load.", view.label()),
+                "stale" => format!("{} dashboard refresh went stale.", view.label()),
+                "loading" => format!("{} dashboard is still loading.", view.label()),
+                _ => format!("{} dashboard has not been requested yet.", view.label()),
+            });
+
         return vec![
             IntelSourceStatus {
                 source: IntelSource::OddsEntry,
-                health: String::from("loading"),
-                freshness: String::from("pending"),
+                health: String::from(health),
+                freshness: String::from(freshness),
                 transport: String::from("worker"),
-                detail: format!("{} dashboard is still loading.", view.label()),
+                detail: detail.clone(),
             },
             IntelSourceStatus {
                 source: IntelSource::FairOdds,
-                health: String::from("loading"),
-                freshness: String::from("pending"),
+                health: String::from(health),
+                freshness: String::from(freshness),
                 transport: String::from("worker"),
-                detail: String::from("Fixture-backed parity slice is loading."),
+                detail: detail.clone(),
             },
             IntelSourceStatus {
                 source: IntelSource::OddsApi,
-                health: String::from("loading"),
-                freshness: String::from("pending"),
+                health: String::from(health),
+                freshness: String::from(freshness),
                 transport: String::from("worker"),
-                detail: String::from("The Odds API fallback slice is loading."),
+                detail,
             },
         ];
     };
@@ -6969,8 +7081,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::domain::{
-        ExchangePanelSnapshot, OpenPositionRow, RuntimeSummary, TrackedBetRow, VenueId,
-        VenueStatus, VenueSummary, WatchRow, WatchSnapshot, WorkerStatus, WorkerSummary,
+        EventCandidateSummary, ExchangePanelSnapshot, OpenPositionRow, RuntimeSummary,
+        TrackedBetRow, VenueId, VenueStatus, VenueSummary, WatchRow, WatchSnapshot, WorkerStatus,
+        WorkerSummary,
     };
     use crate::exchange_api::{MatchbookAccountState, MatchbookOfferRow};
     use crate::manual_positions::ManualPositionEntry;
@@ -7123,6 +7236,22 @@ mod tests {
         assert_eq!(app.snapshot().status_line, "Auto refreshed dashboard");
         assert_eq!(*cached_refresh_count.lock().expect("lock"), 1);
         assert_eq!(*live_refresh_count.lock().expect("lock"), 0);
+    }
+
+    #[test]
+    fn intel_source_statuses_surface_error_without_dashboard_payload() {
+        let statuses = super::intel_source_statuses_for_view(
+            crate::app_state::IntelView::Markets,
+            None,
+            "error",
+            Some("backend unavailable"),
+        );
+
+        assert_eq!(statuses.len(), 3);
+        assert!(statuses.iter().all(|status| status.health == "error"));
+        assert!(statuses
+            .iter()
+            .all(|status| status.detail.contains("backend unavailable")));
     }
 
     #[test]
@@ -8429,6 +8558,198 @@ mod tests {
         app.drain_owls_sync_results();
 
         assert_eq!(app.owls_dashboard.sport, "nfl");
+    }
+
+    #[test]
+    fn top_bar_ticker_prefers_watched_events() {
+        let mut app = App::default();
+        let mut snapshot = sample_snapshot("ticker");
+        snapshot.open_positions = vec![OpenPositionRow {
+            event: String::from("Arsenal vs Everton"),
+            event_status: String::new(),
+            event_url: String::new(),
+            contract: String::from("Draw"),
+            market: String::from("Full-time result"),
+            status: String::from("open"),
+            market_status: String::from("ready"),
+            is_in_play: false,
+            price: 3.2,
+            stake: 10.0,
+            liability: 22.0,
+            current_value: 10.0,
+            pnl_amount: 0.0,
+            overall_pnl_known: true,
+            current_back_odds: Some(3.0),
+            current_implied_probability: Some(1.0 / 3.0),
+            current_implied_percentage: Some(100.0 / 3.0),
+            current_buy_odds: Some(3.0),
+            current_buy_implied_probability: Some(1.0 / 3.0),
+            current_sell_odds: Some(3.1),
+            current_sell_implied_probability: Some(1.0 / 3.1),
+            current_score: String::new(),
+            current_score_home: None,
+            current_score_away: None,
+            live_clock: String::new(),
+            can_trade_out: true,
+        }];
+        snapshot.watch = Some(WatchSnapshot {
+            position_count: 1,
+            watch_count: 1,
+            commission_rate: 0.0,
+            target_profit: 1.0,
+            stop_loss: 1.0,
+            watches: vec![WatchRow {
+                contract: String::from("Draw"),
+                market: String::from("Full-time result"),
+                position_count: 1,
+                can_trade_out: true,
+                total_stake: 10.0,
+                total_liability: 10.0,
+                current_pnl_amount: 0.0,
+                current_back_odds: Some(3.0),
+                average_entry_lay_odds: 3.4,
+                entry_implied_probability: 1.0 / 3.4,
+                profit_take_back_odds: 2.8,
+                profit_take_implied_probability: 1.0 / 2.8,
+                stop_loss_back_odds: 3.7,
+                stop_loss_implied_probability: 1.0 / 3.7,
+            }],
+        });
+        app.replace_snapshot(snapshot);
+
+        let (kind, body) = app.top_bar_ticker_parts();
+        assert_eq!(kind, "watch");
+        assert_eq!(body, "Arsenal vs Everton");
+    }
+
+    #[test]
+    fn top_bar_ticker_falls_back_to_live_events() {
+        let mut app = App::default();
+        let mut snapshot = sample_snapshot("ticker");
+        snapshot.open_positions = vec![OpenPositionRow {
+            event: String::from("Malta vs Luxembourg"),
+            event_status: String::new(),
+            event_url: String::new(),
+            contract: String::from("Draw"),
+            market: String::from("Full-time result"),
+            status: String::from("open"),
+            market_status: String::from("live"),
+            is_in_play: false,
+            price: 3.3,
+            stake: 10.0,
+            liability: 23.0,
+            current_value: 10.0,
+            pnl_amount: 0.0,
+            overall_pnl_known: true,
+            current_back_odds: Some(3.2),
+            current_implied_probability: Some(1.0 / 3.2),
+            current_implied_percentage: Some(100.0 / 3.2),
+            current_buy_odds: Some(3.2),
+            current_buy_implied_probability: Some(1.0 / 3.2),
+            current_sell_odds: Some(3.3),
+            current_sell_implied_probability: Some(1.0 / 3.3),
+            current_score: String::new(),
+            current_score_home: None,
+            current_score_away: None,
+            live_clock: String::from("72"),
+            can_trade_out: true,
+        }];
+        app.replace_snapshot(snapshot);
+
+        let (kind, body) = app.top_bar_ticker_parts();
+        assert_eq!(kind, "live");
+        assert_eq!(body, "Malta vs Luxembourg");
+    }
+
+    #[test]
+    fn top_bar_ticker_falls_back_to_upcoming_events() {
+        let mut app = App::default();
+        let mut snapshot = sample_snapshot("ticker");
+        snapshot.events = vec![EventCandidateSummary {
+            id: String::from("event-1"),
+            label: String::from("Liverpool vs City"),
+            competition: String::from("Premier League"),
+            start_time: String::from("2026-03-22T17:30:00Z"),
+            url: String::from("https://example.com/liverpool-city"),
+        }];
+        app.replace_snapshot(snapshot);
+
+        let (kind, body) = app.top_bar_ticker_parts();
+        assert_eq!(kind, "next");
+        assert_eq!(body, "Liverpool vs City");
+    }
+
+    #[test]
+    fn background_owls_sync_does_not_replace_operator_feed_status() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(StubExchangeProvider::default()),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let initial_event_count = app.recent_events().len();
+        app.owls_sync_rx = rx;
+        app.owls_sync_in_flight = true;
+        app.status_message = String::from("Pinned operator message.");
+
+        let mut dashboard = owls::dashboard_for_sport("nba");
+        dashboard.status_line = String::from("Owls background refresh completed.");
+        tx.send(OwlsSyncResult {
+            outcome: owls::OwlsSyncOutcome {
+                dashboard,
+                checked_count: 3,
+                changed_count: 1,
+                changed: true,
+            },
+            reason: OwlsSyncReason::Background,
+        })
+        .expect("send background result");
+
+        app.drain_owls_sync_results();
+
+        assert_eq!(app.status_message(), "Pinned operator message.");
+        assert_eq!(app.recent_events().len(), initial_event_count);
+    }
+
+    #[test]
+    fn background_snapshot_preserves_operator_feed_status() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(StubExchangeProvider::default()),
+            Box::new(|| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(StubExchangeProvider::default()) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(DisabledSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        app.status_message = String::from("Pinned operator message.");
+        app.last_successful_snapshot_at = Some(String::from("2026-03-19T10:00:00Z"));
+
+        app.replace_snapshot(sample_runtime_snapshot(
+            "Auto refreshed dashboard",
+            "2026-03-19T10:00:01Z",
+            false,
+            "cached",
+        ));
+
+        assert_eq!(app.status_message(), "Pinned operator message.");
     }
 
     #[test]

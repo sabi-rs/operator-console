@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -313,7 +315,18 @@ fn render_workspace_strip(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     ])
     .areas(area);
 
-    let status_label = truncate_line(app.status_message(), 92);
+    let latest_event_label = app.last_event_at_label().unwrap_or("--:--:--");
+    let latest_event_spans = if let Some((prefix, seconds)) = latest_event_label.rsplit_once(':') {
+        vec![
+            Span::styled(format!("{prefix}:"), Style::default().fg(muted_text())),
+            Span::styled(seconds.to_string(), Style::default().fg(text_color())),
+        ]
+    } else {
+        vec![Span::styled(
+            latest_event_label.to_string(),
+            Style::default().fg(text_color()),
+        )]
+    };
 
     if brand_area.height > 0 {
         frame.render_widget(
@@ -338,7 +351,11 @@ fn render_workspace_strip(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 Style::default().fg(accent_gold()).bg(panel_background()),
             ),
             Span::raw(" "),
-            Span::styled(status_label.clone(), Style::default().fg(text_color())),
+            latest_event_spans[0].clone(),
+            latest_event_spans
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| Span::raw("")),
         ]))
         .style(Style::default().bg(shell_background()))
         .wrap(Wrap { trim: true }),
@@ -414,8 +431,28 @@ fn render_workspace_strip(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         center_area,
     );
 
+    let (ticker_kind, ticker_body) = app.top_bar_ticker_parts();
+    let ticker_label = format!(" {ticker_kind} ");
+    let ticker_body_width = left_area
+        .width
+        .saturating_sub(ticker_label.chars().count() as u16 + 1)
+        as usize;
+    let ticker_body = ticker_window(
+        &ticker_body,
+        ticker_body_width,
+        ticker_scroll_offset_chars(),
+    );
     frame.render_widget(
-        Block::default().style(Style::default().bg(shell_background())),
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                ticker_label,
+                Style::default().fg(accent_blue()).bg(panel_background()),
+            ),
+            Span::raw(" "),
+            Span::styled(ticker_body, Style::default().fg(muted_text())),
+        ]))
+        .style(Style::default().bg(shell_background()))
+        .wrap(Wrap { trim: true }),
         left_area,
     );
 
@@ -515,6 +552,7 @@ fn render_footer_line(frame: &mut Frame<'_>, area: Rect, app: &App) {
             crate::alerts::NotificationLevel::Warning => accent_gold(),
             crate::alerts::NotificationLevel::Critical => accent_red(),
         };
+        let issue_count = app.problem_notifications().len();
         Paragraph::new(Line::from(vec![
             Span::styled(
                 format!("{} ", entry.level.label().to_uppercase()),
@@ -523,7 +561,11 @@ fn render_footer_line(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                truncate_line(&format!("{}: {}", entry.title, entry.detail), 72),
+                format!(
+                    "{} issue{}",
+                    issue_count,
+                    if issue_count == 1 { "" } else { "s" }
+                ),
                 Style::default().fg(text_color()),
             ),
             Span::styled("  [n]", Style::default().fg(muted_text())),
@@ -1012,13 +1054,40 @@ fn worker_status_color(app: &App) -> Color {
     }
 }
 
+fn ticker_scroll_offset_chars() -> usize {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| (duration.as_millis() / 1000) as usize)
+        .unwrap_or(0)
+}
+
+fn ticker_window(text: &str, width: usize, offset: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let glyphs = text.chars().collect::<Vec<_>>();
+    if glyphs.len() <= width {
+        return text.to_string();
+    }
+
+    let mut looped = glyphs;
+    looped.extend("      ".chars());
+    let len = looped.len();
+    let start = offset % len;
+
+    (0..width)
+        .map(|index| looped[(start + index) % len])
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use color_eyre::Result;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    use super::render;
+    use super::{render, ticker_window};
     use crate::app::{App, TradingSection};
     use crate::domain::ExchangePanelSnapshot;
     use crate::owls::{
@@ -1057,6 +1126,21 @@ mod tests {
             .expect("draw ui");
 
         assert_eq!(owls::endpoint_summary_clone_count_for_test(), 0);
+    }
+
+    #[test]
+    fn ticker_window_stays_static_when_text_fits() {
+        assert_eq!(
+            ticker_window("Arsenal vs Everton", 32, 5),
+            "Arsenal vs Everton"
+        );
+    }
+
+    #[test]
+    fn ticker_window_scrolls_long_text() {
+        assert_eq!(ticker_window("abcdef", 4, 0), "abcd");
+        assert_eq!(ticker_window("abcdef", 4, 2), "cdef");
+        assert_eq!(ticker_window("abcdef", 4, 6), "    ");
     }
 
     fn large_soccer_dashboard() -> owls::OwlsDashboard {

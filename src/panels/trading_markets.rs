@@ -122,6 +122,10 @@ fn render_overview(
             )),
         ]),
         Line::from(vec![
+            Span::styled("Controls  ", Style::default().fg(accent_pink())),
+            Span::raw("[/] cycle sport • ↑/↓ endpoint • Enter inspect"),
+        ]),
+        Line::from(vec![
             Span::styled("Selected  ", Style::default().fg(accent_green())),
             Span::styled(
                 truncate(&selected_line, 78),
@@ -162,7 +166,7 @@ fn render_overview(
                         .unwrap_or_else(|| String::from("-")),
                 ),
             ]),
-            Row::new(vec![Cell::from("Hint"), Cell::from("[ ] sport")]),
+            Row::new(vec![Cell::from("Hint"), Cell::from("[/] cycle sport")]),
         ],
         [Constraint::Length(10), Constraint::Min(8)],
     )

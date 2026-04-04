@@ -11,7 +11,7 @@ use color_eyre::eyre::{eyre, Result, WrapErr};
 use futures_util::FutureExt;
 use reqwest::blocking::Client;
 use reqwest::Client as AsyncClient;
-use rust_socketio::{Payload, TransportType, asynchronous::ClientBuilder as SocketClientBuilder};
+use rust_socketio::{asynchronous::ClientBuilder as SocketClientBuilder, Payload, TransportType};
 use serde_json::Value;
 
 use crate::market_normalization::{
@@ -442,8 +442,13 @@ pub fn sync_dashboard(
         Err(error) => {
             let previous_dashboard = dashboard.clone();
             let detail = normalize_owls_error(&error.to_string());
-            mark_all_endpoints_error(&mut dashboard, &detail);
-            dashboard.status_line = format!("Owls unavailable: {detail}");
+            if is_missing_owls_api_key_detail(&detail) {
+                mark_all_endpoints_waiting(&mut dashboard, &detail);
+                dashboard.status_line = missing_owls_api_key_status_line();
+            } else {
+                mark_all_endpoints_error(&mut dashboard, &detail);
+                dashboard.status_line = format!("Owls unavailable: {detail}");
+            }
             dashboard.last_sync_mode = String::from(reason.label());
             dashboard.groups = build_group_summaries(&dashboard.endpoints);
             return OwlsSyncOutcome {
@@ -545,8 +550,13 @@ pub async fn sync_dashboard_async(
         Err(error) => {
             let previous_dashboard = dashboard.clone();
             let detail = normalize_owls_error(&error.to_string());
-            mark_all_endpoints_error(&mut dashboard, &detail);
-            dashboard.status_line = format!("Owls unavailable: {detail}");
+            if is_missing_owls_api_key_detail(&detail) {
+                mark_all_endpoints_waiting(&mut dashboard, &detail);
+                dashboard.status_line = missing_owls_api_key_status_line();
+            } else {
+                mark_all_endpoints_error(&mut dashboard, &detail);
+                dashboard.status_line = format!("Owls unavailable: {detail}");
+            }
             dashboard.last_sync_mode = String::from(reason.label());
             dashboard.groups = build_group_summaries(&dashboard.endpoints);
             return OwlsSyncOutcome {
@@ -2159,6 +2169,13 @@ fn mark_all_endpoints_error(dashboard: &mut OwlsDashboard, detail: &str) {
     }
 }
 
+fn mark_all_endpoints_waiting(dashboard: &mut OwlsDashboard, detail: &str) {
+    for endpoint in &mut dashboard.endpoints {
+        endpoint.status = String::from("waiting");
+        endpoint.detail = truncate(detail, 88);
+    }
+}
+
 fn fetch_json(
     client: &Client,
     base_url: &str,
@@ -2300,8 +2317,8 @@ async fn fetch_socketio_realtime_payload(
 
     socket
         .emit(
-                "subscribe",
-                serde_json::json!({
+            "subscribe",
+            serde_json::json!({
                 "sports": [sport],
                 "books": ["pinnacle", "ps3838"],
                 "alternates": true
@@ -2342,7 +2359,8 @@ fn first_json_value(payload: Payload) -> Option<Value> {
 
 fn payload_debug_string(payload: Payload) -> String {
     match payload {
-        Payload::Text(values) => serde_json::to_string(&values).unwrap_or_else(|_| String::from("socket.io text payload")),
+        Payload::Text(values) => serde_json::to_string(&values)
+            .unwrap_or_else(|_| String::from("socket.io text payload")),
         Payload::String(value) => value,
         Payload::Binary(bytes) => format!("binary payload ({} bytes)", bytes.len()),
     }
@@ -2352,7 +2370,10 @@ fn normalize_socketio_realtime_payload(value: &Value, sport: &str) -> Option<Val
     if value.pointer("/data").is_some() {
         return Some(value.clone());
     }
-    if let Some(events) = value.pointer(&format!("/sports/{sport}")).and_then(Value::as_array) {
+    if let Some(events) = value
+        .pointer(&format!("/sports/{sport}"))
+        .and_then(Value::as_array)
+    {
         return Some(serde_json::json!({
             "data": events,
             "meta": {
@@ -3288,26 +3309,34 @@ fn load_api_key_with_source() -> Result<(String, String)> {
         let content = fs::read_to_string(&path)
             .wrap_err_with(|| format!("failed to read {}", path.display()))?;
         for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            let Some((key, value)) = trimmed.split_once('=') else {
-                continue;
-            };
-            if API_KEY_ENV_NAMES.contains(&key.trim()) {
-                let parsed = value
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_string();
-                if !parsed.is_empty() {
-                    return Ok((parsed, path.display().to_string()));
-                }
+            if let Some(parsed) = parse_api_key_from_line(line) {
+                return Ok((parsed, path.display().to_string()));
             }
         }
     }
     Err(eyre!("missing OWLS_INSIGHT_API_KEY / OWLSINSIGHT_API_KEY"))
+}
+
+fn parse_api_key_from_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+
+    let candidate = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+    let (key, value) = candidate.split_once('=')?;
+    if !API_KEY_ENV_NAMES.contains(&key.trim()) {
+        return None;
+    }
+
+    let parsed = value
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string();
+    (!parsed.is_empty()).then_some(parsed)
 }
 
 fn startup_status_line() -> String {
@@ -3317,11 +3346,14 @@ fn startup_status_line() -> String {
             source,
             mask_key_hint(&key)
         ),
-        Err(error) => format!(
-            "Owls catalog loaded but auth is not configured: {}. Press r after adding a key.",
-            error
-        ),
+        Err(_) => missing_owls_api_key_status_line(),
     }
+}
+
+fn missing_owls_api_key_status_line() -> String {
+    String::from(
+        "Owls catalog ready in offline mode. Add OWLS_INSIGHT_API_KEY to hydrate live endpoints.",
+    )
 }
 
 fn mask_key_hint(key: &str) -> String {
@@ -3334,12 +3366,18 @@ fn mask_key_hint(key: &str) -> String {
 
 fn normalize_owls_error(detail: &str) -> String {
     let lowered = detail.to_ascii_lowercase();
-    if lowered.contains("error code: 1010") || (lowered.contains("http 403") && lowered.contains("1010")) {
+    if lowered.contains("error code: 1010")
+        || (lowered.contains("http 403") && lowered.contains("1010"))
+    {
         return String::from(
             "Cloudflare blocked this client (HTTP 403 / 1010). Verify Owls allowlisting or zone access for this machine.",
         );
     }
     detail.to_string()
+}
+
+fn is_missing_owls_api_key_detail(detail: &str) -> bool {
+    detail.contains("OWLS_INSIGHT_API_KEY") || detail.contains("OWLSINSIGHT_API_KEY")
 }
 
 fn dotenv_candidates() -> Vec<PathBuf> {
@@ -3348,6 +3386,10 @@ fn dotenv_candidates() -> Vec<PathBuf> {
         let home_path = PathBuf::from(home);
         paths.push(home_path.join(".env"));
         paths.push(home_path.join(".env.local"));
+        paths.push(home_path.join(".zshenv"));
+        paths.push(home_path.join(".zshrc"));
+        paths.push(home_path.join(".bashrc"));
+        paths.push(home_path.join(".profile"));
     }
     if let Ok(current_dir) = env::current_dir() {
         for ancestor in current_dir.ancestors() {
@@ -3631,6 +3673,41 @@ impl EmptyFallback for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_api_key_offline_state_is_waiting_not_error() {
+        let mut dashboard = dashboard_for_sport("nba");
+
+        mark_all_endpoints_waiting(
+            &mut dashboard,
+            "missing OWLS_INSIGHT_API_KEY / OWLSINSIGHT_API_KEY",
+        );
+
+        assert!(missing_owls_api_key_status_line().contains("offline mode"));
+        assert!(dashboard
+            .endpoints
+            .iter()
+            .all(|endpoint| endpoint.status == "waiting"));
+        assert!(is_missing_owls_api_key_detail(
+            "missing OWLS_INSIGHT_API_KEY / OWLSINSIGHT_API_KEY"
+        ));
+    }
+
+    #[test]
+    fn parse_api_key_from_plain_env_line() {
+        assert_eq!(
+            parse_api_key_from_line("OWLSINSIGHT_API_KEY=secret-value"),
+            Some(String::from("secret-value"))
+        );
+    }
+
+    #[test]
+    fn parse_api_key_from_exported_shell_line() {
+        assert_eq!(
+            parse_api_key_from_line("export OWLSINSIGHT_API_KEY=\"secret-value\""),
+            Some(String::from("secret-value"))
+        );
+    }
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;

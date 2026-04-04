@@ -148,8 +148,27 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_table(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    let rows = app
-        .intel_rows()
+    let intel_rows = app.intel_rows();
+    if intel_rows.is_empty() {
+        let message = match app.market_intel_phase() {
+            "error" | "stale" => app
+                .market_intel_last_error()
+                .unwrap_or("Market intel is unavailable.")
+                .to_string(),
+            "loading" => String::from("Market intel is still loading."),
+            _ => String::from("No market-intel opportunities are available for this view yet."),
+        };
+
+        frame.render_widget(
+            Paragraph::new(message)
+                .block(section_block("Opportunity Board", accent_cyan()))
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    }
+
+    let rows = intel_rows
         .into_iter()
         .map(|row| {
             Row::new(vec![

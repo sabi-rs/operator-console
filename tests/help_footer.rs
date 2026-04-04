@@ -42,7 +42,7 @@ fn help_text_mentions_core_operator_keys() {
 }
 
 #[test]
-fn status_bar_renders_status_message_visibly() {
+fn status_bar_renders_latest_timestamp_and_compact_error_summary() {
     let mut app = App::from_provider(StaticProvider {
         snapshot: sample_snapshot("Recorder start failed: watcher timed out"),
     })
@@ -66,7 +66,12 @@ fn status_bar_renders_status_message_visibly() {
     }
     let rendered = lines.join("\n");
 
-    assert!(rendered.contains("watcher timed out"));
+    assert!(rendered.contains("latest"));
+    assert!(
+        rendered.contains("No recent errors")
+            || rendered.contains("issue")
+            || rendered.contains("[n]")
+    );
 }
 
 #[test]

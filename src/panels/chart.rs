@@ -16,7 +16,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     let model = build_chart_model(app);
-    let shell = section_block("Market Chart", accent_blue());
+    let shell = section_block("Price Chart", accent_blue());
     let inner = shell.inner(area);
     frame.render_widget(shell, area);
 
@@ -29,10 +29,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     render_legend(frame, legend_area, &model);
 
     let [curve_area, ladder_area] =
-        Layout::vertical([Constraint::Percentage(66), Constraint::Percentage(34)])
+        Layout::vertical([Constraint::Percentage(65), Constraint::Percentage(35)])
             .areas(content_area);
     let [price_area, volume_area] =
-        Layout::vertical([Constraint::Percentage(68), Constraint::Percentage(32)])
+        Layout::vertical([Constraint::Percentage(65), Constraint::Percentage(35)])
             .areas(curve_area);
 
     render_price_curve(frame, price_area, &model);
@@ -285,22 +285,15 @@ fn empty_chart_model() -> ChartModel {
 }
 
 fn render_legend(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
-    let lines = vec![
-        Line::from(vec![
+    let compact = area.width < 72;
+    let lines = if compact {
+        vec![Line::from(vec![
+            Span::styled("● ", Style::default().fg(accent_cyan())),
             Span::styled(
-                model.title.clone(),
-                Style::default()
-                    .fg(if model.trend_up {
-                        accent_cyan()
-                    } else {
-                        accent_red()
-                    })
-                    .add_modifier(Modifier::BOLD),
+                truncate(&model.title, 18),
+                Style::default().fg(text_color()),
             ),
             Span::raw("  "),
-            Span::styled(model.subtitle.clone(), Style::default().fg(muted_text())),
-        ]),
-        Line::from(vec![
             Span::styled("Last ", Style::default().fg(muted_text())),
             Span::styled(
                 format!("{:.2}", model.last_price),
@@ -312,29 +305,68 @@ fn render_legend(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
                     })
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("   "),
-            Span::styled("High ", Style::default().fg(muted_text())),
+            Span::raw("  "),
+            Span::styled("Src ", Style::default().fg(muted_text())),
             Span::styled(
-                format!("{:.2}", model.high_price),
-                Style::default().fg(text_color()),
+                truncate(&model.source, 14),
+                Style::default().fg(accent_pink()),
             ),
-            Span::raw("   "),
-            Span::styled("Low ", Style::default().fg(muted_text())),
-            Span::styled(
-                format!("{:.2}", model.low_price),
-                Style::default().fg(text_color()),
-            ),
-            Span::raw("   "),
-            Span::styled("Avg ", Style::default().fg(muted_text())),
-            Span::styled(
-                format!("{:.2}", model.average_price),
-                Style::default().fg(accent_gold()),
-            ),
-            Span::raw("   "),
-            Span::styled("Source ", Style::default().fg(muted_text())),
-            Span::styled(model.source.clone(), Style::default().fg(accent_pink())),
-        ]),
-    ];
+        ])]
+    } else {
+        vec![
+            Line::from(vec![
+                Span::styled(" ● ", Style::default().fg(accent_cyan())),
+                Span::styled("Day Session   ", Style::default().fg(muted_text())),
+                Span::styled(
+                    truncate(&model.title, 22),
+                    Style::default().fg(text_color()),
+                ),
+                Span::raw("  "),
+                Span::styled("Last ", Style::default().fg(muted_text())),
+                Span::styled(
+                    format!("{:.2}", model.last_price),
+                    Style::default()
+                        .fg(if model.trend_up {
+                            accent_green()
+                        } else {
+                            accent_red()
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("   "),
+                Span::styled("High ", Style::default().fg(muted_text())),
+                Span::styled(
+                    format!("{:.2}", model.high_price),
+                    Style::default().fg(text_color()),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("   ", Style::default()),
+                Span::styled(
+                    truncate(&model.subtitle, 24),
+                    Style::default().fg(accent_gold()),
+                ),
+                Span::raw("  "),
+                Span::styled("Avg ", Style::default().fg(muted_text())),
+                Span::styled(
+                    format!("{:.2}", model.average_price),
+                    Style::default().fg(text_color()),
+                ),
+                Span::raw("   "),
+                Span::styled("Low ", Style::default().fg(muted_text())),
+                Span::styled(
+                    format!("{:.2}", model.low_price),
+                    Style::default().fg(text_color()),
+                ),
+                Span::raw("   "),
+                Span::styled("Source ", Style::default().fg(muted_text())),
+                Span::styled(
+                    truncate(&model.source, 16),
+                    Style::default().fg(accent_pink()),
+                ),
+            ]),
+        ]
+    };
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: true })
@@ -344,7 +376,7 @@ fn render_legend(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
 }
 
 fn render_price_curve(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
-    let block = section_block("Curve", accent_blue());
+    let block = section_block("Price Area", accent_blue());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 10 || inner.height < 4 {
@@ -406,7 +438,7 @@ fn render_price_curve(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
 }
 
 fn render_volume_histogram(frame: &mut Frame<'_>, area: Rect, model: &ChartModel) {
-    let block = section_block("Volume", accent_pink());
+    let block = section_block("Volume Histogram", accent_pink());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 10 || inner.height < 3 {
@@ -415,6 +447,9 @@ fn render_volume_histogram(frame: &mut Frame<'_>, area: Rect, model: &ChartModel
     if model.volume_points.is_empty() {
         return;
     }
+
+    let [header_area, chart_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(2)]).areas(inner);
 
     let x_bounds = model.x_bounds;
     let max_volume = model
@@ -425,6 +460,27 @@ fn render_volume_histogram(frame: &mut Frame<'_>, area: Rect, model: &ChartModel
         .max(1.0);
     let volumes = model.volume_points.clone();
     let average_volume = model.average_volume;
+    let smavg_points = compute_smavg(&volumes, 5);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" ░ ", Style::default().fg(accent_pink())),
+            Span::styled("Volume ", Style::default().fg(muted_text())),
+            Span::styled(
+                format!("{:.0} ", model.last_volume),
+                Style::default().fg(text_color()),
+            ),
+            Span::styled(" █ ", Style::default().fg(accent_green())),
+            Span::styled("SMAVG(5) ", Style::default().fg(muted_text())),
+            Span::styled(
+                format!("{average_volume:.0}"),
+                Style::default().fg(text_color()),
+            ),
+        ]))
+        .wrap(Wrap { trim: true })
+        .style(Style::default().bg(panel_background())),
+        header_area,
+    );
 
     frame.render_widget(
         Canvas::default()
@@ -441,6 +497,17 @@ fn render_volume_histogram(frame: &mut Frame<'_>, area: Rect, model: &ChartModel
                         color: accent_pink(),
                     });
                 }
+                for pair in smavg_points.windows(2) {
+                    let first = pair[0];
+                    let second = pair[1];
+                    ctx.draw(&CanvasLine {
+                        x1: first.0,
+                        y1: first.1,
+                        x2: second.0,
+                        y2: second.1,
+                        color: accent_green(),
+                    });
+                }
                 ctx.draw(&CanvasLine {
                     x1: x_bounds[0],
                     y1: average_volume,
@@ -449,7 +516,7 @@ fn render_volume_histogram(frame: &mut Frame<'_>, area: Rect, model: &ChartModel
                     color: accent_green(),
                 });
             }),
-        inner,
+        chart_area,
     );
 }
 
@@ -623,6 +690,23 @@ fn synthetic_volume_series(history: &[&MarketHistoryPoint]) -> Vec<(f64, f64)> {
             };
             let activity = 1.0 + (point.price - previous_price).abs() * 120.0;
             (index as f64, activity)
+        })
+        .collect()
+}
+
+fn compute_smavg(values: &[(f64, f64)], window: usize) -> Vec<(f64, f64)> {
+    if values.is_empty() || window == 0 {
+        return Vec::new();
+    }
+
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, (x, _))| {
+            let start = index.saturating_sub(window.saturating_sub(1));
+            let slice = &values[start..=index];
+            let average = slice.iter().map(|(_, value)| *value).sum::<f64>() / slice.len() as f64;
+            (*x, average)
         })
         .collect()
 }
