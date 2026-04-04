@@ -1,2 +1,8 @@
 /target
 /artifacts/
+/data/
+/codemap.md
+/docs/matchbook-owls-audit-log.md
+/docs/plans/
+/src/**/codemap.md
+/tests/**/codemap.md

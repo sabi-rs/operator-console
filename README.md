@@ -13,6 +13,7 @@ It is the main operator interface for positions, calculators, matchers, recorder
 ## Integrates With
 
 - `../../bet-recorder` for normalized snapshots and recorder control
+- `../../sabisabi` for persisted market intelligence and query APIs
 - `../../workers/exchange-browser-worker` indirectly through recorder-managed worker flows
 
 If a change alters transport messages, recorder snapshot shape, or live recorder behavior, verify the console against the recorder change rather than treating this repo as isolated.
