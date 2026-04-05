@@ -58,7 +58,8 @@ The exact layout is managed in the window manager and can be changed without cha
 - If you run the console without explicit payload arguments, it boots from the configured local provider state instead of immediately autostarting the recorder takeover path.
 - If you pass `--bet-recorder-payload-path` or `--bet-recorder-run-dir`, it starts with a hybrid `bet-recorder` provider.
 - On startup the console checks `SABISABI_BASE_URL`.
-- If `SABISABI_BASE_URL` is the default local backend (`http://127.0.0.1:4080` or `http://localhost:4080`) and the service is not healthy, the console builds and starts `sabisabi` automatically before entering the TUI.
+- By default the console does not build or start `sabisabi`; it comes up independently and reports backend-backed features as unavailable until the backend is healthy.
+- If you explicitly set `OPERATOR_CONSOLE_AUTOSTART_SABISABI=1` and `SABISABI_BASE_URL` points at the default local backend (`http://127.0.0.1:4080` or `http://localhost:4080`), the console will build and start `sabisabi` before entering the TUI.
 - Recorder startup remains an explicit operator action from the `Recorder` pane or other dedicated controls.
 
 ## Run
@@ -111,6 +112,7 @@ Useful options:
 ## Configuration Notes
 
 - `SABISABI_BASE_URL` overrides the backend base URL used for market-intel reads.
+- `OPERATOR_CONSOLE_AUTOSTART_SABISABI=1` restores the old opt-in behavior where the console bootstraps a local `sabisabi` process.
 - The console keeps its own local UI, recorder, alerts, and matcher state on disk through crate-managed config files.
 - For recorder-backed flows, the console can use native file inputs, a worker client, or a hybrid provider that prefers native data and falls back to the worker path.
 - Manual positions load from local config, but legacy example seed entries are filtered so they do not pollute live sportsbook state.

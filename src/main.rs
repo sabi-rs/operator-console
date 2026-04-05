@@ -23,7 +23,7 @@ use operator_console::worker_client::{BetRecorderWorkerClient, WorkerClientExcha
 fn main() -> Result<()> {
     color_eyre::install()?;
     let _ = init_tracing();
-    ensure_local_sabisabi_backend()?;
+    maybe_autostart_local_sabisabi_backend()?;
 
     let options = match CliOptions::parse(env::args().skip(1)) {
         Ok(options) => options,
@@ -96,10 +96,10 @@ fn disable_mouse_capture() -> io::Result<()> {
     execute!(stdout(), DisableMouseCapture)
 }
 
-fn ensure_local_sabisabi_backend() -> Result<()> {
+fn maybe_autostart_local_sabisabi_backend() -> Result<()> {
     let base_url =
         env::var("SABISABI_BASE_URL").unwrap_or_else(|_| String::from("http://127.0.0.1:4080"));
-    if !is_local_default_sabisabi(&base_url) || sabisabi_is_healthy(&base_url) {
+    if !should_autostart_local_sabisabi_backend(&base_url) || sabisabi_is_healthy(&base_url) {
         return Ok(());
     }
 
@@ -147,6 +147,34 @@ fn is_local_default_sabisabi(base_url: &str) -> bool {
     )
 }
 
+fn should_autostart_local_sabisabi_backend(base_url: &str) -> bool {
+    should_autostart_local_sabisabi_backend_with_flag(
+        base_url,
+        autostart_sabisabi_backend_enabled(),
+    )
+}
+
+fn should_autostart_local_sabisabi_backend_with_flag(
+    base_url: &str,
+    autostart_enabled: bool,
+) -> bool {
+    is_local_default_sabisabi(base_url) && autostart_enabled
+}
+
+fn autostart_sabisabi_backend_enabled() -> bool {
+    env::var("OPERATOR_CONSOLE_AUTOSTART_SABISABI")
+        .ok()
+        .as_deref()
+        .is_some_and(flag_is_enabled)
+}
+
+fn flag_is_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 fn sabisabi_is_healthy(base_url: &str) -> bool {
     reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_millis(300))
@@ -160,6 +188,49 @@ fn sabisabi_is_healthy(base_url: &str) -> bool {
                 .ok()
         })
         .is_some_and(|response| response.status().is_success())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{flag_is_enabled, should_autostart_local_sabisabi_backend_with_flag};
+
+    #[test]
+    fn autostart_flag_recognizes_enabled_values() {
+        for value in ["1", "true", "TRUE", " yes ", "On"] {
+            assert!(flag_is_enabled(value), "expected {value:?} to enable autostart");
+        }
+    }
+
+    #[test]
+    fn autostart_flag_rejects_disabled_values() {
+        for value in ["", "0", "false", "off", "no", "disabled"] {
+            assert!(!flag_is_enabled(value), "expected {value:?} to disable autostart");
+        }
+    }
+
+    #[test]
+    fn autostart_only_targets_local_default_backend() {
+        assert!(should_autostart_local_sabisabi_backend_with_flag(
+            "http://127.0.0.1:4080",
+            true
+        ));
+        assert!(should_autostart_local_sabisabi_backend_with_flag(
+            "http://localhost:4080",
+            true
+        ));
+        assert!(!should_autostart_local_sabisabi_backend_with_flag(
+            "https://sabisabi.internal",
+            true
+        ));
+        assert!(!should_autostart_local_sabisabi_backend_with_flag(
+            "http://127.0.0.1:9999",
+            true
+        ));
+        assert!(!should_autostart_local_sabisabi_backend_with_flag(
+            "http://127.0.0.1:4080",
+            false
+        ));
+    }
 }
 
 fn help_text() -> String {
