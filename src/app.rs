@@ -4079,8 +4079,10 @@ impl App {
         let Some(venue) = self.snapshot.venues.get(selected_index) else {
             return;
         };
+        if self.snapshot.selected_venue == Some(venue.id) {
+            return;
+        }
 
-        self.snapshot.selected_venue = Some(venue.id);
         self.queue_provider_request(ProviderJob {
             request: ProviderRequest::SelectVenue(venue.id),
             failure_context: String::from("Venue sync failed"),
@@ -4089,10 +4091,7 @@ impl App {
     }
 
     pub fn selected_venue(&self) -> Option<VenueId> {
-        self.exchange_list_state
-            .selected()
-            .and_then(|index| self.snapshot.venues.get(index).map(|venue| venue.id))
-            .or(self.snapshot.selected_venue)
+        self.snapshot.selected_venue
     }
 
     fn poll_recorder(&mut self) {
@@ -7899,6 +7898,67 @@ mod tests {
         assert_eq!(app.snapshot().other_open_bets.len(), 1);
         assert_eq!(*cached_refresh_count.lock().expect("lock"), 0);
         assert_eq!(*live_refresh_count.lock().expect("lock"), 1);
+    }
+
+    #[test]
+    fn highlighted_live_venue_does_not_change_auto_refresh_mode_before_sync() {
+        let cached_refresh_count = Rc::new(RefCell::new(0));
+        let live_refresh_count = Rc::new(RefCell::new(0));
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut load_snapshot = sample_snapshot("Initial dashboard");
+        load_snapshot.venues.push(VenueSummary {
+            id: VenueId::Betway,
+            label: String::from("betway"),
+            status: VenueStatus::Connected,
+            detail: String::from("live"),
+            event_count: 2,
+            market_count: 2,
+        });
+        load_snapshot.selected_venue = Some(VenueId::Smarkets);
+
+        let mut app = App::with_dependencies_and_storage(
+            Box::new(RefreshingProvider {
+                cached_refresh_count: cached_refresh_count.clone(),
+                live_refresh_count: live_refresh_count.clone(),
+                load_snapshot: load_snapshot.clone(),
+                cached_refresh_snapshot: sample_snapshot("Cached smarkets dashboard"),
+                live_refresh_snapshot: sample_snapshot("Live betway dashboard"),
+            }),
+            Box::new(|| {
+                Box::new(RefreshingProvider {
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: sample_snapshot("Stub dashboard"),
+                    cached_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Stub dashboard"),
+                }) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(|_| {
+                Box::new(RefreshingProvider {
+                    cached_refresh_count: Rc::new(RefCell::new(0)),
+                    live_refresh_count: Rc::new(RefCell::new(0)),
+                    load_snapshot: sample_snapshot("Recorder dashboard"),
+                    cached_refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                    live_refresh_snapshot: sample_snapshot("Recorder dashboard"),
+                }) as Box<dyn ExchangeProvider + Send>
+            }),
+            Box::new(RunningSupervisor),
+            RecorderConfig::default(),
+            temp_dir.path().join("recorder.json"),
+            String::from("test"),
+        )
+        .expect("app");
+
+        app.exchange_list_state.select(Some(1));
+        app.recorder_status = RecorderStatus::Running;
+        app.last_recorder_refresh_at = Some(Instant::now() - Duration::from_secs(6));
+
+        app.poll_recorder();
+        assert!(app.wait_for_async_idle(Duration::from_millis(200)));
+
+        assert_eq!(app.selected_venue(), Some(VenueId::Smarkets));
+        assert_eq!(*cached_refresh_count.lock().expect("lock"), 1);
+        assert_eq!(*live_refresh_count.lock().expect("lock"), 0);
     }
 
     #[test]

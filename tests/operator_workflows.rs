@@ -125,7 +125,6 @@ fn venue_switch_flow_distinguishes_cached_and_live_refreshes() {
         requests.lock().expect("lock").clone(),
         vec![
             ProviderRequest::LoadDashboard,
-            ProviderRequest::SelectVenue(VenueId::Smarkets),
             ProviderRequest::SelectVenue(VenueId::Betway),
             ProviderRequest::RefreshCached,
             ProviderRequest::RefreshLive,
