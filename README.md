@@ -2,12 +2,12 @@
 
 Rust Ratatui console for Sabi operator workflows.
 
-It is the main operator-facing frontend for positions, calculators, matchers, recorder control, and observability over worker-backed betting data.
+It is the main operator-facing frontend for positions, calculators, matchers, recorder control, and observability over backend-backed betting data.
 
 ## What It Does
 
 - Starts the Sabi terminal UI
-- Loads either a stub provider or a `bet-recorder`-backed provider depending on CLI arguments
+- Loads the configured snapshot provider for exchange state and enriches it with `sabisabi`, OwlS, and Matchbook data
 - Reads market-intel data from `sabisabi`
 - Gives operators a single place to inspect live orders, market views, opportunities, alerts, calculators, and recorder state
 
@@ -55,10 +55,11 @@ The exact layout is managed in the window manager and can be changed without cha
 
 ## Startup Behavior
 
-- If you run the console without a recorder payload or run directory, it starts in stub mode.
+- If you run the console without explicit payload arguments, it boots from the configured local provider state instead of immediately autostarting the recorder takeover path.
 - If you pass `--bet-recorder-payload-path` or `--bet-recorder-run-dir`, it starts with a hybrid `bet-recorder` provider.
 - On startup the console checks `SABISABI_BASE_URL`.
 - If `SABISABI_BASE_URL` is the default local backend (`http://127.0.0.1:4080` or `http://localhost:4080`) and the service is not healthy, the console builds and starts `sabisabi` automatically before entering the TUI.
+- Recorder startup remains an explicit operator action from the `Recorder` pane or other dedicated controls.
 
 ## Run
 
@@ -112,13 +113,14 @@ Useful options:
 - `SABISABI_BASE_URL` overrides the backend base URL used for market-intel reads.
 - The console keeps its own local UI, recorder, alerts, and matcher state on disk through crate-managed config files.
 - For recorder-backed flows, the console can use native file inputs, a worker client, or a hybrid provider that prefers native data and falls back to the worker path.
+- Manual positions load from local config, but legacy example seed entries are filtered so they do not pollute live sportsbook state.
 
 ## Operator Notes
 
 - The in-app keymap overlay is the source of truth for navigation keys.
 - `Trading > Accounts` is the venue-selection surface. Selecting a non-`smarkets` venue updates focus immediately; use `r` or `R` when you want a fresh live recapture.
 - Recorder lifecycle controls are available from the `Recorder` pane.
-- Market-intel data is read from `sabisabi`; recorder data is still a fallback/legacy path where adaptor-backed ingestion is not available.
+- Market-intel data is read from `sabisabi`; recorder data is still a fallback/legacy path where adaptor-backed ingestion is not available and should not be treated as the primary runtime model.
 
 ## Test
 

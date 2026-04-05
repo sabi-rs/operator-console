@@ -2182,8 +2182,9 @@ impl App {
                 }
             }
             Err(error) => {
+                let first_load = self.matchbook_account_state.is_none();
                 self.matchbook_resource_state.finish_error(error.clone());
-                if matches!(result.reason, MatchbookSyncReason::Manual) {
+                if matches!(result.reason, MatchbookSyncReason::Manual) || first_load {
                     self.status_message = format!("Matchbook sync failed: {error}");
                     self.status_scroll = 0;
                 }
@@ -2281,8 +2282,9 @@ impl App {
                 self.clamp_selected_intel_row();
             }
             Err(error) => {
+                let first_load = self.market_intel_resource_state.last_good().is_none();
                 self.market_intel_resource_state.finish_error(error.clone());
-                if matches!(result.reason, MarketIntelSyncReason::Manual) {
+                if matches!(result.reason, MarketIntelSyncReason::Manual) || first_load {
                     self.status_message = format!("Market intel sync failed: {error}");
                     self.status_scroll = 0;
                 }
@@ -4131,10 +4133,7 @@ impl App {
     }
 
     fn recorder_auto_refresh_request(&self) -> ProviderRequest {
-        match self.selected_venue() {
-            Some(VenueId::Smarkets) | None => ProviderRequest::RefreshCached,
-            Some(_) => ProviderRequest::RefreshLive,
-        }
+        ProviderRequest::RefreshCached
     }
 
     fn poll_owls_dashboard(&mut self) {
@@ -4175,20 +4174,13 @@ impl App {
     }
 
     fn should_poll_market_intel(&self) -> bool {
-        self.active_panel == Panel::Trading && self.trading_section == TradingSection::Intel
+        self.active_panel == Panel::Trading
     }
 
     fn poll_matchbook_account(&mut self) {
         self.drain_matchbook_sync_results();
         self.expire_stuck_matchbook_sync_placeholder();
-        let should_sync = self.active_panel == Panel::Trading
-            && (self.trading_section == TradingSection::Stats
-                || (self.trading_section == TradingSection::Positions
-                    && self.live_view_overlay_visible)
-                || self
-                    .trading_action_overlay
-                    .as_ref()
-                    .is_some_and(|overlay| overlay.seed.venue == VenueId::Matchbook));
+        let should_sync = self.active_panel == Panel::Trading;
         if !should_sync || self.matchbook_resource_state.is_loading() {
             return;
         }
@@ -7811,7 +7803,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_recorder_uses_live_refresh_for_non_smarkets_selected_venue() {
+    fn poll_recorder_uses_cached_refresh_for_non_smarkets_selected_venue() {
         let cached_refresh_count = Rc::new(RefCell::new(0));
         let live_refresh_count = Rc::new(RefCell::new(0));
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -7827,11 +7819,27 @@ mod tests {
         load_snapshot.selected_venue = Some(VenueId::Betway);
 
         let cached_refresh_snapshot = sample_runtime_snapshot(
-            "Cached smarkets dashboard",
+            "Cached betway dashboard",
             "2026-03-24T12:00:00Z",
             false,
             "cached",
         );
+        let mut cached_refresh_snapshot = cached_refresh_snapshot;
+        cached_refresh_snapshot.selected_venue = Some(VenueId::Betway);
+        cached_refresh_snapshot.venues = load_snapshot.venues.clone();
+        cached_refresh_snapshot.other_open_bets = vec![crate::domain::OtherOpenBetRow {
+            venue: String::from("betway"),
+            event: String::from("Arsenal v Everton"),
+            label: String::from("Arsenal"),
+            market: String::from("Match Odds"),
+            side: String::from("back"),
+            odds: 2.4,
+            stake: 10.0,
+            status: String::from("open"),
+            funding_kind: String::new(),
+            current_cashout_value: None,
+            supports_cash_out: false,
+        }];
         let mut live_refresh_snapshot = sample_runtime_snapshot(
             "Live betway dashboard",
             "2026-03-24T12:00:01Z",
@@ -7893,11 +7901,11 @@ mod tests {
         app.poll_recorder();
         assert!(app.wait_for_async_idle(Duration::from_millis(200)));
 
-        assert_eq!(app.snapshot().status_line, "Live betway dashboard");
+        assert_eq!(app.snapshot().status_line, "Cached betway dashboard");
         assert_eq!(app.snapshot().selected_venue, Some(VenueId::Betway));
         assert_eq!(app.snapshot().other_open_bets.len(), 1);
-        assert_eq!(*cached_refresh_count.lock().expect("lock"), 0);
-        assert_eq!(*live_refresh_count.lock().expect("lock"), 1);
+        assert_eq!(*cached_refresh_count.lock().expect("lock"), 1);
+        assert_eq!(*live_refresh_count.lock().expect("lock"), 0);
     }
 
     #[test]

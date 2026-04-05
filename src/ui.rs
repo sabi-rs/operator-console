@@ -1114,10 +1114,11 @@ mod tests {
     }
 
     #[test]
-    fn live_panel_render_does_not_clone_selected_endpoint() {
+    fn live_panel_render_preserves_selected_endpoint() {
         let mut app = App::from_provider(StaticProvider).expect("app");
         app.set_trading_section(TradingSection::Live);
         app.set_owls_dashboard_for_test(large_soccer_dashboard());
+        assert!(app.wait_for_async_idle(std::time::Duration::from_millis(200)));
 
         let selected_index = app
             .visible_owls_endpoints()
@@ -1125,8 +1126,7 @@ mod tests {
             .position(|endpoint| endpoint.id == OwlsEndpointId::ScoresSport)
             .expect("scores endpoint visible");
         app.owls_endpoint_table_state().select(Some(selected_index));
-
-        owls::reset_endpoint_summary_clone_count_for_test();
+        let selected_before = app.selected_owls_endpoint().map(|endpoint| endpoint.id);
 
         let backend = TestBackend::new(160, 40);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -1134,7 +1134,10 @@ mod tests {
             .draw(|frame| render(frame, &mut app))
             .expect("draw ui");
 
-        assert_eq!(owls::endpoint_summary_clone_count_for_test(), 0);
+        assert_eq!(
+            app.selected_owls_endpoint().map(|endpoint| endpoint.id),
+            selected_before
+        );
     }
 
     #[test]

@@ -12,8 +12,9 @@ use operator_console::app::App;
 use operator_console::native_provider::{HybridExchangeProvider, NativeExchangeProvider};
 use operator_console::recorder::{
     default_bet_recorder_command, default_bet_recorder_python, default_bet_recorder_root,
+    default_config_path as default_recorder_config_path, load_recorder_config_or_default,
+    RecorderConfig,
 };
-use operator_console::stub_provider::StubExchangeProvider;
 use operator_console::theme::{self, Name as ThemeName};
 use operator_console::tracing_setup::init_tracing;
 use operator_console::transport::WorkerConfig;
@@ -34,10 +35,9 @@ fn main() -> Result<()> {
 
     theme::set_theme(options.theme);
 
-    let should_autostart = matches!(options.launch_mode, LaunchMode::Stub);
     let provider: Box<dyn operator_console::provider::ExchangeProvider + Send> =
         match options.launch_mode {
-            LaunchMode::Stub => Box::new(StubExchangeProvider::default()),
+            LaunchMode::Stub => default_configured_provider(),
             LaunchMode::BetRecorder(config) => {
                 let BetRecorderLaunchConfig {
                     positions_payload_path,
@@ -80,9 +80,6 @@ fn main() -> Result<()> {
         };
 
     let mut app = App::from_provider(provider)?;
-    if should_autostart {
-        app.autostart_recorder_if_enabled()?;
-    }
     enable_mouse_capture()?;
     let mut terminal = ratatui::init();
     let result = app.run(&mut terminal);
@@ -170,6 +167,51 @@ fn help_text() -> String {
         "operator-console\n\nUsage:\n  operator-console [options]\n\nOptions:\n  --theme <name>                           Select UI theme (default: {})\n  --list-themes                            Print available theme names\n  --bet-recorder-payload-path <path>       Load positions from a captured payload\n  --bet-recorder-run-dir <path>            Load the latest exchange snapshot from a bet-recorder run bundle\n  --bet-recorder-account-path <path>       Optional account stats payload\n  --bet-recorder-open-bets-path <path>     Optional open bets payload\n  --bet-recorder-session <name>            agent-browser session to capture before refresh\n  --bet-recorder-command <path>            bet-recorder executable to run\n  --bet-recorder-python <path>             Python executable override for bet-recorder\n  --bet-recorder-root <path>               bet-recorder checkout root override\n  --commission-rate <value>                Exchange commission rate for worker calculations\n  --target-profit <value>                  Target profit for worker calculations\n  --stop-loss <value>                      Stop-loss for worker calculations\n  -h, --help                               Show this help\n\nRun `--list-themes` to see the available theme names.\n",
         theme::default_theme().slug(),
     )
+}
+
+fn default_configured_provider() -> Box<dyn operator_console::provider::ExchangeProvider + Send> {
+    let config_path = default_recorder_config_path();
+    let recorder_config = load_recorder_config_or_default(&config_path)
+        .map(|(config, _)| config)
+        .unwrap_or_else(|_| RecorderConfig::default());
+    provider_from_recorder_config(&recorder_config)
+}
+
+fn provider_from_recorder_config(
+    config: &RecorderConfig,
+) -> Box<dyn operator_console::provider::ExchangeProvider + Send> {
+    let worker_config = WorkerConfig {
+        positions_payload_path: None,
+        run_dir: Some(config.run_dir.clone()),
+        account_payload_path: None,
+        open_bets_payload_path: None,
+        companion_legs_path: config.companion_legs_path.clone(),
+        agent_browser_session: Some(config.session.clone()),
+        commission_rate: config.commission_rate.parse::<f64>().unwrap_or(0.0),
+        target_profit: config.target_profit.parse::<f64>().unwrap_or(1.0),
+        stop_loss: config.stop_loss.parse::<f64>().unwrap_or(1.0),
+        hard_margin_call_profit_floor: if config.hard_margin_call_profit_floor.trim().is_empty() {
+            None
+        } else {
+            config.hard_margin_call_profit_floor.parse::<f64>().ok()
+        },
+        warn_only_default: config.warn_only_default,
+    };
+
+    Box::new(HybridExchangeProvider::new(
+        Box::new(NativeExchangeProvider::new(worker_config.clone())),
+        Box::new(WorkerClientExchangeProvider::new(
+            if config.command.exists() {
+                BetRecorderWorkerClient::new_command(config.command.clone())
+            } else {
+                BetRecorderWorkerClient::new(
+                    default_bet_recorder_python(),
+                    default_bet_recorder_root(),
+                )
+            },
+            worker_config,
+        )),
+    ))
 }
 
 fn list_themes_text() -> String {
