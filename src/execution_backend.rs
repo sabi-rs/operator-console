@@ -6,6 +6,7 @@ use std::time::Duration;
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use reqwest::blocking::Client;
 use serde::Deserialize;
+use urlencoding::encode;
 
 const SABISABI_BASE_URL_ENV: &str = "SABISABI_BASE_URL";
 const DEFAULT_SABISABI_BASE_URL: &str = "http://127.0.0.1:4080";
@@ -133,7 +134,7 @@ fn fetch_execution_plan_from_base_url(
     match_id: &str,
 ) -> Result<ExecutionPlanEnvelope> {
     let client = build_backend_client()?;
-    let path = format!("/api/v1/query/execution/plan/{match_id}");
+    let path = format!("/api/v1/query/execution/plan/{}", encode(match_id));
     let response = client
         .get(format!("{}{}", base_url.trim_end_matches('/'), path))
         .send()
@@ -380,6 +381,46 @@ mod tests {
             plan.opportunity.venue_mappings[0].selection_ref,
             "selection-1"
         );
+
+        server.join().expect("server join");
+    }
+
+    #[test]
+    fn fetch_execution_plan_percent_encodes_match_id_path_segment() {
+        let body = serde_json::json!({
+            "matched_at": "2026-04-05T12:00:00Z",
+            "gateway": {"kind": "matchbook", "mode": "stub", "detail": "stub"},
+            "plan": {"primary": {"venue": "matchbook", "selection_name": "Arsenal", "side": "back", "price": 2.1, "stake_hint": 10.0, "deep_link_url": "https://matchbook.example/market"}, "secondary": null, "notes": []},
+            "opportunity": {"id": "arb-1", "event_name": "Arsenal vs Everton", "market_name": "Full-time result", "selection_name": "Arsenal", "stake_hint": 10.0, "canonical": {"event": {"id": "event-1"}, "market": {"id": "market-1"}, "selection": {"id": "selection-1"}}, "venue_mappings": []}
+        })
+        .to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
+        let address = listener.local_addr().expect("server addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0_u8; 2048];
+            let read = stream.read(&mut buffer).expect("read request");
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            assert!(
+                request.starts_with(
+                    "GET /api/v1/query/execution/plan/match%2Fid%20with%20spaces HTTP/1.1"
+                ),
+                "unexpected request line: {request}"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            stream.write_all(response.as_bytes()).expect("write");
+        });
+
+        let plan = fetch_execution_plan_from_base_url(
+            &format!("http://{address}"),
+            "match/id with spaces",
+        )
+        .expect("plan");
+
+        assert_eq!(plan.opportunity.id, "arb-1");
 
         server.join().expect("server join");
     }

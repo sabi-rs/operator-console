@@ -157,7 +157,7 @@ fn operator_match_to_row(item: OperatorMatchOpportunity) -> MarketOpportunityRow
         .quotes
         .iter()
         .cloned()
-        .map(operator_quote_to_quote_row)
+        .map(|quote| operator_quote_to_quote_row(quote, item.is_live))
         .collect::<Vec<_>>();
 
     if quotes.is_empty() {
@@ -215,7 +215,10 @@ fn operator_match_to_row(item: OperatorMatchOpportunity) -> MarketOpportunityRow
     }
 }
 
-fn operator_quote_to_quote_row(item: OperatorMatchQuote) -> MarketQuoteComparisonRow {
+fn operator_quote_to_quote_row(
+    item: OperatorMatchQuote,
+    is_live: bool,
+) -> MarketQuoteComparisonRow {
     MarketQuoteComparisonRow {
         source: item.source,
         event_id: String::new(),
@@ -232,7 +235,7 @@ fn operator_quote_to_quote_row(item: OperatorMatchQuote) -> MarketQuoteCompariso
         event_url: String::new(),
         deep_link_url: item.deep_link_url,
         updated_at: item.updated_at,
-        is_live: false,
+        is_live,
         is_sharp: item.is_sharp,
         notes: Vec::new(),
         raw_data: serde_json::Value::Null,
@@ -707,7 +710,7 @@ mod tests {
                     "event_name": "Chelsea v Liverpool",
                     "market_name": "Match Odds",
                     "selection_name": "Liverpool",
-                    "is_live": false,
+                    "is_live": true,
                     "live_status": null,
                     "start_time": "2026-04-03T13:00:00Z",
                     "updated_at": "2026-04-03T11:24:03Z",
@@ -874,6 +877,10 @@ mod tests {
         assert_eq!(fetched.plus_ev.len(), 1);
         assert_eq!(fetched.total_opportunities, 2);
         assert_eq!(fetched.markets.len(), 0);
+        assert!(fetched.arbitrages[0]
+            .quotes
+            .iter()
+            .all(|quote| quote.is_live));
 
         server.join().expect("server join");
     }
