@@ -12,12 +12,13 @@ use color_eyre::eyre::Result;
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use operator_console::app::App;
+use operator_console::domain::{ExchangePanelSnapshot, VenueId, WorkerStatus, WorkerSummary};
 use operator_console::native_provider::{HybridExchangeProvider, NativeExchangeProvider};
 use operator_console::recorder::{
     default_bet_recorder_command, default_bet_recorder_python, default_bet_recorder_root,
-    default_config_path as default_recorder_config_path, load_recorder_config_or_default,
     RecorderConfig,
 };
+use operator_console::provider::{ExchangeProvider, ProviderRequest};
 use operator_console::theme::{self, Name as ThemeName};
 use operator_console::tracing_setup::init_tracing;
 use operator_console::transport::WorkerConfig;
@@ -252,13 +253,37 @@ fn help_text() -> String {
 fn default_configured_provider() -> Box<dyn operator_console::provider::ExchangeProvider + Send> {
     match BackendExchangeProvider::new() {
         Ok(provider) => Box::new(provider),
-        Err(_) => {
-            let config_path = default_recorder_config_path();
-            let recorder_config = load_recorder_config_or_default(&config_path)
-                .map(|(config, _)| config)
-                .unwrap_or_else(|_| RecorderConfig::default());
-            provider_from_recorder_config(&recorder_config)
+        Err(error) => Box::new(BackendUnavailableProvider::new(error.to_string())),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BackendUnavailableProvider {
+    detail: String,
+}
+
+impl BackendUnavailableProvider {
+    fn new(detail: String) -> Self {
+        Self { detail }
+    }
+
+    fn snapshot(&self) -> ExchangePanelSnapshot {
+        ExchangePanelSnapshot {
+            worker: WorkerSummary {
+                name: String::from("sabisabi"),
+                status: WorkerStatus::Error,
+                detail: self.detail.clone(),
+            },
+            selected_venue: Some(VenueId::Smarkets),
+            status_line: format!("Backend unavailable: {}", self.detail),
+            ..ExchangePanelSnapshot::default()
         }
+    }
+}
+
+impl ExchangeProvider for BackendUnavailableProvider {
+    fn handle(&mut self, _request: ProviderRequest) -> Result<ExchangePanelSnapshot> {
+        Ok(self.snapshot())
     }
 }
 

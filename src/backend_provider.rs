@@ -5,10 +5,12 @@ use std::time::Duration;
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
 use reqwest::blocking::Client;
+use serde::Deserialize;
 use serde::Serialize;
 
 use operator_console::domain::{ExchangePanelSnapshot, VenueId, WorkerStatus, WorkerSummary};
-use operator_console::provider::{ExchangeProvider, ProviderRequest};
+use operator_console::exchange_api::MatchbookAccountState;
+use operator_console::provider::{ExchangeProvider, ProviderRequest, ProviderSnapshot};
 
 const SABISABI_BASE_URL_ENV: &str = "SABISABI_BASE_URL";
 const DEFAULT_SABISABI_BASE_URL: &str = "http://127.0.0.1:4080";
@@ -59,47 +61,80 @@ impl BackendExchangeProvider {
         Ok(Self { client })
     }
 
-    fn load_via_backend(&self, request: ProviderRequest) -> Result<ExchangePanelSnapshot> {
-        let control = map_request(request)?;
-        let path = "/api/v1/control/operator/snapshot";
-        let mut request = self
-            .client
-            .post(format!(
-                "{}{}",
-                sabisabi_base_url().trim_end_matches('/'),
-                path
-            ))
-            .json(&control);
-        if let Some(token) = sabisabi_control_token() {
-            request = request.bearer_auth(token);
-        }
-        let response = request
-            .send()
-            .wrap_err_with(|| format!("request failed for {path}"))?;
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        if !status.is_success() {
-            return Err(eyre!(
-                "HTTP {} during operator snapshot control: {}",
-                status.as_u16(),
-                truncate(&body, 200)
-            ));
-        }
-        serde_json::from_str::<ExchangePanelSnapshot>(&body)
-            .wrap_err("failed to decode backend operator snapshot")
+    fn load_via_backend(&self, request: ProviderRequest) -> Result<ProviderSnapshot> {
+        let base_url = sabisabi_base_url();
+        let (path, response) = if matches!(request, ProviderRequest::LoadDashboard) {
+            let path = "/api/v1/query/operator/snapshot";
+            let response = self
+                .client
+                .get(format!("{}{}", base_url.trim_end_matches('/'), path))
+                .send()
+                .wrap_err_with(|| format!("request failed for {path}"))?;
+            (path, response)
+        } else {
+            let control = map_request(request)?;
+            let path = "/api/v1/control/operator/snapshot";
+            let mut request = self
+                .client
+                .post(format!("{}{}", base_url.trim_end_matches('/'), path))
+                .json(&control);
+            if let Some(token) = sabisabi_control_token() {
+                request = request.bearer_auth(token);
+            }
+            let response = request
+                .send()
+                .wrap_err_with(|| format!("request failed for {path}"))?;
+            (path, response)
+        };
+        decode_snapshot_response(path, response)
     }
 }
 
 impl ExchangeProvider for BackendExchangeProvider {
     fn handle(&mut self, request: ProviderRequest) -> Result<ExchangePanelSnapshot> {
+        self.handle_with_metadata(request).map(|snapshot| snapshot.snapshot)
+    }
+
+    fn handle_with_metadata(&mut self, request: ProviderRequest) -> Result<ProviderSnapshot> {
         match self.load_via_backend(request.clone()) {
             Ok(snapshot) => Ok(snapshot),
             Err(error) if matches!(request, ProviderRequest::LoadDashboard) => {
-                Ok(unavailable_snapshot(&error.to_string()))
+                Ok(ProviderSnapshot::from_snapshot(unavailable_snapshot(
+                    &error.to_string(),
+                )))
             }
             Err(error) => Err(error),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct BackendOperatorSnapshotResponse {
+    snapshot: ExchangePanelSnapshot,
+    #[serde(default)]
+    matchbook_account_state: Option<MatchbookAccountState>,
+}
+
+fn decode_snapshot_response(
+    path: &str,
+    response: reqwest::blocking::Response,
+) -> Result<ProviderSnapshot> {
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(eyre!(
+            "HTTP {} during operator snapshot request: {}",
+            status.as_u16(),
+            truncate(&body, 200)
+        ));
+    }
+
+    let payload = serde_json::from_str::<BackendOperatorSnapshotResponse>(&body)
+        .wrap_err_with(|| format!("failed to decode backend operator snapshot from {path}"))?;
+    Ok(ProviderSnapshot {
+        snapshot: payload.snapshot,
+        matchbook_account_state: payload.matchbook_account_state,
+    })
 }
 
 fn map_request(request: ProviderRequest) -> Result<OperatorSnapshotControlRequest> {
