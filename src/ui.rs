@@ -522,7 +522,7 @@ fn render_bottom_bar(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         "fresh"
     };
     let issues = app.problem_notifications().len();
-    let latest_status = footer_status_detail(app, area.width);
+    let latest_status = footer_status_detail(app, bar_area.width);
     let minimized = app.current_minimized_panes();
     let minimized_label = if minimized.is_empty() {
         String::from("none")

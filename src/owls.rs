@@ -615,12 +615,96 @@ pub async fn sync_dashboard_async(
             }
         }
         Err(error) => {
-            let mut dashboard = previous_dashboard.clone();
-            let detail = normalize_owls_error(&error.to_string());
-            mark_all_endpoints_error(&mut dashboard, &detail);
-            dashboard.status_line = format!("Owls backend unavailable: {detail}");
-            dashboard.last_sync_mode = String::from(reason.label());
-            dashboard.groups = build_group_summaries(&dashboard.endpoints);
+            // Try direct-upstream fallback with OWLS_INSIGHT_API_KEY
+            let api_key = load_api_key();
+            let fallback_result = if let Ok(key) = api_key {
+                let direct_base_url = env::var("OWLS_INSIGHT_BASE_URL")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| String::from(DEFAULT_BASE_URL));
+
+                // Fetch endpoints for this section from direct upstream
+                let section_endpoint_ids = endpoint_ids_for_trading_section(section);
+                let mut fallback_dashboard = previous_dashboard.clone();
+                let mut success = false;
+
+                for &id in section_endpoint_ids {
+                    let summary = fetch_endpoint_summary_async(
+                        client,
+                        &direct_base_url,
+                        &key,
+                        &sport,
+                        id,
+                        &mut fallback_dashboard.seeds,
+                    ).await;
+
+                    if summary.status == "ready" || summary.status == "empty" {
+                        success = true;
+                    }
+
+                    // Replace the endpoint in the dashboard
+                    if let Some(endpoint) = fallback_dashboard.endpoints.iter_mut().find(|e| e.id == id) {
+                        *endpoint = summary;
+                    }
+                }
+
+                if success {
+                    Some(fallback_dashboard)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let mut dashboard = if let Some(fallback_dashboard) = fallback_result {
+                // Fallback succeeded - use it
+                let mut dash = fallback_dashboard;
+                dash.last_sync_mode = String::from(reason.label());
+                dash.groups = build_group_summaries(&dash.endpoints);
+                let checked_count = endpoint_ids_for_trading_section(section).len();
+                let changed = dashboard_semantically_changed(&previous_dashboard, &dash);
+                let changed_count = if changed {
+                    count_changed_endpoints(&previous_dashboard.endpoints, &dash.endpoints)
+                } else {
+                    0
+                };
+                dash.sync_checks = checked_count;
+                dash.sync_changes = changed_count;
+                dash.total_polls = previous_dashboard.total_polls.saturating_add(checked_count);
+                dash.status_line = format!(
+                    "Owls direct-key fallback: fetched {} endpoint{} for {} section",
+                    checked_count,
+                    if checked_count == 1 { "" } else { "s" },
+                    owls_section_key(section)
+                );
+
+                return OwlsSyncOutcome {
+                    changed,
+                    dashboard: dash,
+                    checked_count,
+                    changed_count,
+                };
+            } else {
+                // Fallback also failed - mark only section endpoints as errors
+                let mut dash = previous_dashboard.clone();
+                let detail = normalize_owls_error(&error.to_string());
+                let section_endpoint_ids = endpoint_ids_for_trading_section(section);
+
+                // Only mark endpoints for this section as errors
+                for endpoint in &mut dash.endpoints {
+                    if section_endpoint_ids.contains(&endpoint.id) {
+                        endpoint.status = String::from("error");
+                        endpoint.detail = truncate(&detail, 88);
+                    }
+                }
+
+                dash.status_line = format!("Owls backend unavailable for {} section: {detail}", owls_section_key(section));
+                dash.last_sync_mode = String::from(reason.label());
+                dash.groups = build_group_summaries(&dash.endpoints);
+                dash
+            };
+
             OwlsSyncOutcome {
                 changed: dashboard_semantically_changed(&previous_dashboard, &dashboard),
                 dashboard,
