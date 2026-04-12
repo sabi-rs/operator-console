@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -218,6 +219,29 @@ pub fn submit_adhoc_execution(request: &AdhocExecutionRequest) -> Result<Executi
     decode_json_response(response, "ad hoc execution submit")
 }
 
+#[derive(Debug)]
+pub struct ExecutionHttpError {
+    pub status: u16,
+    pub label: String,
+    pub body: String,
+}
+
+impl std::fmt::Display for ExecutionHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {} during {}: {}", self.status, self.label, self.body)
+    }
+}
+
+impl std::error::Error for ExecutionHttpError {}
+
+pub fn is_not_found_error(error: &color_eyre::eyre::Report) -> bool {
+    if let Some(http_error) = error.downcast_ref::<ExecutionHttpError>() {
+        http_error.status == 404
+    } else {
+        false
+    }
+}
+
 fn build_backend_client() -> Result<Client> {
     Client::builder()
         .connect_timeout(Duration::from_millis(750))
@@ -244,12 +268,12 @@ fn decode_json_response<T: for<'de> Deserialize<'de>>(
     let status = response.status();
     let body = response.text().unwrap_or_default();
     if !status.is_success() {
-        return Err(eyre!(
-            "HTTP {} during {}: {}",
-            status.as_u16(),
-            label,
-            truncate(&body, 200)
-        ));
+        return Err(ExecutionHttpError {
+            status: status.as_u16(),
+            label: label.to_string(),
+            body: truncate(&body, 200),
+        }
+        .into());
     }
     serde_json::from_str(&body).wrap_err_with(|| format!("failed to decode {label} response"))
 }
@@ -298,17 +322,27 @@ fn dotenv_value_from_paths(name: &str, paths: &[PathBuf]) -> Option<String> {
 
 fn dotenv_candidates() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(home) = env::var_os("HOME") {
-        let home_path = PathBuf::from(home);
-        paths.push(home_path.join(".env"));
-        paths.push(home_path.join(".env.local"));
-    }
     if let Ok(current_dir) = env::current_dir() {
         for ancestor in current_dir.ancestors() {
-            paths.push(ancestor.join(".env"));
             paths.push(ancestor.join(".env.local"));
+            paths.push(ancestor.join(".env"));
         }
     }
+    if let Ok(executable) = env::current_exe() {
+        if let Some(executable_dir) = executable.parent() {
+            for ancestor in executable_dir.ancestors() {
+                paths.push(ancestor.join(".env.local"));
+                paths.push(ancestor.join(".env"));
+            }
+        }
+    }
+    if let Some(home) = env::var_os("HOME") {
+        let home_path = PathBuf::from(home);
+        paths.push(home_path.join(".env.local"));
+        paths.push(home_path.join(".env"));
+    }
+    let mut seen = HashSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
     paths
 }
 
